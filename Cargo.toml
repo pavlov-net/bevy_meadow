@@ -47,7 +47,12 @@ naga_oil = { version = "0.22", optional = true, default-features = false }
 # device-superset validation capabilities (binding arrays etc.).
 naga = { version = "29", optional = true, default-features = false }
 
+[[example]]
+name = "meadow"
+path = "examples/meadow.rs"
+
 [dev-dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", features = ["default", "free_camera"] }
 # Parse + validate the assembled mesh-shader WGSL in unit tests (same
 # patched naga wgpu uses at runtime), so frontend regressions surface in
 # `cargo test` instead of at pipeline creation on the GPU box.
