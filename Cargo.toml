@@ -1,0 +1,95 @@
+[package]
+name = "bevy_meadow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "GPU-driven patch-based grass rendering for Bevy"
+repository = "https://github.com/pavlov-net/bevy_meadow"
+readme = "README.md"
+# Depends on `bevy` via git, so it can't go to crates.io — consume it as a
+# git dependency.
+publish = false
+
+# Procedural patch-based grass rendering for Bevy. Blades are derived
+# on the GPU from a hash of (blade index, patch seed) — culled, LOD'd,
+# and drawn either via a compute cull/compact pass + indirect draws, or
+# via a faster task/mesh-shader path. One material per variant,
+# shared across every patch in a biome. See `README.md`.
+
+[features]
+# Mesh-shader render path (task/mesh pipelines via raw wgpu; needs
+# `Features::EXPERIMENTAL_MESH_SHADER` at runtime — Vulkan on
+# Turing+/RDNA2+). Faster than the compute path where supported; the
+# compute path stays the portable fallback. `MeadowForceComputePath`
+# forces the compute path at runtime for comparison. The direct `wgpu`
+# dep resolves to the workspace-patched trunk pin (see the root `[patch]`
+# sections), same as the one inside Bevy — `naga-ir` lets us hand
+# naga_oil-composed modules straight to `create_shader_module`.
+mesh-shaders = ["dep:wgpu", "dep:naga_oil", "dep:naga"]
+
+[dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", default-features = false, features = [
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_asset",
+    "bevy_log",
+] }
+wyrand = { version = "0.4", default-features = false }
+bytemuck = "1"
+wgpu = { version = "29", optional = true, default-features = false, features = [
+    "wgsl",
+    "naga-ir",
+] }
+naga_oil = { version = "0.22", optional = true, default-features = false }
+# Same patched naga the workspace pins; needed to hand the composer the
+# device-superset validation capabilities (binding arrays etc.).
+naga = { version = "29", optional = true, default-features = false }
+
+[dev-dependencies]
+# Parse + validate the assembled mesh-shader WGSL in unit tests (same
+# patched naga wgpu uses at runtime), so frontend regressions surface in
+# `cargo test` instead of at pipeline creation on the GPU box.
+naga = { version = "29", features = ["wgsl-in", "spv-out"] }
+
+# Inlined from the host workspace's `[workspace.lints]` (mirrors Bevy's set)
+# so the crate carries the same hygiene standard standalone.
+[lints.clippy]
+# Hygiene (mirrors Bevy's set)
+manual_let_else = "warn"
+match_same_arms = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_else = "warn"
+semicolon_if_nothing_returned = "warn"
+unwrap_or_default = "warn"
+nonstandard_macro_braces = "warn"
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Bevy-shape allows (queries + system param counts make these false positives)
+type_complexity = "allow"
+too_many_arguments = "allow"
+
+# Bug-catchers — numeric/cast foot-guns
+cast_lossless = "warn"
+lossy_float_literal = "warn"
+
+# Bug-catchers — correctness-adjacent
+if_let_mutex = "deny"
+clone_on_ref_ptr = "warn"
+or_fun_call = "warn"
+large_enum_variant = "warn"
+redundant_clone = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
