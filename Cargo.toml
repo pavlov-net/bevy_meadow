@@ -51,6 +51,16 @@ naga = { version = "29", optional = true, default-features = false }
 name = "meadow"
 path = "examples/meadow.rs"
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Shared per-frame producer encoder (`bevy_solari::scene::
+# RaytracingProducerEncoder`) for the RT blade expansion — recording there
+# folds the pass into the one submit solari makes for every raytracing
+# geometry producer, instead of a private encoder + submit per frame.
+# Target-gated to non-wasm like consumers' deps — bevy_solari pulls in
+# ray-tracing intrinsics that don't compile against wgpu's WebGPU backend.
+# Redirected to the local fork by the consuming workspace's `[patch]`.
+bevy_solari = { git = "https://github.com/bevyengine/bevy" }
+
 [dev-dependencies]
 bevy = { git = "https://github.com/bevyengine/bevy", features = ["default", "free_camera"] }
 # Parse + validate the assembled mesh-shader WGSL in unit tests (same

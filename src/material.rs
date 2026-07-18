@@ -46,14 +46,13 @@ pub struct VariantParams {
     pub width_range: Vec4,
     /// `x = amplitude` (peak XZ displacement of a blade tip in
     /// metres), `y = period` (seconds per gust cycle),
-    /// `z = current_time` (seconds since startup),
-    /// `w = previous_time` (last frame's `current_time`, for
-    /// motion-vector TAA). Time fields live here rather than on
-    /// `bevy_render::globals::Globals` because the prepass pipeline
-    /// layout doesn't include the globals bind group at binding 11
-    /// — referencing `globals` from a prepass-compatible shader
-    /// hits a runtime "binding missing from pipeline layout"
-    /// validation error.
+    /// `z = current_time`, `w = previous_time` (for motion-vector
+    /// TAA; both in `globals`' wrapped seconds). The time fields are
+    /// stamped render-side by `prepare_meadow_variant_params` for the
+    /// compute / mesh / RT kernels; the raster VS reads the same clock
+    /// straight from the `globals` binding. They stay zero on the
+    /// asset — a per-frame asset write would fire
+    /// `AssetEvent::Modified` and re-extract every variant material.
     pub wind: Vec4,
     /// Globally-shared wind direction, normalised. The
     /// `WindDirection` resource broadcasts to every variant on

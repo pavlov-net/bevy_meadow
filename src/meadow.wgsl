@@ -19,13 +19,14 @@
     view_transformations::position_world_to_clip,
 }
 
-// Time fields are stored in `variant_params.wind.zw` (current,
-// previous) rather than read from `bevy_render::globals::Globals`
-// because the prepass pipeline layout doesn't include the globals
-// bind group at binding 11 — referencing `globals` from this
-// shader hits a runtime "binding missing from pipeline layout"
-// validation error. Bevy's `tick_meadow_time` system writes
-// `wind.z = time.elapsed_secs()` each frame.
+// Wind time comes from bevy's globals uniform (`globals.time`, wrapped
+// hourly; previous frame's time = `time - delta_time`) rather than
+// from `variant_params` — a per-frame material write would fire
+// `AssetEvent::Modified` and re-extract every variant material. The
+// forward view layout binds globals where `mesh_view_bindings` declares
+// it (binding 11); the prepass/deferred/shadow view layout
+// (`bevy_pbr/src/prepass/mod.rs`) binds it at binding 1, which no stock
+// import declares — those permutations declare it directly below.
 
 // `pbr_fragment` accesses `in.world_normal` unconditionally
 // (`bevy_pbr/render/pbr_fragment.wgsl:59`); the field only exists on
@@ -60,7 +61,16 @@
 
 #import bevy_meadow::shared::{
     VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, tuft_local_position,
+    wind_sway,
 }
+
+// See the wind-time note above: one `globals` name, two layouts.
+#ifdef PREPASS_PIPELINE
+    #import bevy_render::globals::Globals
+    @group(0) @binding(1) var<uniform> globals: Globals;
+#else
+    #import bevy_pbr::mesh_view_bindings::globals
+#endif
 
 // ---------- Bindings ----------
 
@@ -82,29 +92,19 @@ var<uniform> variant_params: VariantParams;
 @group(4) @binding(0)
 var<storage, read> blades: array<CompactedBladeRecord>;
 
-// Wind sway in world XZ. Direction comes from `WindDirection`;
-// amplitude/period are per-variant; speed/gustiness/crest spacing
-// come from `MeadowWindState` via `variant_params.wind_state`. Gust
-// crests travel along the wind direction so the meadow reads as one
-// big wave passing through, not as every blade gusting in lockstep.
+// Wind sway in world XZ — `shared::wind_sway` bound to this shader's
+// `variant_params`. One implementation serves the raster and RT paths so
+// shadows sway in lockstep with the visible grass.
 fn wind_displacement(world_xz: vec2<f32>, blade_y_norm: f32, t: f32, clump: f32) -> vec2<f32> {
-    let speed_mul = variant_params.wind_state.x;
-    let gustiness = variant_params.wind_state.y;
-    let crest_k = variant_params.wind_state.z;
-    let amp = variant_params.wind.x * speed_mul;
-    let period = max(variant_params.wind.y, 1e-3);
-    let dir = normalize(variant_params.wind_direction.xy + vec2<f32>(0.0001, 0.0));
-    // Subtracting `dot(world_xz, dir) * crest_k` makes the crest move
-    // along +dir rather than against it. `clump * 1.57` (~π/2) gives
-    // ~quarter-cycle per-blade phase scatter — enough to break perfect
-    // lockstep without drowning the spatial gradient that produces the
-    // traveling crest. The earlier `clump * 4π` swamped the spatial
-    // signal so blades visibly sloshed independently.
-    let phase = (t / period) * 6.2831853 + clump * 1.57 - dot(world_xz, dir) * crest_k;
-    let gust_osc = 0.6 + 0.4 * sin(t * 0.25 + world_xz.x * 0.11 + world_xz.y * 0.09);
-    let gust = mix(1.0, gust_osc, gustiness);
-    let sway = sin(phase) * amp * gust * blade_y_norm;
-    return dir * sway;
+    return wind_sway(
+        world_xz,
+        blade_y_norm,
+        t,
+        clump,
+        variant_params.wind,
+        variant_params.wind_direction,
+        variant_params.wind_state,
+    );
 }
 
 fn season_palette() -> vec3<f32> {
@@ -174,7 +174,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     // Wind sway in world XZ on the upper portion of the blade —
     // recomputed each frame (time-varying); cheap relative to the
     // full derivation.
-    let wind = wind_displacement(blade.world_xz, y_norm, variant_params.wind.z, blade.clump_seed);
+    let wind = wind_displacement(blade.world_xz, y_norm, globals.time, blade.clump_seed);
     let target_world_xz = blade_world_xz + wind;
     let root_world_xz = blade.world_xz;
 
@@ -214,8 +214,8 @@ fn vertex(in: Vertex) -> VertexOutput {
 #ifdef MOTION_VECTOR_PREPASS
     // Motion vectors: re-expand the blade at the previous-frame root
     // (`rec.prev_*`, == current root for static placement) and wind
-    // (`prev_time`) so TAA can cancel the per-vertex sway delta.
-    let prev_t = variant_params.wind.w;
+    // (previous frame's time) so TAA can cancel the per-vertex sway delta.
+    let prev_t = globals.time - globals.delta_time;
     let prev_wind = wind_displacement(rec.prev_root_xz, y_norm, prev_t, blade.clump_seed);
     let prev_blade_world_xz = rec.prev_root_xz + vec2<f32>(rotated_x, rotated_z);
     let prev_target_xz = prev_blade_world_xz + prev_wind;

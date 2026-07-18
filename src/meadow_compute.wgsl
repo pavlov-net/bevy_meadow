@@ -13,7 +13,9 @@
 // One workgroup per (patch, view); threads strip-mine the patch's
 // blades in steps of 256.
 
-#import bevy_meadow::shared::{VariantParams, CompactedBladeRecord, BladeAttrs}
+#import bevy_meadow::shared::{
+    VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, wind_sway,
+}
 
 // ---------- compute-only structs + helpers ----------
 // These live here, not in the composable `shared` module, because
@@ -456,6 +458,337 @@ fn cull_and_compact(
             if (slot < cap) { // safety net; buffers are sized so this never trips
                 out_blades[base + slot] = rec;
             }
+        }
+    }
+}
+
+// ---------- raytracing blade expansion ----------
+//
+// A standalone pass (NOT tied to the raster cull/compact above) that bakes
+// the SHADOW-CASTER blade set into triangle vertex buffers for a raytracing
+// BLAS, so grass casts shadows under a raytracer (solari) the same way it
+// casts them into the shadow cascades in the non-RT path. Runs regardless of
+// which raster path (compute or mesh-shader) draws the visible grass — the
+// geometry it produces feeds the TLAS, not the raster.
+//
+// Selection mirrors the non-RT shadow gate (`cull_and_compact`, is_shadow):
+// blades within `RT_SHADOW_DIST` of the viewer, thinned by the same
+// `shadow_full_dist -> shadow_far_density` ramp, trunk-disc gated,
+// `collapse_t`-faded — but as a single radial disc (RT shadow rays travel
+// every direction, so no camera-frustum cull and no per-cascade slicing).
+//
+// Survivors split into two proxy bands so the triangle budget goes where
+// shadow-ray precision needs it:
+//
+// * NEAR (inside `shadow_full_dist`): a 5-vert / 3-tri bent silhouette —
+//   base edge, mid edge on the curl curve (lifted half the chord sag so the
+//   proxy straddles the true ribbon surface within ±~1 cm), curled tip.
+//   Shadow-ray origins sit ~1 cm off the G-buffer surface; a single
+//   base-to-tip chord bows up to 0.105·height (several cm) in front of the
+//   rendered ribbon and would self-shadow-speckle blades this close.
+// * FAR (out to `RT_SHADOW_DIST`): a 1-tri base-to-tip chord, width × 4/3
+//   (occlusion-area parity with the tapered ribbon — same trick as the
+//   mesh-shader shadow proxy), further thinned toward `RT_FAR_THIN` with the
+//   dropped area folded back into blade width. Chord-vs-curve deviation is
+//   invisible at this range.
+//
+// Both gates are pure functions of the stable blade hash + distance, so the
+// caster set is identical every frame (no flicker) and the CPU-side survivor
+// estimate scales `rt_params` keeps so the counts fit the fixed capacities by
+// construction; the cursors only guard the tail. Unused slots are padded
+// with NaN positions each frame (inactive primitives — excluded from the
+// BLAS entirely). The BLAS is rebuilt each frame over the full capacity.
+
+// Radial shadow-caster extent for RT (metres). Matches `mesh.rs::SHADOW_MAX_DIST`.
+const RT_SHADOW_DIST: f32 = 50.0;
+// Fixed per-band blade capacities — MUST equal `compute.rs::RT_NEAR_MAX_BLADES`
+// / `RT_FAR_MAX_BLADES`. `rt_params` keep-scales bound the expected survivor
+// counts below these; the cursors drop the (rare) overflow tail.
+const RT_NEAR_MAX_BLADES: u32 = 98304u;
+const RT_FAR_MAX_BLADES: u32 = 131072u;
+const RT_NEAR_VERTS: u32 = 5u;
+const RT_FAR_VERTS: u32 = 3u;
+// Extra RT-only thinning of the far band at `RT_SHADOW_DIST` (ramped in from
+// 1.0 at the band split). MUST equal `compute.rs::RT_FAR_THIN`.
+const RT_FAR_THIN: f32 = 0.5;
+// Mid-edge pull-back along the curl axis: half of the per-segment chord sag
+// `0.42·h·(1/2)²/4`. Chords of the convex curl curve bow in FRONT of it
+// (+z), so pulling the shared mid verts back by half the sag centres each
+// segment's deviation (≈ [-0.013·h, +0.020·h]) instead of the un-lifted
+// one-sided +0.026·h.
+const RT_NEAR_BEND_LIFT: f32 = 0.013125;
+
+// solari packed vertex: a = (pos.xyz, normal.x), b = (normal.yz, uv.xy).
+struct RtVertex {
+    a: vec4<f32>,
+    b: vec4<f32>,
+    tangent: vec4<f32>,
+}
+
+// x = near keep scale (budget only; raster density is 1.0 in the near band),
+// y = far keep scale (budget only; applied on top of the raster ramp and the
+//     `RT_FAR_THIN` ramp), z/w unused. Written by the CPU each frame from the
+// survivor estimates.
+@group(0) @binding(9) var<uniform> rt_params: vec4<f32>;
+@group(0) @binding(10) var<storage, read_write> rt_cursor_near: atomic<u32>;
+@group(0) @binding(11) var<storage, read_write> rt_verts_near: array<RtVertex>;
+@group(0) @binding(12) var<storage, read_write> rt_cursor_far: atomic<u32>;
+@group(0) @binding(13) var<storage, read_write> rt_verts_far: array<RtVertex>;
+
+// Two-band workgroup compaction accumulators (the raster kernel's
+// `wg_count`/`wg_base` pair, one per band).
+var<workgroup> rt_wg_count_near: atomic<u32>;
+var<workgroup> rt_wg_base_near: u32;
+var<workgroup> rt_wg_count_far: atomic<u32>;
+var<workgroup> rt_wg_base_far: u32;
+
+// Tip wind sway for one blade (`shared::wind_sway`, the same implementation
+// the raster VS uses, so RT shadows sway in lockstep with the visible
+// grass). Sway is linear in `y_norm`, so per-vertex sway is just this
+// scaled — computed once per blade, not per vertex.
+fn rt_wind_tip(blade: BladeAttrs) -> vec2<f32> {
+    return wind_sway(
+        blade.world_xz,
+        1.0,
+        variant_params.wind.z,
+        blade.clump_seed,
+        variant_params.wind,
+        variant_params.wind_direction,
+        variant_params.wind_state,
+    );
+}
+
+// Near-band proxy template. `vi` 0/1 = base edge (ribbon template verts
+// 0/1), 2/3 = mid edge (y = 0.5 — not a template vert; the ribbon's taper +
+// curl formulas with the curl pulled back `RT_NEAR_BEND_LIFT`), 4 = the
+// ribbon's curled tip (template vert 10). `width_boost` folds any near-band
+// budget thinning back into aggregate occlusion.
+fn rt_near_local(vi: u32, blade: BladeAttrs, width_boost: f32) -> vec3<f32> {
+    var local: vec3<f32>;
+    if (vi == 4u) {
+        local = local_blade_position(10u, blade);
+    } else if (vi < 2u) {
+        local = local_blade_position(vi, blade);
+    } else {
+        let side = f32(i32(vi & 1u) * 2 - 1);
+        let half_w = 0.5 * (1.0 - 0.25) * blade.width;
+        let curl = (0.42 * 0.25 - RT_NEAR_BEND_LIFT) * blade.height;
+        local = vec3<f32>(side * half_w, 0.5 * blade.height, curl);
+    }
+    local.x = local.x * width_boost;
+    return local;
+}
+
+// Far-band proxy template: the ribbon's base edge + curled tip (template
+// verts 0/1/10), one triangle. `width_boost` carries the 4/3 area-parity
+// factor plus the reciprocal of the RT-only thinning so aggregate occlusion
+// is conserved.
+fn rt_far_local(vi: u32, blade: BladeAttrs, width_boost: f32) -> vec3<f32> {
+    var local = local_blade_position(select(vi, 10u, vi == 2u), blade);
+    local.x = local.x * width_boost;
+    return local;
+}
+
+// Pack one proxy vertex, reproducing `meadow.wgsl`'s
+// local->world+yaw+wind+collapse transform. `cy`/`sy`/`wind_tip` are
+// per-blade values hoisted out of the per-vertex loop.
+fn rt_pack_vertex(
+    local: vec3<f32>,
+    blade: BladeAttrs,
+    ground_y: f32,
+    collapse_t: f32,
+    cy: f32,
+    sy: f32,
+    wind_tip: vec2<f32>,
+) -> RtVertex {
+    let rotated_x = cy * local.x + sy * local.z;
+    let rotated_z = -sy * local.x + cy * local.z;
+    let blade_world_xz = blade.world_xz + vec2<f32>(rotated_x, rotated_z);
+    let blade_world_y = ground_y + local.y;
+    let y_norm = local.y / max(blade.height, 1e-3);
+    let target_world_xz = blade_world_xz + wind_tip * y_norm;
+    let final_xz = mix(blade.world_xz, target_world_xz, collapse_t);
+    let final_y = mix(ground_y, blade_world_y, collapse_t);
+    var v: RtVertex;
+    // normal = (0,1,0), uv = (0, y_norm), tangent = (1,0,0,1) — matches meadow.wgsl.
+    v.a = vec4<f32>(final_xz.x, final_y, final_xz.y, 0.0);
+    v.b = vec4<f32>(1.0, 0.0, 0.0, y_norm);
+    v.tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+    return v;
+}
+
+@compute @workgroup_size(256)
+fn expand_rt_blades(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let patch_idx = active_patches[wg.x];
+    let p = patches[patch_idx];
+    let blade_count = u32(p.blade_count_noise_canopy_flags.x);
+    if (blade_count == 0u) {
+        return;
+    }
+
+    let viewer = variant_params.viewer_world_xz.xy;
+    let centre_xz = p.centre_xz_radius_seed.xy;
+    let radius = p.centre_xz_radius_seed.z;
+    let edge_noise = p.blade_count_noise_canopy_flags.y;
+    // Coarse patch reject: whole patch outside the shadow disc.
+    if (length(viewer - centre_xz) - radius * (1.0 + edge_noise) > RT_SHADOW_DIST) {
+        return;
+    }
+
+    let p_seed = bitcast<u32>(p.centre_xz_radius_seed.w);
+    let shadow_full_dist = variant_params.density.z;
+    let shadow_far_density = variant_params.density.w;
+    let keep_near = rt_params.x;
+    let keep_far = rt_params.y;
+
+    let num_batches = (blade_count + 255u) / 256u;
+    for (var batch = 0u; batch < num_batches; batch = batch + 1u) {
+        let b = batch * 256u + lid;
+
+        var band_near = false;
+        var band_far = false;
+        var blade: BladeAttrs;
+        var ground_y = 0.0;
+        var collapse_t = 0.0;
+        var near_width_boost = 1.0;
+        var far_width_boost = 1.0;
+        if (b < blade_count) {
+            blade = derive_blade(b, p);
+            let dist = length(viewer - blade.world_xz);
+            if (dist <= RT_SHADOW_DIST) {
+                let near = dist <= shadow_full_dist;
+                // Same distance-ramped shadow density as the non-RT shadow
+                // gate (planar viewer distance; no cascade view-depth here),
+                // times the RT-only far thinning ramp and the CPU budget
+                // scale. The budget scale blends near->far with the same
+                // ramp and every thinning term is folded back into blade
+                // width, so both the caster set and the aggregate occlusion
+                // are continuous across the band split.
+                var keep = keep_near;
+                if (near) {
+                    near_width_boost = 1.0 / clamp(keep_near, 1.0 / 3.0, 1.0);
+                } else {
+                    let ramp_t = clamp(
+                        (dist - shadow_full_dist)
+                            / max(RT_SHADOW_DIST - shadow_full_dist, 1e-3),
+                        0.0,
+                        1.0,
+                    );
+                    let raster_density = mix(1.0, shadow_far_density, ramp_t);
+                    let extra_thin = mix(1.0, RT_FAR_THIN, ramp_t);
+                    let keep_budget = mix(keep_near, keep_far, ramp_t);
+                    keep = raster_density * extra_thin * keep_budget;
+                    // Fold the RT-only thinning (not the raster ramp — that
+                    // look is the parity target) back into blade width so
+                    // aggregate occlusion is conserved. 4/3 = chord-vs-ribbon
+                    // silhouette area parity.
+                    far_width_boost =
+                        (4.0 / 3.0) / clamp(extra_thin * keep_budget, 1.0 / 3.0, 1.0);
+                }
+                if (hash01_pair(p_seed, b) <= keep) {
+                    collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
+                    if (collapse_t > 1e-4) {
+                        ground_y = sample_heightfield(blade.world_xz) + 0.02;
+                        band_near = near;
+                        band_far = !near;
+                    }
+                }
+            }
+        }
+
+        // Workgroup-aggregated compaction, one global atomic per band per
+        // batch — mirrors `cull_and_compact`.
+        workgroupBarrier();
+        if (lid == 0u) {
+            atomicStore(&rt_wg_count_near, 0u);
+            atomicStore(&rt_wg_count_far, 0u);
+        }
+        workgroupBarrier();
+        var local_idx = 0u;
+        if (band_near) {
+            local_idx = atomicAdd(&rt_wg_count_near, 1u);
+        } else if (band_far) {
+            local_idx = atomicAdd(&rt_wg_count_far, 1u);
+        }
+        workgroupBarrier();
+        if (lid == 0u) {
+            rt_wg_base_near = atomicAdd(&rt_cursor_near, atomicLoad(&rt_wg_count_near));
+            rt_wg_base_far = atomicAdd(&rt_cursor_far, atomicLoad(&rt_wg_count_far));
+        }
+        workgroupBarrier();
+        if (band_near) {
+            let slot = rt_wg_base_near + local_idx;
+            if (slot < RT_NEAR_MAX_BLADES) {
+                let cy = cos(blade.yaw);
+                let sy = sin(blade.yaw);
+                let wind_tip = rt_wind_tip(blade);
+                let base = slot * RT_NEAR_VERTS;
+                for (var vi = 0u; vi < RT_NEAR_VERTS; vi = vi + 1u) {
+                    rt_verts_near[base + vi] = rt_pack_vertex(
+                        rt_near_local(vi, blade, near_width_boost),
+                        blade,
+                        ground_y,
+                        collapse_t,
+                        cy,
+                        sy,
+                        wind_tip,
+                    );
+                }
+            }
+        } else if (band_far) {
+            let slot = rt_wg_base_far + local_idx;
+            if (slot < RT_FAR_MAX_BLADES) {
+                let cy = cos(blade.yaw);
+                let sy = sin(blade.yaw);
+                let wind_tip = rt_wind_tip(blade);
+                let base = slot * RT_FAR_VERTS;
+                for (var vi = 0u; vi < RT_FAR_VERTS; vi = vi + 1u) {
+                    rt_verts_far[base + vi] = rt_pack_vertex(
+                        rt_far_local(vi, blade, far_width_boost),
+                        blade,
+                        ground_y,
+                        collapse_t,
+                        cy,
+                        sy,
+                        wind_tip,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Pad every unused slot in both bands with NaN positions: NaN triangles are
+// "inactive" primitives to the BLAS builder — excluded from the tree entirely
+// (unlike zeroed verts, which pile degenerate triangles into a BVH blob at
+// the origin). Runs as a second pass in the same submission, after
+// `expand_rt_blades` has settled the cursors. Also runs alone on frames when
+// the expansion inputs are unavailable, so stale geometry vanishes instead of
+// freezing at the last-written wind phase.
+@compute @workgroup_size(256)
+fn rt_pad_unused(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let nan = bitcast<f32>(0x7FC00000u);
+    var v: RtVertex;
+    v.a = vec4<f32>(nan, nan, nan, 0.0);
+    v.b = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    v.tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+
+    let used_near = min(atomicLoad(&rt_cursor_near), RT_NEAR_MAX_BLADES);
+    if (i >= used_near && i < RT_NEAR_MAX_BLADES) {
+        let base = i * RT_NEAR_VERTS;
+        for (var k = 0u; k < RT_NEAR_VERTS; k = k + 1u) {
+            rt_verts_near[base + k] = v;
+        }
+    }
+    let used_far = min(atomicLoad(&rt_cursor_far), RT_FAR_MAX_BLADES);
+    if (i >= used_far && i < RT_FAR_MAX_BLADES) {
+        let base = i * RT_FAR_VERTS;
+        for (var k = 0u; k < RT_FAR_VERTS; k = k + 1u) {
+            rt_verts_far[base + k] = v;
         }
     }
 }

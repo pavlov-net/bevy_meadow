@@ -37,6 +37,7 @@ pub mod render;
 #[cfg(feature = "mesh-shaders")]
 pub use mesh_path::MeadowForceComputePath;
 
+pub use compute::{MeadowRaytracingConfig, MeadowRtBuffers, RtBandBuffers, RtVariantBuffers};
 pub use material::{
     MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PatchData, PatchTrunkSlot, TrunkDisc,
     VariantParams,

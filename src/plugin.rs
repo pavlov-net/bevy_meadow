@@ -499,11 +499,6 @@ impl Plugin for MeadowPlugin {
                 broadcast_wind_state.run_if(resource_changed::<MeadowWindState>),
                 broadcast_season.run_if(resource_changed::<MeadowSeasonState>),
                 broadcast_heightfield.run_if(resource_changed::<MeadowHeightfield>),
-                // `wind.zw` carries (current_time, previous_time);
-                // motion-vector TAA reads `previous_time` to cancel
-                // per-vertex sway delta, so the reupload is required
-                // for correctness rather than waste.
-                tick_meadow_time,
                 broadcast_viewer.run_if(resource_changed::<MeadowViewer>),
                 spawn_meadow_render_drivers,
             ),
@@ -591,27 +586,6 @@ fn broadcast_season(
             && mat.extension.variant_params.season_blend != blend
         {
             mat.extension.variant_params.season_blend = blend;
-        }
-    }
-}
-
-/// Per-frame time update. The shader can't read `globals.time`
-/// from a prepass-compatible pipeline (the prepass pipeline layout
-/// at `bevy_pbr/src/prepass/mod.rs` doesn't include the globals
-/// bind group at binding 11), so we route time through the
-/// material's `wind.zw` field instead. Writes elapsed_secs +
-/// previous_secs each frame on every registered variant.
-fn tick_meadow_time(
-    time: Res<Time>,
-    registry: Res<MeadowVariantRegistry>,
-    mut materials: ResMut<Assets<MeadowMaterial>>,
-) {
-    let now = time.elapsed_secs();
-    for (_, entry) in registry.iter() {
-        if let Some(mut mat) = materials.get_mut(&entry.material) {
-            let prev = mat.extension.variant_params.wind.z;
-            mat.extension.variant_params.wind.z = now;
-            mat.extension.variant_params.wind.w = prev;
         }
     }
 }

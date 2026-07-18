@@ -94,6 +94,7 @@ use crate::plugin::MeadowVariantId;
 /// frame; blade placement is hash-identical between paths, so the field
 /// should not visibly change beyond the shading-model delta).
 #[derive(Resource, Default, Clone, Copy, ExtractResource)]
+#[extract_app(bevy::render::RenderApp)]
 pub struct MeadowForceComputePath(pub bool);
 
 /// Bind-group index of the meadow resources in every pipeline built from
@@ -434,10 +435,20 @@ fn prepare_meadow_mesh_mv_target(
         (With<Camera3d>, Without<LightEntity>),
     >,
     pipelines: Res<MeadowMeshPipelines>,
+    force: Res<MeadowForceComputePath>,
     render_device: Res<RenderDevice>,
     mut target: ResMut<MeadowMeshMvTarget>,
 ) {
     if !pipelines.supported {
+        return;
+    }
+    // Forced-compute: the meadow-owned MV target would sit unused — drop
+    // it (a full-resolution Rgba16Float texture) and recreate it the
+    // frame the force flag unflips.
+    if force.0 {
+        if target.view.is_some() {
+            *target = MeadowMeshMvTarget::default();
+        }
         return;
     }
     let wanted = views.iter().next().and_then(|(camera, msaa, has_mv)| {
@@ -768,11 +779,14 @@ fn prepare_meadow_mesh_view_uniforms(
         Option<&MainPassResolutionOverride>,
     )>,
     pipelines: Res<MeadowMeshPipelines>,
+    force: Res<MeadowForceComputePath>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut out: ResMut<MeadowMeshViewUniforms>,
 ) {
-    if !pipelines.supported {
+    // The matrices feed only the mesh-path pipelines — skip the assembly
+    // + upload while the compute path is pinned to serve every view.
+    if !pipelines.supported || force.0 {
         return;
     }
     let mut entries = [MeadowMeshViewUniform::default(); MEADOW_MAX_VIEWS];
@@ -834,11 +848,16 @@ fn prepare_meadow_mesh_pipelines(
     specialized: Res<SpecializedMaterialPipelineCache>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
+    force: Res<MeadowForceComputePath>,
     mut pipelines: ResMut<MeadowMeshPipelines>,
     mut shader_sources: ResMut<MeadowMeshShaderSources>,
 ) {
     pipelines.current_main_key = None;
-    if !pipelines.supported {
+    // Forced-compute leaves the key `None`, so `decide_meadow_mesh_path`
+    // can never activate against a stale key — the frame the force flag
+    // unflips, the key (and any missing pipeline) is recomputed here
+    // before the decision runs.
+    if !pipelines.supported || force.0 {
         return;
     }
     let Some((view, msaa, has_mv)) = views.iter().next() else {
@@ -1121,11 +1140,12 @@ fn prepare_meadow_mesh_bind_groups(
     buffers: Res<MeadowGpuBuffers>,
     view_uniforms: Res<MeadowMeshViewUniforms>,
     pipelines: Res<MeadowMeshPipelines>,
+    force: Res<MeadowForceComputePath>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     mut bind_groups: ResMut<MeadowMeshBindGroups>,
 ) {
-    if !pipelines.supported {
+    if !pipelines.supported || force.0 {
         return;
     }
     let Some(meadow_bgl_desc) = &pipelines.meadow_bgl_desc else {

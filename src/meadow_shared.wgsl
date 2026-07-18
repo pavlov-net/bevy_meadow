@@ -114,3 +114,40 @@ fn tuft_local_position(vert_idx: u32, blade: BladeAttrs) -> vec3<f32> {
     let rz = -sa * local.x + ca * local.z;
     return vec3<f32>(rx, local.y, rz);
 }
+
+// Wind sway in world XZ at `y_norm` up the blade. Direction comes from
+// `WindDirection`; amplitude/period are per-variant; speed/gustiness/crest
+// spacing come from `MeadowWindState`. Gust crests travel along the wind
+// direction so the meadow reads as one big wave passing through, not as
+// every blade gusting in lockstep. Shared by the raster passthrough VS
+// (`meadow.wgsl`) and the raytracing expansion (`meadow_compute.wgsl`) so
+// RT shadows sway in lockstep with the visible grass; the parameters are
+// the `VariantParams` fields of the same names (passed explicitly because
+// each caller binds `variant_params` at a different group slot).
+fn wind_sway(
+    world_xz: vec2<f32>,
+    blade_y_norm: f32,
+    t: f32,
+    clump: f32,
+    wind: vec4<f32>,
+    wind_direction: vec4<f32>,
+    wind_state: vec4<f32>,
+) -> vec2<f32> {
+    let speed_mul = wind_state.x;
+    let gustiness = wind_state.y;
+    let crest_k = wind_state.z;
+    let amp = wind.x * speed_mul;
+    let period = max(wind.y, 1e-3);
+    let dir = normalize(wind_direction.xy + vec2<f32>(0.0001, 0.0));
+    // Subtracting `dot(world_xz, dir) * crest_k` makes the crest move
+    // along +dir rather than against it. `clump * 1.57` (~π/2) gives
+    // ~quarter-cycle per-blade phase scatter — enough to break perfect
+    // lockstep without drowning the spatial gradient that produces the
+    // traveling crest. The earlier `clump * 4π` swamped the spatial
+    // signal so blades visibly sloshed independently.
+    let phase = (t / period) * 6.2831853 + clump * 1.57 - dot(world_xz, dir) * crest_k;
+    let gust_osc = 0.6 + 0.4 * sin(t * 0.25 + world_xz.x * 0.11 + world_xz.y * 0.09);
+    let gust = mix(1.0, gust_osc, gustiness);
+    let sway = sin(phase) * amp * gust * blade_y_norm;
+    return dir * sway;
+}

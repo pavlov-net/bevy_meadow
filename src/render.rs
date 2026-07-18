@@ -119,6 +119,14 @@ impl Plugin for MeadowRenderPlugin {
             >::default());
         }
 
+        // Consumer-set switch for the raytracing blade-expansion pass (off by
+        // default). A raytracer registers the produced geometry; mirrored to
+        // the render world where the RT compute reads it.
+        app.init_resource::<crate::compute::MeadowRaytracingConfig>();
+        app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
+            crate::compute::MeadowRaytracingConfig,
+        >::default());
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -166,6 +174,10 @@ impl Plugin for MeadowRenderPlugin {
 
         // GPU-driven cull/compact compute + per-view indirect machinery.
         build_meadow_compute(render_app);
+
+        // Raytracing blade-expansion (shadow-caster set → solari-layout
+        // vertex/index buffers). Gated by `MeadowRaytracingConfig`.
+        crate::compute::build_meadow_raytracing(render_app);
 
         // Task/mesh-shader path (raw wgpu pipelines; runtime-gated on
         // EXPERIMENTAL_MESH_SHADER, force-compute toggle via
