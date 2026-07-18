@@ -73,7 +73,7 @@ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery
 use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::sync_world::MainEntity;
 use bevy::render::texture::GpuImage;
-use bevy::render::view::{ExtractedView, Msaa, ViewDepthTexture, ViewTarget};
+use bevy::render::view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderStartup, RenderSystems};
 use bevy::shader::{Shader, ShaderDefVal};
 
@@ -1228,7 +1228,7 @@ pub fn meadow_mesh_main_pass(
             &ExtractedView,
             &ExtractedCamera,
             &ViewTarget,
-            &ViewDepthTexture,
+            &ViewDepthStencilTexture,
             Option<&MeshViewBindGroup>,
             Option<&MainPassResolutionOverride>,
         ),

@@ -38,14 +38,14 @@ bevy = { git = "https://github.com/bevyengine/bevy", default-features = false, f
 ] }
 wyrand = { version = "0.4", default-features = false }
 bytemuck = "1"
-wgpu = { version = "29", optional = true, default-features = false, features = [
+wgpu = { version = "30", optional = true, default-features = false, features = [
     "wgsl",
     "naga-ir",
 ] }
-naga_oil = { version = "0.22", optional = true, default-features = false }
+naga_oil = { version = "0.23", optional = true, default-features = false }
 # Same patched naga the workspace pins; needed to hand the composer the
 # device-superset validation capabilities (binding arrays etc.).
-naga = { version = "29", optional = true, default-features = false }
+naga = { version = "30", optional = true, default-features = false }
 
 [[example]]
 name = "meadow"
@@ -66,7 +66,7 @@ bevy = { git = "https://github.com/bevyengine/bevy", features = ["default", "fre
 # Parse + validate the assembled mesh-shader WGSL in unit tests (same
 # patched naga wgpu uses at runtime), so frontend regressions surface in
 # `cargo test` instead of at pipeline creation on the GPU box.
-naga = { version = "29", features = ["wgsl-in", "spv-out"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 
 # Inlined from the host workspace's `[workspace.lints]` (mirrors Bevy's set)
 # so the crate carries the same hygiene standard standalone.
