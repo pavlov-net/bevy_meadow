@@ -203,14 +203,12 @@ impl MeadowVariantRegistry {
         self.next_id += 1;
 
         // Initial buffer size = 1 row each so the bind group is
-        // well-formed before `upload_placements` runs; `set_data`
-        // resizes as the placement list grows.
-        let mut patches_buf = ShaderBuffer::default();
-        patches_buf.set_data(vec![PatchData::default()]);
+        // well-formed before `upload_placements` runs; the upload
+        // resizes them as the placement list grows.
+        let patches_buf = ShaderBuffer::new(vec![PatchData::default()], default());
         let patches_handle = shader_buffers.add(patches_buf);
 
-        let mut trunks_buf = ShaderBuffer::default();
-        trunks_buf.set_data(vec![PatchTrunkSlot::default()]);
+        let trunks_buf = ShaderBuffer::new(vec![PatchTrunkSlot::default()], default());
         let trunks_handle = shader_buffers.add(trunks_buf);
 
         let variant_params = variant_params_from(&variant);
@@ -732,7 +730,8 @@ pub fn upload_placements(
     let Some(mut buf) = shader_buffers.get_mut(&mat.extension.patches) else {
         return;
     };
-    buf.set_data(rows);
+    buf.clear();
+    buf.extend_from_slice(&rows);
 }
 
 /// Helper: write a per-patch trunk-slot list into a variant's
@@ -777,5 +776,6 @@ pub fn upload_trunk_slots(
     let Some(mut buf) = shader_buffers.get_mut(&mat.extension.trunk_slots) else {
         return;
     };
-    buf.set_data(rows);
+    buf.clear();
+    buf.extend_from_slice(&rows);
 }

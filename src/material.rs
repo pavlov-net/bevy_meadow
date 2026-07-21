@@ -158,7 +158,8 @@ impl Default for VariantParams {
 /// by the patch entity's `MeshTag`. Packed for cheap shader fetch:
 /// the WGSL side reads one `vec4` for centre/radius/seed and a
 /// second `vec4` for blade_count/edge_noise_amp/canopy_density/flags.
-#[derive(ShaderType, Debug, Clone, Copy, Default)]
+#[repr(C)]
+#[derive(ShaderType, Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PatchData {
     /// `xy = world centre`, `z = radius (metres)`, `w = seed (f32 from u32 bits)`.
     pub centre_xz_radius_seed: Vec4,
@@ -169,7 +170,8 @@ pub struct PatchData {
 
 /// One trunk disc collapsed in this patch's local trunk list.
 /// `xy = world centre`, `z = solid radius`, `w = fade band`.
-#[derive(ShaderType, Debug, Clone, Copy, Default)]
+#[repr(C)]
+#[derive(ShaderType, Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TrunkDisc {
     pub center_radius_fade: Vec4,
 }
@@ -177,7 +179,8 @@ pub struct TrunkDisc {
 /// Per-patch slot of trunk discs. Padded so the slot is
 /// `std140`-aligned to 16 B; the explicit padding keeps the layout
 /// stable across any future field reordering.
-#[derive(ShaderType, Debug, Clone, Copy)]
+#[repr(C)]
+#[derive(ShaderType, Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PatchTrunkSlot {
     pub count: u32,
     pub _pad0: u32,
