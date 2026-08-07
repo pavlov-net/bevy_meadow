@@ -23,7 +23,7 @@ use bevy::shader::ShaderRef;
 
 use crate::compute::meadow_draw_bind_group_layout;
 
-pub(crate) const MEADOW_SHADER: &str = "embedded://bevy_meadow/meadow.wgsl";
+pub(crate) const MEADOW_SHADER: &str = "embedded://bevy_meadow/meadow.wesl";
 
 /// Maximum trunk discs collapsed per patch. The plan estimates ~10
 /// per patch given typical tree spacing; 16 leaves headroom. This is

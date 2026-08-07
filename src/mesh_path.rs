@@ -307,14 +307,9 @@ fn meadow_mesh_bgl_desc() -> BindGroupLayoutDescriptor {
 }
 
 /// Assemble the task/mesh module source: `enable` directive + the shared
-/// struct/geometry library (minus its `#define_import_path`) + the mesh
-/// shader body.
+/// struct/geometry library (plain WGSL) + the mesh shader body.
 fn assemble_geom_source() -> String {
-    let shared: String = include_str!("meadow_shared.wgsl")
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("#define_import_path"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let shared = include_str!("meadow_shared.wesl");
     let body = include_str!("meadow_mesh.wgsl");
     format!("enable wgpu_mesh_shader;\n{shared}\n{body}")
 }
@@ -530,7 +525,7 @@ fn extract_meadow_shader_sources(
 // ---------- PBR fragment composition ----------
 
 /// The composed fragment source. Mirrors what the compute path's
-/// `meadow.wgsl` forward fragment produces (season palette × height shade
+/// `meadow.wesl` forward fragment produces (season palette × height shade
 /// × clump luminance through `apply_pbr_lighting`, shadow-receiver bit
 /// forced, tip emissive), but builds the `PbrInput` by hand — there is no
 /// material or mesh bind group on this pipeline, so
@@ -568,7 +563,7 @@ struct MeadowVertexOut {
     @location(2) misc: vec2<f32>,
 }
 
-// MIRROR: meadow.wgsl::season_palette.
+// MIRROR: meadow.wesl::season_palette.
 fn season_palette() -> vec3<f32> {
     let a_idx = u32(variant_params.season_blend.x);
     let b_idx = u32(variant_params.season_blend.y);
@@ -591,7 +586,7 @@ fn shade_meadow_fragment(in: MeadowVertexOut, is_front: bool) -> vec4<f32> {
     let palette = season_palette();
     let shade = mix(0.70, 1.00, in.misc.x);
     let lum = in.misc.y;
-    // Mirror of meadow.wgsl::apply_blade_palette with the meadow
+    // Mirror of meadow.wesl::apply_blade_palette with the meadow
     // StandardMaterial's values baked in (white base → blade_lum = lum,
     // roughness 0.85).
     pbr_input.material.base_color = vec4<f32>(palette * shade * lum, 1.0);
@@ -608,7 +603,7 @@ fn shade_meadow_fragment(in: MeadowVertexOut, is_front: bool) -> vec4<f32> {
     pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr_input.V = calculate_view(in.world_position, pbr_input.is_orthographic);
     // No real MeshUniform row exists for mesh-emitted geometry; force the
-    // shadow-receiver bit the same way meadow.wgsl does.
+    // shadow-receiver bit the same way meadow.wesl does.
     pbr_input.flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;
 
     var color = apply_pbr_lighting(pbr_input);
@@ -1573,9 +1568,9 @@ mod tests {
     /// function bodies to each other so drift fails the build.
     #[test]
     fn mirrored_helpers_match_compute_kernel() {
-        let compute = include_str!("meadow_compute.wgsl");
+        let compute = include_str!("meadow_compute.wesl");
         let mesh = include_str!("meadow_mesh.wgsl");
-        let raster = include_str!("meadow.wgsl");
+        let raster = include_str!("meadow.wesl");
 
         /// Function body with comments stripped and whitespace collapsed —
         /// the mirrors must match structurally; comments may differ.
@@ -1619,19 +1614,19 @@ mod tests {
             assert_eq!(
                 body_of(compute, f),
                 body_of(mesh, f),
-                "`{f}` drifted between meadow_compute.wgsl and meadow_mesh.wgsl"
+                "`{f}` drifted between meadow_compute.wesl and meadow_mesh.wgsl"
             );
         }
         for f in ["wind_displacement", "season_palette"] {
             assert_eq!(
                 body_of(raster, f),
                 body_of(mesh, f),
-                "`{f}` drifted between meadow.wgsl and meadow_mesh.wgsl"
+                "`{f}` drifted between meadow.wesl and meadow_mesh.wgsl"
             );
         }
 
         // The composed PBR fragment (a Rust string, invisible to the
-        // .wgsl mirrors above) carries its own copies of the palette,
+        // shader mirrors above) carries its own copies of the palette,
         // the motion-vector math, and the interface structs that must
         // match the mesh stage by location — pin them too. Struct bodies
         // reuse `body_of` via the `struct Name {` prefix.

@@ -5,7 +5,7 @@
 // the heightfield once, applies the per-view LOD / density / frustum
 // gates, and atomically appends survivors into that view's contiguous
 // region of `out_blades`. The raster passes then issue one
-// `draw_indexed_indirect` per view over its region (see `meadow.wgsl`).
+// `draw_indexed_indirect` per view over its region (see `meadow.wesl`).
 //
 // Dispatch: x = active-patch ordinal (indexes `active_patches`, which
 // holds the rows of `patches` that are in currently-loaded chunks —
@@ -13,15 +13,13 @@
 // One workgroup per (patch, view); threads strip-mine the patch's
 // blades in steps of 256.
 
-#import bevy_meadow::shared::{
+import bevy_meadow::meadow_shared::{
     VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, wind_sway,
-}
+};
 
 // ---------- compute-only structs + helpers ----------
-// These live here, not in the composable `shared` module, because
-// naga_oil forbids exported identifiers that naga's WGSL writer renames
-// on round-trip (digit-ending names like `pad0` / `hash_u32`); an entry
-// shader has no such restriction.
+// These live here, not in `meadow_shared`, because only this kernel
+// uses them.
 
 const MEADOW_VIEW_FLAG_SHADOW: u32 = 1u;
 
@@ -589,7 +587,7 @@ fn rt_far_local(vi: u32, blade: BladeAttrs, width_boost: f32) -> vec3<f32> {
     return local;
 }
 
-// Pack one proxy vertex, reproducing `meadow.wgsl`'s
+// Pack one proxy vertex, reproducing `meadow.wesl`'s
 // local->world+yaw+wind+collapse transform. `cy`/`sy`/`wind_tip` are
 // per-blade values hoisted out of the per-vertex loop.
 fn rt_pack_vertex(
@@ -610,7 +608,7 @@ fn rt_pack_vertex(
     let final_xz = mix(blade.world_xz, target_world_xz, collapse_t);
     let final_y = mix(ground_y, blade_world_y, collapse_t);
     var v: RtVertex;
-    // normal = (0,1,0), uv = (0, y_norm), tangent = (1,0,0,1) — matches meadow.wgsl.
+    // normal = (0,1,0), uv = (0, y_norm), tangent = (1,0,0,1) — matches meadow.wesl.
     v.a = vec4<f32>(final_xz.x, final_y, final_xz.y, 0.0);
     v.b = vec4<f32>(1.0, 0.0, 0.0, y_norm);
     v.tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);

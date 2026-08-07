@@ -26,7 +26,7 @@
 // final source as:
 //
 //     enable wgpu_mesh_shader;
-//     <meadow_shared.wgsl minus its #define_import_path line>
+//     <meadow_shared.wesl>
 //     <this file>
 //
 // so `VariantParams` / `BladeAttrs` / `local_blade_position` /
@@ -84,9 +84,9 @@ const MESH_SHADOW_OUT_PRIMS: u32 = 21u; // MESH_WG_SHADOW_BLADES × 1
 const MEADOW_VIEW_FLAG_SHADOW: u32 = 1u;
 const TUFT_SALT: u32 = 0x5C3Bu;
 
-// ---------- structs (MIRROR: meadow_compute.wgsl) ----------
+// ---------- structs (MIRROR: meadow_compute.wesl) ----------
 // Any change to these structs or to the derivation helpers below MUST be
-// copied to/from `meadow_compute.wgsl` — the two paths must derive
+// copied to/from `meadow_compute.wesl` — the two paths must derive
 // bit-identical blades, or switching between them (the runtime toggle)
 // shows different fields. `tests` in `mesh_path.rs` string-compares the
 // mirrored helper bodies.
@@ -153,7 +153,7 @@ struct MeadowTaskSlices {
 @group(3) @binding(5) var<storage, read> task_slices: MeadowTaskSlices;
 @group(3) @binding(6) var<uniform> mesh_view: MeadowMeshView;
 
-// ---------- hash helpers (MIRROR: meadow_compute.wgsl) ----------
+// ---------- hash helpers (MIRROR: meadow_compute.wesl) ----------
 
 fn hash_u32(v: u32) -> u32 {
     var x = v;
@@ -174,7 +174,7 @@ fn hash01_pair(a: u32, b: u32) -> f32 {
     return f32(h & 0x00FFFFFFu) / f32(0x01000000u);
 }
 
-// ---------- derivation helpers (MIRROR: meadow_compute.wgsl) ----------
+// ---------- derivation helpers (MIRROR: meadow_compute.wesl) ----------
 
 fn derive_blade(blade_idx: u32, p: PatchData) -> BladeAttrs {
     let centre = p.centre_xz_radius_seed.xy;
@@ -289,7 +289,7 @@ fn patch_sphere_culled(centre: vec3<f32>, radius: f32, vc: MeadowViewCull, is_sh
     return false;
 }
 
-// ---------- wind + palette (MIRROR: meadow.wgsl) ----------
+// ---------- wind + palette (MIRROR: meadow.wesl) ----------
 
 fn wind_displacement(world_xz: vec2<f32>, blade_y_norm: f32, t: f32, clump: f32) -> vec2<f32> {
     let speed_mul = variant_params.wind_state.x;
@@ -405,7 +405,7 @@ fn meadow_task(
     let tuft_start = variant_params.tuft.x;
     let dist = length(variant_params.viewer_world_xz.xy - centre_xz);
 
-    // Camera view-depth of the patch centre (see meadow_compute.wgsl for
+    // Camera view-depth of the patch centre (see meadow_compute.wesl for
     // why cascade assignment uses this, not planar viewer distance).
     let vf = variant_params.viewer_forward;
     let view_depth =

@@ -1,5 +1,5 @@
 //! GPU-driven patch-based grass rendering for Bevy. A compute pass
-//! (`compute.rs` + `meadow_compute.wgsl`) derives, culls, and compacts
+//! (`compute.rs` + `meadow_compute.wesl`) derives, culls, and compacts
 //! every blade once per frame into per-view buffers from a hash of
 //! `(blade_idx, patch.seed)`; the raster passes then issue one indirect
 //! draw per view (`render.rs::DrawMeadowPatch`) with a passthrough

@@ -10,7 +10,7 @@
 //!   camera angle (no rotation, so no billboard popping) and casts no
 //!   shadows.
 //!
-//! The compute kernel (`meadow_compute.wgsl`) culls + compacts blades
+//! The compute kernel (`meadow_compute.wesl`) culls + compacts blades
 //! per (view, band) into `CompactedBladeRecord`s; `DrawMeadowPatch`
 //! (see `crate::render`) issues one `draw_indexed_indirect` per
 //! (view, band) and `@builtin(instance_index)` indexes the band's
@@ -51,11 +51,11 @@ pub const TUFT_INDICES_PER_BLADE: u32 = TUFT_ARMS * 3;
 /// raster side draws per view: band 0 = near blade, band 1 = far tuft.
 /// Compile-time const — sizes the per-band `cursors` / `indirect`
 /// arrays and the per-(view, band) base/cap bookkeeping. MUST equal
-/// `MEADOW_MAX_BANDS` in `meadow_compute.wgsl`.
+/// `MEADOW_MAX_BANDS` in `meadow_compute.wesl`.
 pub const MEADOW_MAX_BANDS: usize = 2;
 
 /// Bytes per `CompactedBladeRecord` (compute → raster). Must match the
-/// `CompactedBladeRecord` std430 layout in `meadow_shared.wgsl`.
+/// `CompactedBladeRecord` std430 layout in `meadow_shared.wesl`.
 pub const BLADE_RECORD_SIZE: u64 = 48;
 
 /// Bytes per `DrawIndexedIndirectArgs` record (wgpu `DrawIndexedIndirect`:
@@ -78,7 +78,7 @@ pub const SHADOW_MAX_DIST: f32 = 50.0;
 /// as tight as the cascade count allows (each extra slot costs a
 /// `cap_shadow` region of VRAM). Excess views beyond this are dropped by
 /// `build_meadow_view_slots`'s `slot >= MEADOW_MAX_VIEWS` guard.
-/// MUST equal the array sizes hardcoded in `meadow_compute.wgsl`
+/// MUST equal the array sizes hardcoded in `meadow_compute.wesl`
 /// (`array<MeadowViewCull, N>` + the `write_instance_counts` workgroup size).
 pub const MEADOW_MAX_VIEWS: usize = 6;
 
@@ -220,7 +220,7 @@ fn build_template_mesh(
 ///
 /// Like the blade, `POSITION.y` carries `vert_idx` (0..20) and
 /// `POSITION.x = 1.0` marks the tuft band so the shared vertex shader
-/// expands it via `tuft_local_position` (in `meadow_shared.wgsl`) instead
+/// expands it via `tuft_local_position` (in `meadow_shared.wesl`) instead
 /// of `local_blade_position`. `vert_idx` demuxes to `(arm = idx/3,
 /// corner = idx%3)`; corner 2 is the tip (UV.y = 1, for the shade ramp),
 /// corners 0/1 the base. The fan's baked per-arm yaw means it reads as a

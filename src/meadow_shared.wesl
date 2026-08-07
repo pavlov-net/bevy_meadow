@@ -1,21 +1,17 @@
-// Meadow shared shader library.
+// Meadow shared shader library (importable as `bevy_meadow::meadow_shared`).
 //
 // Only the structs/helpers used by BOTH the compute kernel
-// (`meadow_compute.wgsl`) and the raster passthrough shader
-// (`meadow.wgsl`) live here. Compute-only types (PatchData,
+// (`meadow_compute.wesl`) and the raster passthrough shader
+// (`meadow.wesl`) live here. Compute-only types (PatchData,
 // PatchTrunkSlot, the view-cull + indirect structs, the hash helpers)
-// live in `meadow_compute.wgsl` directly — this is a *composable*
-// module (`#define_import_path`), and naga_oil forbids exported
-// identifiers that naga's WGSL writer would rename on round-trip
-// (notably names ending in a digit, e.g. `pad0` / `hash_u32`; see
-// bevy_pbr `utils.wgsl:86`). Keeping those out of the export surface
-// sidesteps the rule; the one shared pad field is named `pad`.
+// live in `meadow_compute.wesl` directly. This file is also spliced
+// verbatim into the mesh-shader module source
+// (`mesh_path.rs::assemble_geom_source`), so it must stay plain WGSL —
+// no imports or `@if` directives.
 //
 // Struct layouts here are the contract with the Rust side
 // (`material.rs::VariantParams`, `compute.rs`); std430 offsets are
 // load-bearing.
-
-#define_import_path bevy_meadow::shared
 
 // Mirror of `material.rs::VariantParams` (16 × vec4 = 256 B). Bound at
 // `@binding(100)` in raster (material group) and `@binding(0)` in
@@ -120,7 +116,7 @@ fn tuft_local_position(vert_idx: u32, blade: BladeAttrs) -> vec3<f32> {
 // spacing come from `MeadowWindState`. Gust crests travel along the wind
 // direction so the meadow reads as one big wave passing through, not as
 // every blade gusting in lockstep. Shared by the raster passthrough VS
-// (`meadow.wgsl`) and the raytracing expansion (`meadow_compute.wgsl`) so
+// (`meadow.wesl`) and the raytracing expansion (`meadow_compute.wesl`) so
 // RT shadows sway in lockstep with the visible grass; the parameters are
 // the `VariantParams` fields of the same names (passed explicitly because
 // each caller binds `variant_params` at a different group slot).

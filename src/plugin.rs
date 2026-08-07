@@ -469,11 +469,11 @@ impl Plugin for MeadowPlugin {
     fn build(&self, app: &mut App) {
         // Shared struct/helper library imported by both the compute
         // kernel and the raster passthrough shader.
-        load_shader_library!(app, "meadow_shared.wgsl");
-        load_shader_library!(app, "meadow.wgsl");
-        // The compute kernel is loaded by handle (not a `#define_import_path`
-        // library), so embed it for `asset_server.load(embedded://…)`.
-        bevy::asset::embedded_asset!(app, "meadow_compute.wgsl");
+        load_shader_library!(app, "meadow_shared.wesl");
+        load_shader_library!(app, "meadow.wesl");
+        // The compute kernel is loaded by handle, so embed it for
+        // `asset_server.load(embedded://…)`.
+        bevy::asset::embedded_asset!(app, "meadow_compute.wesl");
 
         app.add_plugins(MaterialPlugin::<MeadowMaterial>::default());
         // Custom RenderCommand chain that issues

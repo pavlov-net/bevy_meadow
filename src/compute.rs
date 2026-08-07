@@ -1,7 +1,7 @@
 //! GPU-driven cull + compact compute pass for the meadow renderer.
 //!
 //! Per frame, for every (active patch, view) pair, the compute kernel
-//! `cull_and_compact` (in `meadow_compute.wgsl`) derives each blade,
+//! `cull_and_compact` (in `meadow_compute.wesl`) derives each blade,
 //! samples the heightfield once, applies the per-view LOD / density /
 //! frustum gates, and atomically appends survivors into that view's
 //! contiguous region of a per-variant `blades` buffer. A tiny
@@ -58,10 +58,10 @@ use crate::mesh::{
 use crate::plugin::{MeadowPatch, MeadowVariantId, MeadowVariantRegistry, MeadowViewer};
 use crate::render::{MeadowRenderDriver, RenderMeadowMeshIds};
 
-const MEADOW_COMPUTE_SHADER: &str = "embedded://bevy_meadow/meadow_compute.wgsl";
+const MEADOW_COMPUTE_SHADER: &str = "embedded://bevy_meadow/meadow_compute.wesl";
 
 /// Per-variant raytracing blade capacities — MUST equal `RT_NEAR_MAX_BLADES`
-/// / `RT_FAR_MAX_BLADES` in `meadow_compute.wgsl`. The shadow-caster
+/// / `RT_FAR_MAX_BLADES` in `meadow_compute.wesl`. The shadow-caster
 /// expansion compacts survivors into `[0, cap)` per band; the per-frame
 /// keep scales in `rt_params` are derived from the CPU survivor estimates so
 /// the expected counts fit these by construction (the cursors only drop the
@@ -83,7 +83,7 @@ const RT_FAR_VERTS_PER_BLADE: u32 = 3;
 const RT_FAR_INDICES_PER_BLADE: u32 = 3;
 /// Extra RT-only thinning of the far band at `SHADOW_MAX_DIST`, ramped in
 /// from 1.0 at the band split — MUST equal `RT_FAR_THIN` in
-/// `meadow_compute.wgsl`. The dropped occlusion area is folded back into
+/// `meadow_compute.wesl`. The dropped occlusion area is folded back into
 /// blade width on the GPU, so aggregate shadow coverage is conserved.
 const RT_FAR_THIN: f32 = 0.5;
 /// Fraction of each band's capacity the keep scales aim to fill — headroom
@@ -103,7 +103,7 @@ const RT_NEAR_BLADE_INDICES: [u32; 9] = [0, 1, 2, 1, 3, 2, 2, 3, 4];
 const RT_FAR_BLADE_INDICES: [u32; 3] = [0, 1, 2];
 
 /// Flag bit 0 in `MeadowViewCull.params.x` marking a shadow (cascade)
-/// view. Mirror of `MEADOW_VIEW_FLAG_SHADOW` in `meadow_compute.wgsl`.
+/// view. Mirror of `MEADOW_VIEW_FLAG_SHADOW` in `meadow_compute.wesl`.
 pub(crate) const MEADOW_VIEW_FLAG_SHADOW: u32 = 1;
 
 /// Blade-capacity rounding granularity (512Ki blades). Active footprints
@@ -117,7 +117,7 @@ fn round_cap(n: u32) -> u32 {
 
 // ---------- GPU-uploaded per-view culling data ----------
 
-/// Rust mirror of `MeadowViewCull` (`meadow_compute.wgsl`). `frustum`
+/// Rust mirror of `MeadowViewCull` (`meadow_compute.wesl`). `frustum`
 /// holds the 6 world-space half-space planes (normal.xyz, d).
 /// `params  = (flags, lod_max, base0, cap0)` — band 0 (near blade) region;
 /// flags bit 0 = shadow view.
@@ -407,7 +407,7 @@ pub fn build_meadow_compute(render_app: &mut SubApp) {
 // ---------- RenderStartup: pipeline + layouts ----------
 
 fn compute_bind_group_layout() -> BindGroupLayoutDescriptor {
-    // Compute group 0 — order + types match meadow_compute.wgsl exactly.
+    // Compute group 0 — order + types match meadow_compute.wesl exactly.
     // The runtime-array storage buffers use `*_sized(.., None)` since the
     // element type is a WGSL struct, not a Rust `ShaderType`.
     BindGroupLayoutDescriptor::new(
@@ -462,7 +462,7 @@ fn init_meadow_compute_pipeline(
 /// pipeline layout matches the one the draw bind group is built from.
 ///
 /// Binding 0: `var<storage, read> blades: array<CompactedBladeRecord>`
-/// (VERTEX). Mirror of `meadow.wgsl`'s `@group(4) @binding(0)`.
+/// (VERTEX). Mirror of `meadow.wesl`'s `@group(4) @binding(0)`.
 pub fn meadow_draw_bind_group_layout() -> BindGroupLayoutDescriptor {
     BindGroupLayoutDescriptor::new(
         "meadow_draw_layout",
@@ -1338,7 +1338,7 @@ fn meadow_compute_node(
 // when no raytracer is present.
 //
 // Casters split into two radial bands (see the shader-side rationale in
-// `meadow_compute.wgsl`): a NEAR band of 3-tri bent-silhouette proxies whose
+// `meadow_compute.wesl`): a NEAR band of 3-tri bent-silhouette proxies whose
 // surface tracks the rendered ribbon within ±~1 cm (shadow-ray self-
 // intersection margin), and a FAR band of 1-tri chords, extra-thinned with
 // the dropped occlusion area folded back into blade width. Selection is a
@@ -1456,7 +1456,7 @@ fn init_meadow_rt_pipeline(
     asset_server: &AssetServer,
     pipeline_cache: &PipelineCache,
 ) -> MeadowRtExpandPipeline {
-    // Explicit binding indices — a SUBSET of meadow_compute.wgsl's group 0
+    // Explicit binding indices — a SUBSET of meadow_compute.wesl's group 0
     // (the read-only inputs) plus the RT bindings at 9..=13. The kernel
     // doesn't reference bindings 4/6/7/8, so they're omitted.
     let expand_layout = BindGroupLayoutDescriptor::new(
