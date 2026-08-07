@@ -75,7 +75,7 @@ use bevy::render::sync_world::MainEntity;
 use bevy::render::texture::GpuImage;
 use bevy::render::view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderStartup, RenderSystems};
-use bevy::shader::{Shader, ShaderDefVal};
+use bevy::shader::{Shader, ShaderDefVal, ShaderImport};
 
 use crate::compute::{
     MeadowExtractedVariants, MeadowGpuBuffers, MeadowMeshPathActive, MeadowVariantParamsBuffers,
@@ -516,7 +516,7 @@ fn extract_meadow_shader_sources(
     }
     out.by_module.clear();
     for (_, shader) in shaders.iter() {
-        let name = shader.import_path.module_name();
+        let name = module_name(&shader.import_path);
         if name.starts_with("bevy_pbr::")
             || name.starts_with("bevy_render::")
             || name.starts_with("bevy_core_pipeline::")
@@ -702,12 +702,41 @@ fn add_module_with_deps(
         .get(module)
         .ok_or_else(|| format!("shader library `{module}` not loaded yet"))?;
     for import in &shader.imports {
-        add_module_with_deps(composer, sources, &import.module_name())?;
+        add_module_with_deps(composer, sources, &module_name(import))?;
     }
     composer
-        .add_composable_module(shader.into())
+        .add_composable_module(composable_descriptor(shader))
         .map_err(|e| format!("composing `{module}`: {e}"))?;
     Ok(())
+}
+
+/// The naga_oil module name of a shader: custom import paths are the module
+/// name verbatim, asset paths are quoted. Bevy's shader library ships WESL
+/// modules (no naga_oil module names), so `by_module` fills only from
+/// naga_oil-dialect sources — until this composer is ported to WESL,
+/// `compose_pbr_fragment` errors on the missing library and the compute
+/// path serves every meadow.
+fn module_name(import: &ShaderImport) -> Cow<'_, str> {
+    match import {
+        ShaderImport::AssetPath(s) => Cow::Owned(format!("\"{s}\"")),
+        ShaderImport::Custom(s) => Cow::Borrowed(s),
+    }
+}
+
+/// A naga_oil composable-module descriptor for a naga_oil-dialect shader,
+/// registered under the same module-name scheme as [`module_name`].
+fn composable_descriptor(shader: &Shader) -> naga_oil::compose::ComposableModuleDescriptor<'_> {
+    naga_oil::compose::ComposableModuleDescriptor {
+        source: shader.source.as_str(),
+        file_path: &shader.path,
+        language: naga_oil::compose::ShaderLanguage::Wgsl,
+        additional_imports: &[],
+        shader_defs: to_naga_oil_defs(&shader.shader_defs),
+        as_name: match &shader.import_path {
+            ShaderImport::AssetPath(p) => Some(format!("\"{p}\"")),
+            ShaderImport::Custom(_) => None,
+        },
+    }
 }
 
 /// Compose the PBR fragment with the given defs and create the raw
