@@ -745,7 +745,7 @@ fn meadow_mesh_shadow(
 //
 // Used when PBR fragment composition is unavailable (debug / composition
 // failure). Season palette × height shade × fixed lambert — deliberately
-// simple; the shipping fragment is the naga_oil-composed PBR one
+// simple; the shipping fragment is the wesl-composed PBR one
 // (`mesh_path.rs::PBR_FRAGMENT_SOURCE / compose_pbr_fragment`).
 
 fn flat_lit_color(misc: vec2<f32>) -> vec4<f32> {

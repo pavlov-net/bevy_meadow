@@ -23,8 +23,9 @@
 //! pipelines, everything here is raw wgpu — but it deliberately *reuses*
 //! Bevy's frame data rather than rebuilding it:
 //!
-//! - The **PBR fragment** is composed by driving naga_oil ourselves over
-//!   the loaded `Shader` assets, with the shader defs lifted verbatim
+//! - The **PBR fragment** is composed by driving the wesl compiler (the
+//!   same one bevy_shader uses) over the loaded `Shader` assets, with
+//!   the shader defs lifted verbatim
 //!   from the meadow material's own specialized forward pipeline
 //!   ([`SpecializedMaterialPipelineCache`]), so the composed module's
 //!   view-binding declarations match the real view bind group layout by
@@ -177,15 +178,19 @@ pub struct MeadowMeshPipelines {
     /// Empty bind group for the shadow pipeline's unused slots 0-2 (and
     /// layout-compatible with the main pipeline's empty slot 2).
     pub empty_bind_group: Option<BindGroup>,
-    /// naga_oil-composed PBR fragment (entries `fragment`/`fragment_mv`).
+    /// wesl-composed PBR fragment (entries `fragment`/`fragment_mv`).
     pub pbr_fragment: Option<wgpu::ShaderModule>,
     /// Hash of the shader-def set the PBR fragment was composed with;
     /// recompose when the specialized pipeline's defs change.
     pub pbr_defs_hash: Option<u64>,
-    /// Def-set hash a composition attempt failed for (fall back to the
-    /// flat fragment for that def set; a def change — e.g. DLSS toggling
-    /// the prepasses — retries with the new set).
-    pub pbr_failed_defs: Option<u64>,
+    /// (def-set hash, source-snapshot generation) a composition attempt
+    /// permanently failed for (fall back to the flat fragment). A def
+    /// change — e.g. DLSS toggling the prepasses — or a refreshed shader
+    /// collection (hot reload) retries.
+    pub pbr_failed: Option<(u64, u64)>,
+    /// Module name already logged as missing (waiting-to-stream); keeps
+    /// the retry loop visible in the log without spamming it.
+    pub pbr_missing_logged: Option<String>,
     pub main_pipelines: HashMap<MeadowMainPipelineKey, wgpu::RenderPipeline>,
     /// Key the current frame's main view resolves to (None until known).
     /// `decide_meadow_mesh_path` requires the matching pipeline to exist.
@@ -223,11 +228,17 @@ pub struct MeadowMeshBindGroups {
 }
 
 /// Render-world snapshot of the composable `Shader` assets the PBR
-/// fragment needs (`bevy_pbr::*` libraries + `bevy_meadow::shared`).
-/// Re-cloned each frame until composition settles, then frozen.
+/// fragment needs (the `bevy_pbr::`/`bevy_render::`/
+/// `bevy_core_pipeline::` libraries + `bevy_meadow::meadow_shared`),
+/// keyed by wesl module path. Whole `Shader` clones — the composer
+/// needs each dep's own `shader_defs` for the def closure. Re-cloned on
+/// shader-asset changes until composition settles, then frozen.
 #[derive(Resource, Default)]
 pub struct MeadowMeshShaderSources {
-    pub by_module: StdHashMap<String, Shader>,
+    pub by_module: StdHashMap<wesl::syntax::ModulePath, Shader>,
+    /// Bumped on every re-collection; a permanent composition failure is
+    /// keyed to it so a refreshed snapshot retries.
+    pub generation: u64,
     pub frozen: bool,
 }
 
@@ -343,7 +354,10 @@ fn init_meadow_mesh_path(
         pipelines.supported = false;
         return;
     }
-    info!("meadow mesh-shader path available; will take over once pipelines are ready");
+    // The takeover itself is logged by `decide_meadow_mesh_path` when the
+    // pipelines land (and composition failures downgrade to the flat
+    // fragment with their own warning) — don't promise it here.
+    info!("meadow mesh-shader path available");
 
     let device = render_device.wgpu_device();
     pipelines.geom_module = Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -511,15 +525,44 @@ fn extract_meadow_shader_sources(
     }
     out.by_module.clear();
     for (_, shader) in shaders.iter() {
-        let name = module_name(&shader.import_path);
-        if name.starts_with("bevy_pbr::")
-            || name.starts_with("bevy_render::")
-            || name.starts_with("bevy_core_pipeline::")
-            || name.as_ref() == "bevy_meadow::shared"
-        {
-            out.by_module.insert(name.into_owned(), shader.clone());
+        let ShaderImport::Custom(name) = &shader.import_path else {
+            continue;
+        };
+        if !is_collectable_module(name) {
+            continue;
         }
+        let Some(path) = custom_module_path(name) else {
+            continue;
+        };
+        out.by_module.insert(path, shader.clone());
     }
+    out.generation += 1;
+}
+
+/// Module names the collection above keeps: bevy's shader library plus
+/// the meadow shared library. A `ModuleNotFound` for one of these can
+/// still resolve on a later frame (the asset streams in); anything else
+/// can never appear and is a permanent composition failure.
+fn is_collectable_module(name: &str) -> bool {
+    name.starts_with("bevy_pbr::")
+        || name.starts_with("bevy_render::")
+        || name.starts_with("bevy_core_pipeline::")
+        || name == "bevy_meadow::meadow_shared"
+}
+
+/// The wesl module path of a `ShaderImport::Custom` name (bevy derives
+/// these from `embedded://` paths, e.g.
+/// `bevy_pbr::render::pbr_functions`).
+fn custom_module_path(name: &str) -> Option<wesl::syntax::ModulePath> {
+    let mut segments = name.split("::");
+    let package = segments.next().filter(|s| !s.is_empty())?;
+    let components = segments
+        .map(|s| (!s.is_empty()).then(|| s.to_string()))
+        .collect::<Option<Vec<_>>>()?;
+    Some(wesl::syntax::ModulePath {
+        origin: wesl::syntax::PathOrigin::Package(package.to_string()),
+        components,
+    })
 }
 
 // ---------- PBR fragment composition ----------
@@ -535,7 +578,7 @@ fn extract_meadow_shader_sources(
 /// double-sided). Varyings MUST match `MeadowVertexOut` in
 /// `meadow_mesh.wgsl` by location.
 const PBR_FRAGMENT_SOURCE: &str = r#"
-#import bevy_pbr::{
+import bevy_pbr::render::{
     mesh_view_bindings::view,
     pbr_types::pbr_input_new,
     pbr_functions::{
@@ -543,8 +586,8 @@ const PBR_FRAGMENT_SOURCE: &str = r#"
         prepare_world_normal,
     },
     mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
-}
-#import bevy_meadow::shared::VariantParams
+};
+import bevy_meadow::meadow_shared::VariantParams;
 
 struct MeadowMeshView {
     clip_from_world: mat4x4<f32>,
@@ -670,125 +713,290 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec2<f32> {
 }
 "#;
 
-fn to_naga_oil_defs(
+/// Which PBR fragment to compose. `Forward` is the only variant today;
+/// a deferred G-buffer fragment slots in as a second arm carrying its
+/// own root source + import roots.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeadowPbrVariant {
+    Forward,
+}
+
+impl MeadowPbrVariant {
+    fn root_source(self) -> &'static str {
+        match self {
+            Self::Forward => PBR_FRAGMENT_SOURCE,
+        }
+    }
+
+    /// Module-level roots of the variant's `import` statements — the def
+    /// closure walks the shader-library import graph from these. Must
+    /// stay in sync with the imports in [`Self::root_source`].
+    fn import_roots(self) -> &'static [&'static str] {
+        match self {
+            Self::Forward => &[
+                "bevy_pbr::render::mesh_view_bindings",
+                "bevy_pbr::render::pbr_types",
+                "bevy_pbr::render::pbr_functions",
+                "bevy_pbr::render::mesh_types",
+                "bevy_meadow::meadow_shared",
+            ],
+        }
+    }
+}
+
+/// Composition failure, classified for the caller's retry policy.
+enum PbrComposeError {
+    /// An imported module isn't in the collected sources yet but matches
+    /// the collected prefixes, so it can still stream in — retry when
+    /// the collection refreshes. Carries the module name.
+    MissingModule(String),
+    /// Anything else (syntax/validation errors, a module outside the
+    /// collected set) — permanent for this def set + source snapshot.
+    Permanent(String),
+}
+
+/// The innermost `ModuleNotFound` module path in a wesl error, if any.
+fn missing_module_path(error: &wesl::Error) -> Option<&wesl::syntax::ModulePath> {
+    match error {
+        wesl::Error::ResolveError(wesl::ResolveError::ModuleNotFound(path, _))
+        | wesl::Error::ImportError(wesl::ImportError::ResolveError(
+            wesl::ResolveError::ModuleNotFound(path, _),
+        )) => Some(path),
+        wesl::Error::Error(diagnostic) => missing_module_path(&diagnostic.error),
+        _ => None,
+    }
+}
+
+/// `pkg::a::b` name of a package-origin module path (the inverse of
+/// [`custom_module_path`]); other origins render via `Display`.
+fn module_path_name(path: &wesl::syntax::ModulePath) -> String {
+    match &path.origin {
+        wesl::syntax::PathOrigin::Package(pkg) => std::iter::once(pkg.as_str())
+            .chain(path.components.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("::"),
+        _ => path.to_string(),
+    }
+}
+
+/// Wesl import resolver over the collected shader-library snapshot, plus
+/// bevy's virtual `constants` module (shader defs with values) and the
+/// virtual root module holding the inline fragment source. Mirrors
+/// bevy_shader's `ShaderResolver`.
+struct MeadowShaderResolver<'a> {
+    sources: &'a StdHashMap<wesl::syntax::ModulePath, Shader>,
+    constants_source: &'a str,
+    root_path: &'a wesl::syntax::ModulePath,
+    root_source: &'a str,
+}
+
+impl wesl::Resolver for MeadowShaderResolver<'_> {
+    fn resolve_source(
+        &self,
+        module_path: &wesl::syntax::ModulePath,
+    ) -> Result<Cow<'_, str>, wesl::ResolveError> {
+        let module_path = self.canonical_path(module_path);
+        if module_path == *self.root_path {
+            return Ok(Cow::Borrowed(self.root_source));
+        }
+        if module_path.origin == wesl::syntax::PathOrigin::Package("constants".to_string())
+            && module_path.components.is_empty()
+        {
+            return Ok(Cow::Borrowed(self.constants_source));
+        }
+        self.sources
+            .get(&module_path)
+            .map(|shader| Cow::Borrowed(shader.source.as_str()))
+            .ok_or_else(|| {
+                wesl::ResolveError::ModuleNotFound(
+                    module_path.clone(),
+                    "module not collected from the shader library".to_string(),
+                )
+            })
+    }
+
+    fn canonical_path(&self, module_path: &wesl::syntax::ModulePath) -> wesl::syntax::ModulePath {
+        // Collapse a '/'-bearing package to its last segment, like
+        // bevy_shader's resolver.
+        match &module_path.origin {
+            wesl::syntax::PathOrigin::Package(pkg) if pkg.contains('/') => {
+                wesl::syntax::ModulePath {
+                    origin: wesl::syntax::PathOrigin::Package(
+                        pkg.rsplit('/').next().unwrap().to_string(),
+                    ),
+                    components: module_path.components.clone(),
+                }
+            }
+            _ => module_path.clone(),
+        }
+    }
+
+    fn display_name(&self, module_path: &wesl::syntax::ModulePath) -> Option<String> {
+        let module_path = self.canonical_path(module_path);
+        Some(self.sources.get(&module_path)?.path.clone())
+    }
+}
+
+/// Compose the PBR fragment to WGSL text with bevy_shader's exact wesl
+/// recipe: feature flags + a virtual `constants` module built from the
+/// def list, the import-closure defs of the library modules, and the
+/// device-global defs; compiled with `EscapeMangler` (root declarations
+/// — the entry points — keep their names).
+fn compose_pbr_fragment_wgsl(
+    sources: &MeadowMeshShaderSources,
     defs: &[ShaderDefVal],
-) -> StdHashMap<String, naga_oil::compose::ShaderDefValue> {
-    use naga_oil::compose::ShaderDefValue;
-    defs.iter()
-        .map(|d| match d {
-            ShaderDefVal::Bool(k, v) => (k.to_string(), ShaderDefValue::Bool(*v)),
-            ShaderDefVal::Int(k, v) => (k.to_string(), ShaderDefValue::Int(*v)),
-            ShaderDefVal::UInt(k, v) => (k.to_string(), ShaderDefValue::UInt(*v)),
-        })
-        .collect()
+    max_storage_buffers_per_shader_stage: u32,
+    rec2020: bool,
+    variant: MeadowPbrVariant,
+) -> Result<String, PbrComposeError> {
+    let root_path = wesl::syntax::ModulePath {
+        origin: wesl::syntax::PathOrigin::Package("bevy_meadow".to_string()),
+        components: vec!["mesh_pbr_fragment".to_string()],
+    };
+
+    let mut compiler_options = wesl::CompileOptions {
+        imports: true,
+        condcomp: true,
+        ..Default::default()
+    };
+
+    // Def closure: the shader_defs of every library module transitively
+    // imported by the root. Library defs (e.g. mesh_view_types' MAX_*
+    // constants) live on the Shader assets, not in the pipeline's def
+    // list — bevy's shader cache does the same walk.
+    let mut closure_defs: Vec<&ShaderDefVal> = Vec::new();
+    let mut visited: std::collections::HashSet<wesl::syntax::ModulePath> =
+        std::collections::HashSet::new();
+    let mut to_visit: Vec<wesl::syntax::ModulePath> = variant
+        .import_roots()
+        .iter()
+        .filter_map(|name| custom_module_path(name))
+        .collect();
+    while let Some(path) = to_visit.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let Some(shader) = sources.by_module.get(&path) else {
+            // Item-level import candidates and not-yet-collected modules;
+            // the compile itself reports genuinely missing modules.
+            continue;
+        };
+        closure_defs.extend(shader.shader_defs.iter());
+        for import in &shader.imports {
+            if let ShaderImport::Custom(name) = import
+                && let Some(import_path) = custom_module_path(name)
+            {
+                to_visit.push(import_path);
+            }
+        }
+    }
+
+    // Device-global defs bevy's PipelineCache registers outside the
+    // specialize def list (it splices them into every shader inside its
+    // private cache, so they never appear on the `Assets<Shader>` clones
+    // we collect). Applied last, like the root shader's own defs in
+    // bevy's fold.
+    let mut global_defs: Vec<ShaderDefVal> = vec![
+        ShaderDefVal::UInt(
+            "AVAILABLE_STORAGE_BUFFER_BINDINGS".into(),
+            max_storage_buffers_per_shader_stage,
+        ),
+        ShaderDefVal::Bool(
+            "AVAILABLE_STORAGE_BUFFER_BINDINGS__GE_3".into(),
+            max_storage_buffers_per_shader_stage >= 3,
+        ),
+        ShaderDefVal::Bool(
+            "AVAILABLE_STORAGE_BUFFER_BINDINGS__GE_6".into(),
+            max_storage_buffers_per_shader_stage >= 6,
+        ),
+    ];
+    if rec2020 {
+        global_defs.push(ShaderDefVal::Bool("WORKING_COLOR_SPACE_REC2020".into(), true));
+    }
+
+    let mut constants = std::collections::BTreeMap::new();
+    for shader_def in closure_defs
+        .into_iter()
+        .chain(defs.iter())
+        .chain(global_defs.iter())
+    {
+        match shader_def {
+            ShaderDefVal::Bool(key, value) => {
+                compiler_options
+                    .features
+                    .flags
+                    .insert(key.to_string(), (*value).into());
+            }
+            ShaderDefVal::Int(key, value) => {
+                compiler_options
+                    .features
+                    .flags
+                    .insert(key.to_string(), true.into());
+                constants.insert(key.as_ref(), value.to_string());
+            }
+            ShaderDefVal::UInt(key, value) => {
+                compiler_options
+                    .features
+                    .flags
+                    .insert(key.to_string(), true.into());
+                constants.insert(key.as_ref(), value.to_string());
+            }
+        }
+    }
+    let constants_source: String = constants
+        .iter()
+        .map(|(name, value)| format!("const {name} = {value};\n"))
+        .collect();
+
+    let resolver = MeadowShaderResolver {
+        sources: &sources.by_module,
+        constants_source: &constants_source,
+        root_path: &root_path,
+        root_source: variant.root_source(),
+    };
+
+    let compiled = wesl::compile_sourcemap(
+        &root_path,
+        &resolver,
+        &wesl::EscapeMangler,
+        &compiler_options,
+    )
+    .map_err(|error| {
+        if let Some(path) = missing_module_path(&error) {
+            let name = module_path_name(path);
+            if is_collectable_module(&name) {
+                return PbrComposeError::MissingModule(name);
+            }
+        }
+        PbrComposeError::Permanent(format!("composing meadow PBR fragment: {error}"))
+    })?;
+
+    Ok(compiled.to_string())
 }
 
-/// Recursively add `module` and its import tree to the composer,
-/// dependencies first (mirrors bevy_shader's `add_import_to_composer`).
-fn add_module_with_deps(
-    composer: &mut naga_oil::compose::Composer,
-    sources: &StdHashMap<String, Shader>,
-    module: &str,
-) -> Result<(), String> {
-    if composer.contains_module(module) {
-        return Ok(());
-    }
-    let shader = sources
-        .get(module)
-        .ok_or_else(|| format!("shader library `{module}` not loaded yet"))?;
-    for import in &shader.imports {
-        add_module_with_deps(composer, sources, &module_name(import))?;
-    }
-    composer
-        .add_composable_module(composable_descriptor(shader))
-        .map_err(|e| format!("composing `{module}`: {e}"))?;
-    Ok(())
-}
-
-/// The naga_oil module name of a shader: custom import paths are the module
-/// name verbatim, asset paths are quoted. Bevy's shader library ships WESL
-/// modules (no naga_oil module names), so `by_module` fills only from
-/// naga_oil-dialect sources — until this composer is ported to WESL,
-/// `compose_pbr_fragment` errors on the missing library and the compute
-/// path serves every meadow.
-fn module_name(import: &ShaderImport) -> Cow<'_, str> {
-    match import {
-        ShaderImport::AssetPath(s) => Cow::Owned(format!("\"{s}\"")),
-        ShaderImport::Custom(s) => Cow::Borrowed(s),
-    }
-}
-
-/// A naga_oil composable-module descriptor for a naga_oil-dialect shader,
-/// registered under the same module-name scheme as [`module_name`].
-fn composable_descriptor(shader: &Shader) -> naga_oil::compose::ComposableModuleDescriptor<'_> {
-    naga_oil::compose::ComposableModuleDescriptor {
-        source: shader.source.as_str(),
-        file_path: &shader.path,
-        language: naga_oil::compose::ShaderLanguage::Wgsl,
-        additional_imports: &[],
-        shader_defs: to_naga_oil_defs(&shader.shader_defs),
-        as_name: match &shader.import_path {
-            ShaderImport::AssetPath(p) => Some(format!("\"{p}\"")),
-            ShaderImport::Custom(_) => None,
-        },
-    }
-}
-
-/// Compose the PBR fragment with the given defs and create the raw
-/// shader module. Errors are strings so callers can log-and-fallback.
+/// Compose the PBR fragment and create the raw shader module. The WGSL
+/// output is handed to wgpu, which validates it against the real device
+/// (a genuine capability miss fails there and the caller falls back to
+/// the flat fragment).
 fn compose_pbr_fragment(
     sources: &MeadowMeshShaderSources,
     defs: &[ShaderDefVal],
     render_device: &RenderDevice,
-) -> Result<wgpu::ShaderModule, String> {
-    // Validation is skipped (like bevy's release-mode composer), but
-    // naga_oil ALWAYS validates each composable module's generated header
-    // with `Composer::capabilities` — and the defaults reject capability-
-    // gated constructs the view bindings legitimately use (binding_array
-    // environment maps under ENVIRONMENT_MAP, cube texture arrays).
-    // Grant everything: bevy derives these from the device, but a
-    // superset is safe because wgpu re-validates the final module against
-    // the real device at create_shader_module (a genuine capability miss
-    // fails there and we fall back to the flat fragment). NOTE:
-    // `with_capabilities` resets other composer fields — chain it at
-    // construction only.
-    let mut composer = naga_oil::compose::Composer::non_validating()
-        .with_capabilities(naga::valid::Capabilities::all());
-    for root in [
-        "bevy_pbr::mesh_view_bindings",
-        "bevy_pbr::pbr_types",
-        "bevy_pbr::pbr_functions",
-        "bevy_pbr::mesh_types",
-        "bevy_meadow::shared",
-    ] {
-        add_module_with_deps(&mut composer, &sources.by_module, root)?;
-    }
-
-    let mut shader_defs = to_naga_oil_defs(defs);
-    // Global def bevy injects per-device outside the specialize def list.
-    shader_defs
-        .entry("AVAILABLE_STORAGE_BUFFER_BINDINGS".into())
-        .or_insert_with(|| {
-            naga_oil::compose::ShaderDefValue::UInt(
-                render_device.limits().max_storage_buffers_per_shader_stage,
-            )
-        });
-
-    let module = composer
-        .make_naga_module(naga_oil::compose::NagaModuleDescriptor {
-            source: PBR_FRAGMENT_SOURCE,
-            file_path: "bevy_meadow/meadow_mesh_pbr_fragment.wgsl",
-            shader_type: naga_oil::compose::ShaderType::Wgsl,
-            shader_defs,
-            additional_imports: &[],
-        })
-        .map_err(|e| format!("composing meadow PBR fragment: {e}"))?;
-
+    rec2020: bool,
+    variant: MeadowPbrVariant,
+) -> Result<wgpu::ShaderModule, PbrComposeError> {
+    let wgsl = compose_pbr_fragment_wgsl(
+        sources,
+        defs,
+        render_device.limits().max_storage_buffers_per_shader_stage,
+        rec2020,
+        variant,
+    )?;
     Ok(render_device
         .wgpu_device()
         .create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("meadow_mesh_pbr_fragment"),
-            source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl)),
         }))
 }
 
@@ -872,6 +1080,7 @@ fn prepare_meadow_mesh_pipelines(
     specialized: Res<SpecializedMaterialPipelineCache>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
+    working_color_space: Res<bevy::render::WorkingColorSpace>,
     force: Res<MeadowForceComputePath>,
     mut pipelines: ResMut<MeadowMeshPipelines>,
     mut shader_sources: ResMut<MeadowMeshShaderSources>,
@@ -926,24 +1135,43 @@ fn prepare_meadow_mesh_pipelines(
     let mut hasher = std::hash::DefaultHasher::new();
     frag.shader_defs.hash(&mut hasher);
     let defs_hash = hasher.finish();
-    if pipelines.pbr_defs_hash != Some(defs_hash) && pipelines.pbr_failed_defs != Some(defs_hash) {
-        match compose_pbr_fragment(&shader_sources, &frag.shader_defs, &render_device) {
+    if pipelines.pbr_defs_hash != Some(defs_hash)
+        && pipelines.pbr_failed != Some((defs_hash, shader_sources.generation))
+    {
+        match compose_pbr_fragment(
+            &shader_sources,
+            &frag.shader_defs,
+            &render_device,
+            working_color_space.is_rec2020(),
+            MeadowPbrVariant::Forward,
+        ) {
             Ok(module) => {
                 info!("meadow mesh-shader PBR fragment composed");
                 pipelines.pbr_fragment = Some(module);
                 pipelines.pbr_defs_hash = Some(defs_hash);
+                pipelines.pbr_failed = None;
+                pipelines.pbr_missing_logged = None;
                 // Stale-def pipelines are unreachable via the key; clear
                 // to bound the map.
                 pipelines.main_pipelines.clear();
                 shader_sources.frozen = true;
             }
-            Err(err) => {
-                if err.contains("not loaded yet") {
-                    // Assets still streaming in — retry next frame.
-                    return;
+            Err(PbrComposeError::MissingModule(module)) => {
+                // A library shader still streaming in — retry as assets
+                // load. Logged once per module name so a renamed/removed
+                // upstream module can't stall the mesh path silently.
+                if pipelines.pbr_missing_logged.as_deref() != Some(module.as_str()) {
+                    warn!(
+                        "meadow PBR fragment waiting on shader module `{module}` \
+                        (retries as shader assets load)"
+                    );
+                    pipelines.pbr_missing_logged = Some(module);
                 }
+                return;
+            }
+            Err(PbrComposeError::Permanent(err)) => {
                 warn!("{err}; meadow mesh path falls back to flat-lit fragment");
-                pipelines.pbr_failed_defs = Some(defs_hash);
+                pipelines.pbr_failed = Some((defs_hash, shader_sources.generation));
                 // The old module's view-binding declarations match the
                 // OLD layout — unusable with pipelines built for the new
                 // defs. Flat until a compose succeeds.
@@ -1516,6 +1744,133 @@ pub fn meadow_mesh_shadow_pass(
 
 #[cfg(test)]
 mod tests {
+    use bevy::shader::{Shader, ShaderDefVal};
+    use std::path::{Path, PathBuf};
+
+    /// The bevy checkout the composer test reads the real shader library
+    /// from: `BEVY_CHECKOUT` if set, else the sibling `../bevy` checkout.
+    /// `None` (test skips) when neither holds a bevy source tree.
+    fn bevy_checkout() -> Option<PathBuf> {
+        let root = std::env::var_os("BEVY_CHECKOUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../bevy"));
+        root.join("crates/bevy_pbr/src/render/pbr_functions.wesl")
+            .exists()
+            .then_some(root)
+    }
+
+    /// Register every `.wesl` under `dir` the way `load_shader_library!`
+    /// does at runtime: `embedded://<crate>/<path-under-src>` paths, so
+    /// module names and import scanning match the real asset registry.
+    fn collect_wesl_dir(
+        crate_name: &str,
+        src_root: &Path,
+        dir: &Path,
+        out: &mut super::MeadowMeshShaderSources,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("readable bevy source dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_wesl_dir(crate_name, src_root, &path, out);
+            } else if path.extension().is_some_and(|e| e == "wesl") {
+                let rel = path
+                    .strip_prefix(src_root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = std::fs::read_to_string(&path).expect("readable wesl file");
+                let shader = Shader::from_wesl(source, format!("embedded://{crate_name}/{rel}"));
+                let bevy::shader::ShaderImport::Custom(name) = &shader.import_path else {
+                    panic!("embedded wesl path must derive a custom import");
+                };
+                let module_path = super::custom_module_path(name).expect("module path");
+                out.by_module.insert(module_path, shader);
+            }
+        }
+    }
+
+    /// Run the composer offline against the REAL bevy shader library
+    /// (skipped when no bevy checkout is present) with a representative
+    /// forward def set: the composition must succeed, both entry points
+    /// must survive under their unmangled names, and the output must be
+    /// WGSL that naga parses + validates.
+    #[test]
+    fn pbr_fragment_composes_against_bevy_library() {
+        let Some(root) = bevy_checkout() else {
+            eprintln!("skipping: no bevy checkout at ../bevy (set BEVY_CHECKOUT)");
+            return;
+        };
+        let mut sources = super::MeadowMeshShaderSources::default();
+        for crate_name in ["bevy_pbr", "bevy_render", "bevy_core_pipeline"] {
+            let src = root.join("crates").join(crate_name).join("src");
+            collect_wesl_dir(crate_name, &src, &src, &mut sources);
+        }
+        // Library defs bevy registers through loader settings
+        // (`mesh_view_types.wesl` in `MeshRenderPlugin::build`) — carried
+        // on the Shader asset, folded in by the composer's def closure.
+        let mesh_view_types = super::custom_module_path("bevy_pbr::render::mesh_view_types")
+            .expect("module path");
+        sources
+            .by_module
+            .get_mut(&mesh_view_types)
+            .expect("mesh_view_types collected")
+            .shader_defs = vec![
+            ShaderDefVal::UInt("MAX_DIRECTIONAL_LIGHTS".into(), 10),
+            ShaderDefVal::UInt("MAX_CASCADES_PER_LIGHT".into(), 4),
+            ShaderDefVal::UInt("MAX_RECT_LIGHTS".into(), 8),
+        ];
+        // The meadow shared library, as `MeadowPlugin` registers it.
+        sources.by_module.insert(
+            super::custom_module_path("bevy_meadow::meadow_shared").expect("module path"),
+            Shader::from_wesl(
+                include_str!("meadow_shared.wesl"),
+                "embedded://bevy_meadow/meadow_shared.wesl",
+            ),
+        );
+
+        // Representative forward-view def set (a subset of what the
+        // meadow material's specialized pipeline hands over at runtime).
+        let defs: Vec<ShaderDefVal> = vec![
+            "VERTEX_POSITIONS".into(),
+            "VERTEX_NORMALS".into(),
+            "TONEMAP_IN_SHADER".into(),
+            "TONEMAP_METHOD_TONY_MC_MAPFACE".into(),
+            ShaderDefVal::UInt("TONEMAPPING_LUT_TEXTURE_BINDING_INDEX".into(), 18),
+            ShaderDefVal::UInt("TONEMAPPING_LUT_SAMPLER_BINDING_INDEX".into(), 19),
+        ];
+
+        let wgsl = match super::compose_pbr_fragment_wgsl(
+            &sources,
+            &defs,
+            12,
+            false,
+            super::MeadowPbrVariant::Forward,
+        ) {
+            Ok(wgsl) => wgsl,
+            Err(super::PbrComposeError::MissingModule(module)) => {
+                panic!("composer reported module `{module}` missing from a full checkout")
+            }
+            Err(super::PbrComposeError::Permanent(err)) => panic!("{err}"),
+        };
+
+        // The raw-wgpu pipelines reference these entry names directly.
+        assert!(wgsl.contains("fn fragment("), "entry `fragment` lost");
+        assert!(wgsl.contains("fn fragment_mv("), "entry `fragment_mv` lost");
+
+        let module = naga::front::wgsl::parse_str(&wgsl).unwrap_or_else(|e| {
+            panic!(
+                "composed PBR fragment failed to parse:\n{}",
+                e.emit_to_string(&wgsl)
+            )
+        });
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("composed PBR fragment failed validation: {e:?}"));
+    }
+
     /// The assembled task/mesh module must parse + validate with the same
     /// (workspace-patched) naga wgpu uses at runtime — the WGSL mesh
     /// shader frontend is new, so pin it in `cargo test` rather than

@@ -24,9 +24,11 @@ publish = false
 # compute path stays the portable fallback. `MeadowForceComputePath`
 # forces the compute path at runtime for comparison. The direct `wgpu`
 # dep resolves to the workspace-patched trunk pin (see the root `[patch]`
-# sections), same as the one inside Bevy — `naga-ir` lets us hand
-# naga_oil-composed modules straight to `create_shader_module`.
-mesh-shaders = ["dep:wgpu", "dep:naga_oil", "dep:naga"]
+# sections), same as the one inside Bevy. `wesl` is the same compiler
+# bevy_shader drives — the runtime PBR fragment is composed with it
+# against bevy's WESL shader library (keep the dep line in sync with
+# bevy_shader's).
+mesh-shaders = ["dep:wgpu", "dep:wesl"]
 
 [dependencies]
 bevy = { git = "https://github.com/bevyengine/bevy", default-features = false, features = [
@@ -42,12 +44,8 @@ wyrand = { version = "0.4", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = { version = "30", optional = true, default-features = false, features = [
     "wgsl",
-    "naga-ir",
 ] }
-naga_oil = { version = "0.23", optional = true, default-features = false }
-# Same patched naga the workspace pins; needed to hand the composer the
-# device-superset validation capabilities (binding arrays etc.).
-naga = { version = "30", optional = true, default-features = false }
+wesl = { version = "0.4.2", features = ["naga-ext"], optional = true }
 
 [[example]]
 name = "meadow"
