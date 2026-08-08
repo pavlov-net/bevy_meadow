@@ -7,14 +7,17 @@
 //! small pure-expander mesh workgroups through the task payload — no
 //! intermediate `out_blades` buffer, no cursors, no indirect args
 //! (see `meadow_mesh.wgsl` for the stage-split rationale). It serves
-//! BOTH the main camera view (full PBR fragment + motion vectors) and
-//! the directional shadow cascades (depth-only proxy-silhouette
-//! pipelines drawn into each cascade after bevy's shadow pass).
+//! BOTH the main camera view — forward (full PBR fragment + motion
+//! vectors) or deferred (G-buffer fragment drawn straight into bevy's
+//! deferred prepass attachments, shaded by the deferred lighting pass /
+//! solari like every other deferred surface) — and the directional
+//! shadow cascades (depth-only proxy-silhouette pipelines drawn into
+//! each cascade after bevy's shadow pass).
 //!
 //! The compute path stays intact behind [`MeadowForceComputePath`] (force
 //! it at runtime to compare) and is the automatic fallback when
-//! `EXPERIMENTAL_MESH_SHADER` is absent (pre-Turing/pre-RDNA2, non-Vulkan)
-//! or the view renders deferred: [`MeadowMeshPathActive`] flips
+//! `EXPERIMENTAL_MESH_SHADER` is absent (pre-Turing/pre-RDNA2,
+//! non-Vulkan): [`MeadowMeshPathActive`] flips
 //! per frame, `DrawMeadowPatch` skips the views the mesh path serves, and
 //! `prepare_meadow_gpu_buffers` collapses the per-view blade regions to
 //! zero so the VRAM saving is real.
@@ -46,15 +49,18 @@ use bevy::camera::{Camera3d, MainPassResolutionOverride, Viewport};
 use bevy::core_pipeline::core_3d::{
     CORE_3D_DEPTH_FORMAT, main_opaque_pass_3d, main_transparent_pass_3d,
 };
+use bevy::core_pipeline::deferred::copy_lighting_id::copy_deferred_lighting_id;
+use bevy::core_pipeline::deferred::node::late_deferred_prepass;
 use bevy::core_pipeline::prepass::{
     DeferredPrepass, MOTION_VECTOR_PREPASS_FORMAT, MotionVectorPrepass, PreviousViewData,
-    ViewPrepassTextures,
+    PreviousViewUniformOffset, ViewPrepassTextures,
 };
 use bevy::core_pipeline::{Core3d, Core3dSystems};
 use bevy::ecs::resource::Resource;
 use bevy::pbr::{
-    LATE_SHADOW_PASS, LightEntity, MeshViewBindGroup, ShadowView, SpecializedMaterialPipelineCache,
-    ViewLightEntities, per_view_shadow_pass,
+    LATE_SHADOW_PASS, LightEntity, MeshViewBindGroup, PrepassViewBindGroup, ShadowView,
+    SpecializedMaterialPipelineCache, SpecializedPrepassMaterialPipelineCache, ViewLightEntities,
+    per_view_shadow_pass,
 };
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
@@ -74,7 +80,9 @@ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery
 use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::sync_world::MainEntity;
 use bevy::render::texture::GpuImage;
-use bevy::render::view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget};
+use bevy::render::view::{
+    ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget, ViewUniformOffset,
+};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderStartup, RenderSystems};
 use bevy::shader::{Shader, ShaderDefVal, ShaderImport};
 
@@ -164,6 +172,39 @@ pub struct MeadowMainPipelineKey {
     pub defs_hash: u64,
 }
 
+/// Key for the deferred-view mesh pipeline. Derived from the meadow
+/// material's specialized deferred prepass pipeline: `defs_hash` covers
+/// everything the descriptor varies on (target list, view layout), while
+/// `mv`/`normal` are lifted out for the pass to select the matching
+/// prepass view bind group and attachment slots.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub struct MeadowDeferredPipelineKey {
+    /// Hash of the specialized deferred pipeline's shader defs (same
+    /// layout-mismatch rationale as [`MeadowMainPipelineKey::defs_hash`]).
+    pub defs_hash: u64,
+    /// MOTION_VECTOR_PREPASS: the pipeline was built against the
+    /// motion-vectors prepass view layout and writes color target 1.
+    pub mv: bool,
+    /// NORMAL_PREPASS: the pipeline writes color target 0.
+    pub normal: bool,
+}
+
+/// One wesl-composed PBR fragment variant + its retry bookkeeping.
+#[derive(Default)]
+pub struct ComposedPbrFragment {
+    pub module: Option<wgpu::ShaderModule>,
+    /// Hash of the shader-def set the fragment was composed with;
+    /// recompose when the specialized pipeline's defs change.
+    pub defs_hash: Option<u64>,
+    /// (def-set hash, source-snapshot generation) a composition attempt
+    /// permanently failed for. A def change — e.g. DLSS toggling the
+    /// prepasses — or a refreshed shader collection (hot reload) retries.
+    pub failed: Option<(u64, u64)>,
+    /// Module name already logged as missing (waiting-to-stream); keeps
+    /// the retry loop visible in the log without spamming it.
+    pub missing_logged: Option<String>,
+}
+
 /// Everything raw-wgpu the mesh path owns: shader modules, the meadow
 /// bind group layout, and the lazily-created pipelines.
 #[derive(Resource, Default)]
@@ -178,23 +219,25 @@ pub struct MeadowMeshPipelines {
     /// Empty bind group for the shadow pipeline's unused slots 0-2 (and
     /// layout-compatible with the main pipeline's empty slot 2).
     pub empty_bind_group: Option<BindGroup>,
-    /// wesl-composed PBR fragment (entries `fragment`/`fragment_mv`).
-    pub pbr_fragment: Option<wgpu::ShaderModule>,
-    /// Hash of the shader-def set the PBR fragment was composed with;
-    /// recompose when the specialized pipeline's defs change.
-    pub pbr_defs_hash: Option<u64>,
-    /// (def-set hash, source-snapshot generation) a composition attempt
-    /// permanently failed for (fall back to the flat fragment). A def
-    /// change — e.g. DLSS toggling the prepasses — or a refreshed shader
-    /// collection (hot reload) retries.
-    pub pbr_failed: Option<(u64, u64)>,
-    /// Module name already logged as missing (waiting-to-stream); keeps
-    /// the retry loop visible in the log without spamming it.
-    pub pbr_missing_logged: Option<String>,
+    /// Forward fragment (entries `fragment`/`fragment_mv`), used on
+    /// non-deferred main views. A permanent composition failure falls
+    /// back to the flat-lit fragment.
+    pub forward_fragment: ComposedPbrFragment,
+    /// Deferred G-buffer fragment (entry `fragment_deferred`), used on
+    /// deferred main views. There is no flat fallback for the packed
+    /// G-buffer — a permanent composition failure leaves deferred views
+    /// to the compute path.
+    pub deferred_fragment: ComposedPbrFragment,
     pub main_pipelines: HashMap<MeadowMainPipelineKey, wgpu::RenderPipeline>,
-    /// Key the current frame's main view resolves to (None until known).
+    pub deferred_pipelines: HashMap<MeadowDeferredPipelineKey, wgpu::RenderPipeline>,
+    /// Key the current frame's main view resolves to when it renders
+    /// forward (None until known, and always None on deferred views —
+    /// exactly one of `current_main_key`/`current_deferred_key` is set
+    /// per frame, which is what routes the pass systems).
     /// `decide_meadow_mesh_path` requires the matching pipeline to exist.
     pub current_main_key: Option<MeadowMainPipelineKey>,
+    /// Deferred-view counterpart of `current_main_key`.
+    pub current_deferred_key: Option<MeadowDeferredPipelineKey>,
     pub shadow_pipeline: Option<wgpu::RenderPipeline>,
     /// Fullscreen composite copying the meadow-owned motion target's
     /// valid texels into bevy's MV prepass texture (which can't be an
@@ -290,6 +333,14 @@ pub fn build_meadow_mesh_path(render_app: &mut SubApp) {
                 meadow_mesh_mv_composite_pass
                     .after(meadow_mesh_main_pass)
                     .before(main_transparent_pass_3d),
+                // G-buffer contribution: after every deferred mesh draw
+                // (late prepass included), before the lighting-id copy —
+                // and thereby before bevy's deferred lighting and
+                // solari's G-buffer consumption (both in the MainPass
+                // set).
+                meadow_mesh_deferred_pass
+                    .after(late_deferred_prepass)
+                    .before(copy_deferred_lighting_id),
             ),
         );
 }
@@ -440,7 +491,12 @@ fn empty_bgl_desc() -> BindGroupLayoutDescriptor {
 /// single-sample MV-prepass configs (DLSS/TAA).
 fn prepare_meadow_mesh_mv_target(
     views: Query<
-        (&ExtractedCamera, &Msaa, Has<MotionVectorPrepass>),
+        (
+            &ExtractedCamera,
+            &Msaa,
+            Has<MotionVectorPrepass>,
+            Has<DeferredPrepass>,
+        ),
         (With<Camera3d>, Without<LightEntity>),
     >,
     pipelines: Res<MeadowMeshPipelines>,
@@ -460,11 +516,18 @@ fn prepare_meadow_mesh_mv_target(
         }
         return;
     }
-    let wanted = views.iter().next().and_then(|(camera, msaa, has_mv)| {
-        (has_mv && msaa.samples() == 1)
-            .then_some(camera.physical_target_size)
-            .flatten()
-    });
+    // Deferred views don't route through this target: the deferred pass
+    // writes motion vectors straight into bevy's MV prepass attachment
+    // (its fragment binds no bind group that samples it, so there is no
+    // bound-vs-attached conflict to composite around).
+    let wanted = views
+        .iter()
+        .next()
+        .and_then(|(camera, msaa, has_mv, deferred)| {
+            (has_mv && msaa.samples() == 1 && !deferred)
+                .then_some(camera.physical_target_size)
+                .flatten()
+        });
     let Some(size) = wanted else {
         if target.view.is_some() {
             *target = MeadowMeshMvTarget::default();
@@ -690,6 +753,122 @@ fn fragment_mv(in: MeadowVertexOut, @builtin(front_facing) is_front: bool) -> Me
 }
 "#;
 
+/// The composed deferred G-buffer fragment. Same hand-built `PbrInput`
+/// as [`PBR_FRAGMENT_SOURCE`] (palette × height shade × clump luminance,
+/// hardcoded upright normal, shadow-receiver bit forced), but packed
+/// through `deferred_gbuffer_from_pbr_input` + the lighting-pass id —
+/// bevy's deferred lighting pass (or solari) shades it from the
+/// G-buffer, exactly like the compute path's `meadow.wesl` deferred arm
+/// via `deferred_output`. The output struct is bevy's own
+/// `prepass::io::FragmentOutput`, so the def set (lifted from the meadow
+/// material's specialized deferred prepass pipeline) makes the output
+/// locations match bevy's prepass attachment slots by construction.
+///
+/// Motion vectors are written directly to bevy's MV prepass attachment
+/// (location 1): the only view binding this fragment statically uses is
+/// the `View` uniform (through `deferred_gbuffer_from_pbr_input`'s
+/// exposure term), served by the prepass view layout — nothing in the
+/// pipeline's bind groups samples the deferred/MV textures, so they can
+/// be attachments of this very pass. Bevy's own `calculate_motion_vector`
+/// would drag in the previous-view uniform; the mesh-view matrices at
+/// group 3 carry the same data, so the MV math mirrors the flat/forward
+/// fragments instead (pinned by the mirror test).
+const DEFERRED_PBR_FRAGMENT_SOURCE: &str = r#"
+import bevy_pbr::render::{
+    pbr_types::pbr_input_new,
+    pbr_functions::prepare_world_normal,
+    mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
+};
+import bevy_pbr::deferred::functions::deferred_gbuffer_from_pbr_input;
+import bevy_pbr::prepass::io::FragmentOutput;
+import bevy_meadow::meadow_shared::VariantParams;
+
+struct MeadowMeshView {
+    clip_from_world: mat4x4<f32>,
+    unjittered_clip_from_world: mat4x4<f32>,
+    prev_clip_from_world: mat4x4<f32>,
+    params: vec4<u32>,
+}
+
+@group(3) @binding(0) var<uniform> variant_params: VariantParams;
+@group(3) @binding(6) var<uniform> mesh_view: MeadowMeshView;
+
+struct MeadowVertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) prev_world_position: vec4<f32>,
+    @location(2) misc: vec2<f32>,
+}
+
+// MIRROR: meadow.wesl::season_palette.
+fn season_palette() -> vec3<f32> {
+    let a_idx = u32(variant_params.season_blend.x);
+    let b_idx = u32(variant_params.season_blend.y);
+    let t = variant_params.season_blend.z;
+    var a = variant_params.palette_summer.rgb;
+    var b = variant_params.palette_summer.rgb;
+    if (a_idx == 0u) { a = variant_params.palette_spring.rgb; }
+    else if (a_idx == 1u) { a = variant_params.palette_summer.rgb; }
+    else if (a_idx == 2u) { a = variant_params.palette_autumn.rgb; }
+    else { a = variant_params.palette_winter.rgb; }
+    if (b_idx == 0u) { b = variant_params.palette_spring.rgb; }
+    else if (b_idx == 1u) { b = variant_params.palette_summer.rgb; }
+    else if (b_idx == 2u) { b = variant_params.palette_autumn.rgb; }
+    else { b = variant_params.palette_winter.rgb; }
+    return mix(a, b, clamp(t, 0.0, 1.0));
+}
+
+// MIRROR: meadow_mesh.wgsl::meadow_motion_vector (pinned by the mirror
+// test) — same jitter-free NDC delta bevy's calculate_motion_vector
+// produces, without the previous-view uniform binding.
+@if(MOTION_VECTOR_PREPASS)
+fn meadow_motion_vector(world: vec4<f32>, prev_world: vec4<f32>) -> vec2<f32> {
+    let clip = mesh_view.unjittered_clip_from_world * vec4<f32>(world.xyz, 1.0);
+    let prev_clip = mesh_view.prev_clip_from_world * vec4<f32>(prev_world.xyz, 1.0);
+    let ndc = clip.xy / clip.w;
+    let prev_ndc = prev_clip.xy / prev_clip.w;
+    return (ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
+}
+
+@fragment
+fn fragment_deferred(
+    in: MeadowVertexOut,
+    @builtin(front_facing) is_front: bool,
+) -> FragmentOutput {
+    var pbr_input = pbr_input_new();
+    let palette = season_palette();
+    let shade = mix(0.70, 1.00, in.misc.x);
+    let lum = in.misc.y;
+    // Mirror of the forward variant's material assembly (white base →
+    // blade_lum = lum, roughness 0.85, tip emissive).
+    pbr_input.material.base_color = vec4<f32>(palette * shade * lum, 1.0);
+    pbr_input.material.perceptual_roughness = 0.85;
+    let tip_glow = smoothstep(0.7, 1.0, in.misc.x) * 0.06;
+    pbr_input.material.emissive = vec4<f32>(palette * tip_glow, 1.0);
+    pbr_input.frag_coord = in.position;
+    pbr_input.world_position = in.world_position;
+    // Same hardcoded upright normal + double-sided back-face flip as the
+    // forward variant; V / is_orthographic stay at their defaults — the
+    // G-buffer doesn't pack them (the lighting pass reconstructs both
+    // from depth).
+    pbr_input.world_normal = prepare_world_normal(vec3<f32>(0.0, 1.0, 0.0), true, is_front);
+    pbr_input.N = normalize(pbr_input.world_normal);
+    // No real MeshUniform row exists for mesh-emitted geometry; force the
+    // shadow-receiver bit like the other meadow fragments — packed into
+    // the G-buffer flags, unpacked by the deferred lighting pass.
+    pbr_input.flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;
+
+    var out: FragmentOutput;
+    out.deferred = deferred_gbuffer_from_pbr_input(pbr_input);
+    out.deferred_lighting_pass_id = pbr_input.material.deferred_lighting_pass_id;
+@if(NORMAL_PREPASS)
+    out.normal = vec4<f32>(pbr_input.N * 0.5 + vec3<f32>(0.5), 1.0);
+@if(MOTION_VECTOR_PREPASS)
+    out.motion_vector = meadow_motion_vector(in.world_position, in.prev_world_position);
+    return out;
+}
+"#;
+
 /// Fullscreen composite: copy valid texels from the meadow-owned motion
 /// target into bevy's Rg16Float MV prepass texture. Standalone WGSL —
 /// a plain (vertex) render pipeline, nothing mesh-shader about it.
@@ -713,18 +892,20 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec2<f32> {
 }
 "#;
 
-/// Which PBR fragment to compose. `Forward` is the only variant today;
-/// a deferred G-buffer fragment slots in as a second arm carrying its
-/// own root source + import roots.
+/// Which PBR fragment to compose: the forward-lit fragment for the main
+/// pass, or the G-buffer fragment for bevy's deferred prepass
+/// attachments.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MeadowPbrVariant {
     Forward,
+    Deferred,
 }
 
 impl MeadowPbrVariant {
     fn root_source(self) -> &'static str {
         match self {
             Self::Forward => PBR_FRAGMENT_SOURCE,
+            Self::Deferred => DEFERRED_PBR_FRAGMENT_SOURCE,
         }
     }
 
@@ -738,6 +919,14 @@ impl MeadowPbrVariant {
                 "bevy_pbr::render::pbr_types",
                 "bevy_pbr::render::pbr_functions",
                 "bevy_pbr::render::mesh_types",
+                "bevy_meadow::meadow_shared",
+            ],
+            Self::Deferred => &[
+                "bevy_pbr::render::pbr_types",
+                "bevy_pbr::render::pbr_functions",
+                "bevy_pbr::render::mesh_types",
+                "bevy_pbr::deferred::functions",
+                "bevy_pbr::prepass::io",
                 "bevy_meadow::meadow_shared",
             ],
         }
@@ -911,7 +1100,10 @@ fn compose_pbr_fragment_wgsl(
         ),
     ];
     if rec2020 {
-        global_defs.push(ShaderDefVal::Bool("WORKING_COLOR_SPACE_REC2020".into(), true));
+        global_defs.push(ShaderDefVal::Bool(
+            "WORKING_COLOR_SPACE_REC2020".into(),
+            true,
+        ));
     }
 
     let mut constants = std::collections::BTreeMap::new();
@@ -1070,14 +1262,111 @@ fn prepare_meadow_mesh_view_uniforms(
 
 // ---------- Prepare: pipelines ----------
 
+/// Result of [`ensure_pbr_fragment`].
+enum ComposeOutcome {
+    /// `frag.module` matches the requested def set.
+    Composed,
+    /// A library module hasn't streamed in yet — retry next frame.
+    Waiting,
+    /// Permanent for this (def set, source snapshot) pair.
+    Failed,
+}
+
+/// Compose (or re-compose on def change) one PBR fragment variant. The
+/// def set changes with the view config (DLSS/TAA toggling prepasses,
+/// MSAA, forward/deferred), and it must match the view bind group layout,
+/// so both the fragment module and the pipelines are keyed by its hash.
+fn ensure_pbr_fragment(
+    frag: &mut ComposedPbrFragment,
+    variant: MeadowPbrVariant,
+    defs: &[ShaderDefVal],
+    defs_hash: u64,
+    sources: &mut MeadowMeshShaderSources,
+    render_device: &RenderDevice,
+    rec2020: bool,
+) -> ComposeOutcome {
+    if frag.defs_hash == Some(defs_hash) {
+        return ComposeOutcome::Composed;
+    }
+    if frag.failed == Some((defs_hash, sources.generation)) {
+        return ComposeOutcome::Failed;
+    }
+    match compose_pbr_fragment(sources, defs, render_device, rec2020, variant) {
+        Ok(module) => {
+            info!("meadow mesh-shader PBR fragment composed ({variant:?})");
+            frag.module = Some(module);
+            frag.defs_hash = Some(defs_hash);
+            frag.failed = None;
+            frag.missing_logged = None;
+            sources.frozen = true;
+            ComposeOutcome::Composed
+        }
+        Err(PbrComposeError::MissingModule(module)) => {
+            // A library shader still streaming in — retry as assets
+            // load. A snapshot frozen by the OTHER variant's success can
+            // predate this variant's imports: unfreeze + clear so the
+            // extractor re-collects once, then the streaming retry loop
+            // takes over. Logged once per module name so a renamed/
+            // removed upstream module can't stall the mesh path silently.
+            if sources.frozen {
+                sources.frozen = false;
+                sources.by_module.clear();
+            }
+            if frag.missing_logged.as_deref() != Some(module.as_str()) {
+                warn!(
+                    "meadow PBR fragment ({variant:?}) waiting on shader module `{module}` \
+                    (retries as shader assets load)"
+                );
+                frag.missing_logged = Some(module);
+            }
+            ComposeOutcome::Waiting
+        }
+        Err(PbrComposeError::Permanent(err)) => {
+            warn!(
+                "{err}; {}",
+                match variant {
+                    MeadowPbrVariant::Forward =>
+                        "meadow mesh path falls back to the flat-lit fragment",
+                    MeadowPbrVariant::Deferred =>
+                        "meadow mesh path leaves deferred views to the compute path",
+                }
+            );
+            frag.failed = Some((defs_hash, sources.generation));
+            // The old module's view-binding declarations match the OLD
+            // layout — unusable with pipelines built for the new defs.
+            frag.module = None;
+            frag.defs_hash = None;
+            ComposeOutcome::Failed
+        }
+    }
+}
+
+/// Whether `defs` contains the boolean def `name`, set.
+fn has_bool_def(defs: &[ShaderDefVal], name: &str) -> bool {
+    defs.iter()
+        .any(|def| matches!(def, ShaderDefVal::Bool(key, true) if key.as_ref() == name))
+}
+
+fn hash_defs(defs: &[ShaderDefVal]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    defs.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_meadow_mesh_pipelines(
     views: Query<
-        (&ExtractedView, &Msaa, Has<MotionVectorPrepass>),
+        (
+            &ExtractedView,
+            &Msaa,
+            Has<MotionVectorPrepass>,
+            Has<DeferredPrepass>,
+        ),
         (With<Camera3d>, Without<LightEntity>),
     >,
     drivers: Res<RenderMeadowDriver>,
     specialized: Res<SpecializedMaterialPipelineCache>,
+    prepass_specialized: Res<SpecializedPrepassMaterialPipelineCache>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     working_color_space: Res<bevy::render::WorkingColorSpace>,
@@ -1086,109 +1375,17 @@ fn prepare_meadow_mesh_pipelines(
     mut shader_sources: ResMut<MeadowMeshShaderSources>,
 ) {
     pipelines.current_main_key = None;
-    // Forced-compute leaves the key `None`, so `decide_meadow_mesh_path`
+    pipelines.current_deferred_key = None;
+    // Forced-compute leaves both keys `None`, so `decide_meadow_mesh_path`
     // can never activate against a stale key — the frame the force flag
     // unflips, the key (and any missing pipeline) is recomputed here
     // before the decision runs.
     if !pipelines.supported || force.0 {
         return;
     }
-    let Some((view, msaa, has_mv)) = views.iter().next() else {
+    let Some((view, msaa, has_mv, has_deferred)) = views.iter().next() else {
         return;
     };
-    // The meadow material's own specialized forward pipeline for this
-    // view: its shader defs + view bind group layouts + color target are
-    // the ground truth we build the raw mesh pipeline against.
-    let Some(view_cache) = specialized.get(&view.retained_view_entity) else {
-        return;
-    };
-    let Some(&pipeline_id) = drivers
-        .by_entity
-        .keys()
-        .find_map(|e| view_cache.get(&MainEntity::from(*e)))
-    else {
-        return;
-    };
-    // The specialized cache hands out ids at queue time, but
-    // `get_render_pipeline_descriptor` PANICS for ids the pipeline cache
-    // hasn't processed yet (freshly specialized this frame). Waiting for
-    // the compiled pipeline is bounds-safe and also guarantees we mirror
-    // a descriptor that actually built.
-    if pipeline_cache.get_render_pipeline(pipeline_id).is_none() {
-        return;
-    }
-    let descriptor = pipeline_cache.get_render_pipeline_descriptor(pipeline_id);
-    let Some(frag) = descriptor.fragment.as_ref() else {
-        return;
-    };
-    let Some(Some(color_target)) = frag.targets.first().cloned() else {
-        return;
-    };
-    if descriptor.layout.len() < 2 {
-        return;
-    }
-
-    // Compose (or re-compose on def change) the PBR fragment. The def
-    // set changes with the view config (DLSS/TAA toggling prepasses,
-    // MSAA), and it must match the view bind group layout, so both the
-    // fragment module and the pipelines are keyed by its hash.
-    let mut hasher = std::hash::DefaultHasher::new();
-    frag.shader_defs.hash(&mut hasher);
-    let defs_hash = hasher.finish();
-    if pipelines.pbr_defs_hash != Some(defs_hash)
-        && pipelines.pbr_failed != Some((defs_hash, shader_sources.generation))
-    {
-        match compose_pbr_fragment(
-            &shader_sources,
-            &frag.shader_defs,
-            &render_device,
-            working_color_space.is_rec2020(),
-            MeadowPbrVariant::Forward,
-        ) {
-            Ok(module) => {
-                info!("meadow mesh-shader PBR fragment composed");
-                pipelines.pbr_fragment = Some(module);
-                pipelines.pbr_defs_hash = Some(defs_hash);
-                pipelines.pbr_failed = None;
-                pipelines.pbr_missing_logged = None;
-                // Stale-def pipelines are unreachable via the key; clear
-                // to bound the map.
-                pipelines.main_pipelines.clear();
-                shader_sources.frozen = true;
-            }
-            Err(PbrComposeError::MissingModule(module)) => {
-                // A library shader still streaming in — retry as assets
-                // load. Logged once per module name so a renamed/removed
-                // upstream module can't stall the mesh path silently.
-                if pipelines.pbr_missing_logged.as_deref() != Some(module.as_str()) {
-                    warn!(
-                        "meadow PBR fragment waiting on shader module `{module}` \
-                        (retries as shader assets load)"
-                    );
-                    pipelines.pbr_missing_logged = Some(module);
-                }
-                return;
-            }
-            Err(PbrComposeError::Permanent(err)) => {
-                warn!("{err}; meadow mesh path falls back to flat-lit fragment");
-                pipelines.pbr_failed = Some((defs_hash, shader_sources.generation));
-                // The old module's view-binding declarations match the
-                // OLD layout — unusable with pipelines built for the new
-                // defs. Flat until a compose succeeds.
-                pipelines.pbr_fragment = None;
-                pipelines.pbr_defs_hash = None;
-            }
-        }
-    }
-
-    let key = MeadowMainPipelineKey {
-        color_format: color_target.format,
-        samples: descriptor.multisample.count,
-        pbr: pipelines.pbr_fragment.is_some(),
-        mv: has_mv && msaa.samples() == 1 && descriptor.multisample.count == 1,
-        defs_hash,
-    };
-    pipelines.current_main_key = Some(key);
 
     let device = render_device.wgpu_device();
     // Clones are cheap handle bumps; owning them here frees `pipelines`
@@ -1202,58 +1399,6 @@ fn prepare_meadow_mesh_pipelines(
     let geom_module = &geom_module;
     let meadow = pipeline_cache.get_bind_group_layout(&meadow_bgl_desc);
     let empty = pipeline_cache.get_bind_group_layout(&empty_bgl_desc());
-
-    if !pipelines.main_pipelines.contains_key(&key) {
-        // Bind group layouts: bevy's view main + binding-array layouts
-        // exactly as the specialized pipeline uses them, an empty slot 2
-        // (the material pipeline has mesh/material groups there; we bind
-        // an empty group), and the meadow group at [`MEADOW_GROUP`].
-        let view_main = pipeline_cache.get_bind_group_layout(&descriptor.layout[0]);
-        let view_arrays = pipeline_cache.get_bind_group_layout(&descriptor.layout[1]);
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("meadow_mesh_main_layout"),
-            bind_group_layouts: &[
-                Some(view_main.deref()),
-                Some(view_arrays.deref()),
-                Some(empty.deref()),
-                Some(meadow.deref()),
-            ],
-            immediate_size: 0,
-        });
-
-        let (frag_module, entry): (&wgpu::ShaderModule, &str) =
-            match (&pipelines.pbr_fragment, key.mv) {
-                (Some(m), false) => (m, "fragment"),
-                (Some(m), true) => (m, "fragment_mv"),
-                (None, false) => (geom_module, "meadow_frag_flat"),
-                (None, true) => (geom_module, "meadow_frag_flat_mv"),
-            };
-        let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![Some(color_target)];
-        if key.mv {
-            targets.push(Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba16Float,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            }));
-        }
-        let pipeline = create_meadow_mesh_pipeline(
-            device,
-            "meadow_mesh_main_pipeline",
-            &layout,
-            geom_module,
-            "meadow_mesh",
-            Some(wgpu::FragmentState {
-                module: frag_module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                targets: &targets,
-            }),
-            key.samples,
-            false,
-        );
-        info!("meadow mesh-shader main pipeline created ({key:?})");
-        pipelines.main_pipelines.insert(key, pipeline);
-    }
 
     if pipelines.shadow_pipeline.is_none() {
         // The geometry module hardcodes the meadow group at
@@ -1291,6 +1436,230 @@ fn prepare_meadow_mesh_pipelines(
         );
         info!("meadow mesh-shader shadow pipeline created");
         pipelines.shadow_pipeline = Some(pipeline);
+    }
+
+    if has_deferred {
+        // The meadow material's specialized DEFERRED PREPASS pipeline for
+        // this view is the ground truth: its shader defs determine the
+        // prepass view bind group layout AND the G-buffer target list
+        // (both must match the composed fragment's declarations /
+        // output locations by construction).
+        let Some(view_cache) = prepass_specialized.get(&view.retained_view_entity) else {
+            return;
+        };
+        let Some(&(_, pipeline_id, _)) = drivers
+            .by_entity
+            .keys()
+            .find_map(|e| view_cache.get(&MainEntity::from(*e)))
+        else {
+            return;
+        };
+        // The specialized cache hands out ids at queue time, but
+        // `get_render_pipeline_descriptor` PANICS for ids the pipeline
+        // cache hasn't processed yet (freshly specialized this frame).
+        // Waiting for the compiled pipeline is bounds-safe and also
+        // guarantees we mirror a descriptor that actually built.
+        if pipeline_cache.get_render_pipeline(pipeline_id).is_none() {
+            return;
+        }
+        let descriptor = pipeline_cache.get_render_pipeline_descriptor(pipeline_id);
+        let Some(frag) = descriptor.fragment.as_ref() else {
+            return;
+        };
+        // The driver's prepass-cache entry can transiently be a plain
+        // depth/normal prepass pipeline (renderer method still
+        // settling) — only the deferred permutation carries the
+        // G-buffer targets this pipeline mirrors.
+        if !has_bool_def(&frag.shader_defs, "DEFERRED_PREPASS") {
+            return;
+        }
+        if descriptor.layout.is_empty() {
+            return;
+        }
+
+        let defs_hash = hash_defs(&frag.shader_defs);
+        let fresh = pipelines.deferred_fragment.defs_hash != Some(defs_hash);
+        let outcome = ensure_pbr_fragment(
+            &mut pipelines.deferred_fragment,
+            MeadowPbrVariant::Deferred,
+            &frag.shader_defs,
+            defs_hash,
+            &mut shader_sources,
+            &render_device,
+            working_color_space.is_rec2020(),
+        );
+        // No flat fallback can write the packed G-buffer: without a
+        // composed fragment the key stays `None` and the compute path
+        // keeps serving deferred views.
+        if !matches!(outcome, ComposeOutcome::Composed) {
+            return;
+        }
+        if fresh {
+            // Stale-def pipelines are unreachable via the key; clear to
+            // bound the map.
+            pipelines.deferred_pipelines.clear();
+        }
+
+        let key = MeadowDeferredPipelineKey {
+            defs_hash,
+            mv: has_bool_def(&frag.shader_defs, "MOTION_VECTOR_PREPASS"),
+            normal: has_bool_def(&frag.shader_defs, "NORMAL_PREPASS"),
+        };
+        pipelines.current_deferred_key = Some(key);
+
+        if !pipelines.deferred_pipelines.contains_key(&key) {
+            // Groups: the prepass view layout exactly as the specialized
+            // deferred pipeline uses it (the pass binds bevy's
+            // `PrepassViewBindGroup` against it), empty slots 1-2 (bevy
+            // has empty + mesh/material groups there), and the meadow
+            // group at [`MEADOW_GROUP`].
+            let view_layout = pipeline_cache.get_bind_group_layout(&descriptor.layout[0]);
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("meadow_mesh_deferred_layout"),
+                bind_group_layouts: &[
+                    Some(view_layout.deref()),
+                    Some(empty.deref()),
+                    Some(empty.deref()),
+                    Some(meadow.deref()),
+                ],
+                immediate_size: 0,
+            });
+            let Some(frag_module) = pipelines.deferred_fragment.module.clone() else {
+                return;
+            };
+            let pipeline = create_meadow_mesh_pipeline(
+                device,
+                "meadow_mesh_deferred_pipeline",
+                &layout,
+                geom_module,
+                "meadow_mesh",
+                Some(wgpu::FragmentState {
+                    module: &frag_module,
+                    entry_point: Some("fragment_deferred"),
+                    compilation_options: Default::default(),
+                    // Bevy's own prepass target list ([normal?, motion?,
+                    // gbuffer, lighting-id]) — `None` holes preserved so
+                    // target indices match `FragmentOutput`'s locations.
+                    targets: &frag.targets,
+                }),
+                descriptor.multisample.count,
+                false,
+            );
+            info!("meadow mesh-shader deferred pipeline created ({key:?})");
+            pipelines.deferred_pipelines.insert(key, pipeline);
+        }
+        return;
+    }
+
+    // The meadow material's own specialized forward pipeline for this
+    // view: its shader defs + view bind group layouts + color target are
+    // the ground truth we build the raw mesh pipeline against.
+    let Some(view_cache) = specialized.get(&view.retained_view_entity) else {
+        return;
+    };
+    let Some(&pipeline_id) = drivers
+        .by_entity
+        .keys()
+        .find_map(|e| view_cache.get(&MainEntity::from(*e)))
+    else {
+        return;
+    };
+    // Same bounds-safety rationale as the deferred branch above.
+    if pipeline_cache.get_render_pipeline(pipeline_id).is_none() {
+        return;
+    }
+    let descriptor = pipeline_cache.get_render_pipeline_descriptor(pipeline_id);
+    let Some(frag) = descriptor.fragment.as_ref() else {
+        return;
+    };
+    let Some(Some(color_target)) = frag.targets.first().cloned() else {
+        return;
+    };
+    if descriptor.layout.len() < 2 {
+        return;
+    }
+
+    let defs_hash = hash_defs(&frag.shader_defs);
+    let fresh = pipelines.forward_fragment.defs_hash != Some(defs_hash);
+    match ensure_pbr_fragment(
+        &mut pipelines.forward_fragment,
+        MeadowPbrVariant::Forward,
+        &frag.shader_defs,
+        defs_hash,
+        &mut shader_sources,
+        &render_device,
+        working_color_space.is_rec2020(),
+    ) {
+        ComposeOutcome::Waiting => return,
+        ComposeOutcome::Composed if fresh => {
+            // Stale-def pipelines are unreachable via the key; clear to
+            // bound the map.
+            pipelines.main_pipelines.clear();
+        }
+        // A permanent failure builds the pipeline against the flat-lit
+        // fallback fragment (`key.pbr = false`).
+        _ => {}
+    }
+
+    let key = MeadowMainPipelineKey {
+        color_format: color_target.format,
+        samples: descriptor.multisample.count,
+        pbr: pipelines.forward_fragment.module.is_some(),
+        mv: has_mv && msaa.samples() == 1 && descriptor.multisample.count == 1,
+        defs_hash,
+    };
+    pipelines.current_main_key = Some(key);
+
+    if !pipelines.main_pipelines.contains_key(&key) {
+        // Bind group layouts: bevy's view main + binding-array layouts
+        // exactly as the specialized pipeline uses them, an empty slot 2
+        // (the material pipeline has mesh/material groups there; we bind
+        // an empty group), and the meadow group at [`MEADOW_GROUP`].
+        let view_main = pipeline_cache.get_bind_group_layout(&descriptor.layout[0]);
+        let view_arrays = pipeline_cache.get_bind_group_layout(&descriptor.layout[1]);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("meadow_mesh_main_layout"),
+            bind_group_layouts: &[
+                Some(view_main.deref()),
+                Some(view_arrays.deref()),
+                Some(empty.deref()),
+                Some(meadow.deref()),
+            ],
+            immediate_size: 0,
+        });
+
+        let (frag_module, entry): (&wgpu::ShaderModule, &str) =
+            match (&pipelines.forward_fragment.module, key.mv) {
+                (Some(m), false) => (m, "fragment"),
+                (Some(m), true) => (m, "fragment_mv"),
+                (None, false) => (geom_module, "meadow_frag_flat"),
+                (None, true) => (geom_module, "meadow_frag_flat_mv"),
+            };
+        let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![Some(color_target)];
+        if key.mv {
+            targets.push(Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            }));
+        }
+        let pipeline = create_meadow_mesh_pipeline(
+            device,
+            "meadow_mesh_main_pipeline",
+            &layout,
+            geom_module,
+            "meadow_mesh",
+            Some(wgpu::FragmentState {
+                module: frag_module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            key.samples,
+            false,
+        );
+        info!("meadow mesh-shader main pipeline created ({key:?})");
+        pipelines.main_pipelines.insert(key, pipeline);
     }
 }
 
@@ -1359,14 +1728,21 @@ fn decide_meadow_mesh_path(
     mv_target: Res<MeadowMeshMvTarget>,
     mut active: ResMut<MeadowMeshPathActive>,
 ) {
+    // `prepare_meadow_mesh_pipelines` set exactly one of the two keys
+    // for the main view's current mode (forward color pass vs deferred
+    // G-buffer pass) — require that mode's pipeline.
     let deferred = views.iter().any(|d| d);
-    let ready = pipelines.supported
-        && !force.0
-        && !deferred
-        && pipelines.shadow_pipeline.is_some()
-        && pipelines.current_main_key.is_some_and(|key| {
+    let main_view_ready = if deferred {
+        pipelines
+            .current_deferred_key
+            .is_some_and(|key| pipelines.deferred_pipelines.contains_key(&key))
+    } else {
+        pipelines.current_main_key.is_some_and(|key| {
             pipelines.main_pipelines.contains_key(&key) && (!key.mv || mv_target.view.is_some())
-        });
+        })
+    };
+    let ready =
+        pipelines.supported && !force.0 && pipelines.shadow_pipeline.is_some() && main_view_ready;
     if ready != active.active {
         info!(
             "meadow render path: {}",
@@ -1602,6 +1978,171 @@ fn draw_meadow_task_lists(
     }
 }
 
+// ---------- Core3d: deferred-view G-buffer pass ----------
+
+/// Draw the meadow into bevy's deferred prepass attachments on deferred
+/// main views: one pass writing the packed G-buffer, the lighting-pass
+/// id, motion vectors, and depth, ordered after the deferred mesh draws
+/// and before the lighting-id copy (so the deferred lighting pass and
+/// solari shade the grass like any other deferred surface).
+///
+/// The real attachments can be render targets here — unlike PTR's
+/// terrain (whose fragment binds the full mesh-view group, which on
+/// deferred views contains the current-frame deferred texture, forcing
+/// private targets + a composite), this fragment's only view binding is
+/// the `View` uniform, served by bevy's prepass view bind group; nothing
+/// bound by the pass is attached to it.
+///
+/// The pass tail restages the scene depth (grass included) into the
+/// prepass depth texture, mirroring the copy at the end of bevy's
+/// deferred prepass — the deferred lighting pass and solari reconstruct
+/// world positions from that texture, and bevy's own copy ran before the
+/// grass drew.
+#[allow(clippy::too_many_arguments)]
+pub fn meadow_mesh_deferred_pass(
+    view: ViewQuery<
+        (
+            &ExtractedView,
+            &ExtractedCamera,
+            &ViewDepthStencilTexture,
+            &ViewPrepassTextures,
+            &ViewUniformOffset,
+            Option<&PreviousViewUniformOffset>,
+            Option<&MainPassResolutionOverride>,
+        ),
+        (With<Camera3d>, With<DeferredPrepass>),
+    >,
+    active: Res<MeadowMeshPathActive>,
+    pipelines: Res<MeadowMeshPipelines>,
+    prepass_view_bind_group: Res<PrepassViewBindGroup>,
+    bind_groups: Res<MeadowMeshBindGroups>,
+    view_uniforms: Res<MeadowMeshViewUniforms>,
+    slots: Res<MeadowViewSlots>,
+    buffers: Res<MeadowGpuBuffers>,
+    mut ctx: RenderContext,
+) {
+    if !active.active || bind_groups.by_variant.is_empty() {
+        return;
+    }
+    let (
+        extracted_view,
+        camera,
+        depth,
+        prepass_textures,
+        view_offset,
+        prev_view_offset,
+        resolution_override,
+    ) = view.into_inner();
+    // Only the view the meadow cull tracks as slot 0 (the main camera).
+    if slots.by_retained.get(&extracted_view.retained_view_entity) != Some(&0) {
+        return;
+    }
+    let Some(key) = pipelines.current_deferred_key else {
+        return;
+    };
+    let Some(pipeline) = pipelines.deferred_pipelines.get(&key) else {
+        return;
+    };
+    let Some(empty_bind_group) = &pipelines.empty_bind_group else {
+        return;
+    };
+
+    // The view bind group variant must match the prepass view layout the
+    // pipeline was built against (bindings 0/2 carry dynamic offsets).
+    let offsets = [
+        view_offset.offset,
+        prev_view_offset.map_or(0, |prev| prev.offset),
+    ];
+    let (view_bind_group, view_offsets): (&BindGroup, &[u32]) = if key.mv {
+        let (Some(bind_group), Some(_)) = (
+            prepass_view_bind_group.motion_vectors.as_ref(),
+            prev_view_offset,
+        ) else {
+            return;
+        };
+        (bind_group, &offsets)
+    } else {
+        let Some(bind_group) = prepass_view_bind_group.no_motion_vectors.as_ref() else {
+            return;
+        };
+        (bind_group, &offsets[..1])
+    };
+
+    // Same attachment arrangement as bevy's deferred prepass ([normal?,
+    // motion?, gbuffer, lighting-id], `None` holes preserved) — the
+    // pipeline's target list was mirrored from the same def set. All
+    // `get_attachment()` calls load here: bevy's prepass performed the
+    // frame's clears earlier in the chain.
+    let (Some(deferred_texture), Some(lighting_pass_id)) = (
+        &prepass_textures.deferred,
+        &prepass_textures.deferred_lighting_pass_id,
+    ) else {
+        return;
+    };
+    let normal_attachment = if key.normal {
+        match &prepass_textures.normal {
+            Some(texture) => Some(texture.get_attachment()),
+            None => return,
+        }
+    } else {
+        None
+    };
+    let motion_attachment = if key.mv {
+        match &prepass_textures.motion_vectors {
+            Some(texture) => Some(texture.get_attachment()),
+            None => return,
+        }
+    } else {
+        None
+    };
+    let color_attachments = [
+        normal_attachment,
+        motion_attachment,
+        Some(deferred_texture.get_attachment()),
+        Some(lighting_pass_id.get_attachment()),
+    ];
+    let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
+
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    {
+        let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("meadow_mesh_deferred_pass"),
+            color_attachments: &color_attachments,
+            depth_stencil_attachment,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let pass_span = diagnostics.pass_span(&mut render_pass, "meadow_mesh_deferred_pass");
+        // Same DLSS sub-viewport handling as the forward main pass.
+        if let Some(viewport) =
+            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
+        {
+            render_pass.set_camera_viewport(&viewport);
+        }
+        {
+            let raw = render_pass.wgpu_pass();
+            raw.set_pipeline(pipeline);
+            raw.set_bind_group(0, &**view_bind_group, view_offsets);
+            raw.set_bind_group(1, &**empty_bind_group, &[]);
+            raw.set_bind_group(2, &**empty_bind_group, &[]);
+            draw_meadow_task_lists(raw, view_uniforms.offsets[0], &bind_groups, &buffers);
+        }
+        pass_span.end(&mut render_pass);
+    }
+
+    // Restage the scene depth (now including grass) into the prepass
+    // depth texture, exactly like the tail of bevy's deferred prepass.
+    if let Some(prepass_depth_texture) = &prepass_textures.depth {
+        ctx.command_encoder().copy_texture_to_texture(
+            depth.texture().as_image_copy(),
+            prepass_depth_texture.texture.texture.as_image_copy(),
+            prepass_textures.size,
+        );
+    }
+}
+
 // ---------- Core3d: motion-vector composite ----------
 
 /// Copy the grass motion vectors from the meadow-owned motion target
@@ -1789,27 +2330,21 @@ mod tests {
         }
     }
 
-    /// Run the composer offline against the REAL bevy shader library
-    /// (skipped when no bevy checkout is present) with a representative
-    /// forward def set: the composition must succeed, both entry points
-    /// must survive under their unmangled names, and the output must be
-    /// WGSL that naga parses + validates.
-    #[test]
-    fn pbr_fragment_composes_against_bevy_library() {
-        let Some(root) = bevy_checkout() else {
-            eprintln!("skipping: no bevy checkout at ../bevy (set BEVY_CHECKOUT)");
-            return;
-        };
+    /// The full composable library, as the render-world extraction sees
+    /// it: bevy's shader crates from the checkout + the meadow shared
+    /// module, with the loader-settings defs bevy registers
+    /// (`mesh_view_types.wesl` in `MeshRenderPlugin::build`) carried on
+    /// the Shader asset for the composer's def closure. `None` (tests
+    /// skip) without a bevy checkout.
+    fn collect_library() -> Option<super::MeadowMeshShaderSources> {
+        let root = bevy_checkout()?;
         let mut sources = super::MeadowMeshShaderSources::default();
         for crate_name in ["bevy_pbr", "bevy_render", "bevy_core_pipeline"] {
             let src = root.join("crates").join(crate_name).join("src");
             collect_wesl_dir(crate_name, &src, &src, &mut sources);
         }
-        // Library defs bevy registers through loader settings
-        // (`mesh_view_types.wesl` in `MeshRenderPlugin::build`) — carried
-        // on the Shader asset, folded in by the composer's def closure.
-        let mesh_view_types = super::custom_module_path("bevy_pbr::render::mesh_view_types")
-            .expect("module path");
+        let mesh_view_types =
+            super::custom_module_path("bevy_pbr::render::mesh_view_types").expect("module path");
         sources
             .by_module
             .get_mut(&mesh_view_types)
@@ -1827,6 +2362,49 @@ mod tests {
                 "embedded://bevy_meadow/meadow_shared.wesl",
             ),
         );
+        Some(sources)
+    }
+
+    /// Compose `variant` against the real library with `defs`, panicking
+    /// on any composition error, and naga-validate the WGSL output.
+    fn compose_and_validate(
+        sources: &super::MeadowMeshShaderSources,
+        defs: &[ShaderDefVal],
+        variant: super::MeadowPbrVariant,
+    ) -> String {
+        let wgsl = match super::compose_pbr_fragment_wgsl(sources, defs, 12, false, variant) {
+            Ok(wgsl) => wgsl,
+            Err(super::PbrComposeError::MissingModule(module)) => {
+                panic!("composer reported module `{module}` missing from a full checkout")
+            }
+            Err(super::PbrComposeError::Permanent(err)) => panic!("{err}"),
+        };
+        let module = naga::front::wgsl::parse_str(&wgsl).unwrap_or_else(|e| {
+            panic!(
+                "composed {variant:?} fragment failed to parse:\n{}",
+                e.emit_to_string(&wgsl)
+            )
+        });
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("composed {variant:?} fragment failed validation: {e:?}"));
+        wgsl
+    }
+
+    /// Run the composer offline against the REAL bevy shader library
+    /// (skipped when no bevy checkout is present) with a representative
+    /// forward def set: the composition must succeed, both entry points
+    /// must survive under their unmangled names, and the output must be
+    /// WGSL that naga parses + validates.
+    #[test]
+    fn pbr_fragment_composes_against_bevy_library() {
+        let Some(sources) = collect_library() else {
+            eprintln!("skipping: no bevy checkout at ../bevy (set BEVY_CHECKOUT)");
+            return;
+        };
 
         // Representative forward-view def set (a subset of what the
         // meadow material's specialized pipeline hands over at runtime).
@@ -1839,36 +2417,53 @@ mod tests {
             ShaderDefVal::UInt("TONEMAPPING_LUT_SAMPLER_BINDING_INDEX".into(), 19),
         ];
 
-        let wgsl = match super::compose_pbr_fragment_wgsl(
-            &sources,
-            &defs,
-            12,
-            false,
-            super::MeadowPbrVariant::Forward,
-        ) {
-            Ok(wgsl) => wgsl,
-            Err(super::PbrComposeError::MissingModule(module)) => {
-                panic!("composer reported module `{module}` missing from a full checkout")
-            }
-            Err(super::PbrComposeError::Permanent(err)) => panic!("{err}"),
-        };
+        let wgsl = compose_and_validate(&sources, &defs, super::MeadowPbrVariant::Forward);
 
         // The raw-wgpu pipelines reference these entry names directly.
         assert!(wgsl.contains("fn fragment("), "entry `fragment` lost");
         assert!(wgsl.contains("fn fragment_mv("), "entry `fragment_mv` lost");
+    }
 
-        let module = naga::front::wgsl::parse_str(&wgsl).unwrap_or_else(|e| {
-            panic!(
-                "composed PBR fragment failed to parse:\n{}",
-                e.emit_to_string(&wgsl)
-            )
-        });
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap_or_else(|e| panic!("composed PBR fragment failed validation: {e:?}"));
+    /// Deferred counterpart: composes the G-buffer fragment with the def
+    /// set `PrepassPipeline::specialize` produces for a deferred, depth,
+    /// and motion-vector view (a solari session's main view) — the exact
+    /// shape `prepare_meadow_mesh_pipelines` lifts from the meadow
+    /// material's specialized deferred prepass pipeline at runtime.
+    #[test]
+    fn deferred_fragment_composes_against_bevy_library() {
+        let Some(sources) = collect_library() else {
+            eprintln!("skipping: no bevy checkout at ../bevy (set BEVY_CHECKOUT)");
+            return;
+        };
+
+        let defs: Vec<ShaderDefVal> = vec![
+            "PREPASS_PIPELINE".into(),
+            ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3),
+            "VERTEX_OUTPUT_INSTANCE_INDEX".into(),
+            "DEPTH_PREPASS".into(),
+            "VERTEX_POSITIONS".into(),
+            "VERTEX_UVS".into(),
+            "VERTEX_UVS_A".into(),
+            "NORMAL_PREPASS_OR_DEFERRED_PREPASS".into(),
+            "VERTEX_NORMALS".into(),
+            "MOTION_VECTOR_PREPASS_OR_DEFERRED_PREPASS".into(),
+            "DEFERRED_PREPASS".into(),
+            "MOTION_VECTOR_PREPASS".into(),
+            "PREPASS_FRAGMENT".into(),
+        ];
+
+        let wgsl = compose_and_validate(&sources, &defs, super::MeadowPbrVariant::Deferred);
+
+        assert!(
+            wgsl.contains("fn fragment_deferred("),
+            "entry `fragment_deferred` lost"
+        );
+        // The G-buffer write must survive to the entry point's output —
+        // guards against the packing path getting condcomp'd away.
+        assert!(
+            wgsl.contains("deferred_lighting_pass_id"),
+            "lighting-pass id output missing"
+        );
     }
 
     /// The assembled task/mesh module must parse + validate with the same
@@ -2013,6 +2608,29 @@ mod tests {
                 struct_of(mesh, s),
                 struct_of(pbr, s),
                 "`{s}` drifted between meadow_mesh.wgsl and PBR_FRAGMENT_SOURCE \
+                 (fragment inputs are matched by location)"
+            );
+        }
+
+        // The deferred G-buffer fragment carries the same mirrored
+        // copies — pin them to the mesh module too.
+        let deferred = super::DEFERRED_PBR_FRAGMENT_SOURCE;
+        assert_eq!(
+            body_of(mesh, "season_palette"),
+            body_of(deferred, "season_palette"),
+            "`season_palette` drifted between meadow_mesh.wgsl and DEFERRED_PBR_FRAGMENT_SOURCE"
+        );
+        assert_eq!(
+            body_of(mesh, "meadow_motion_vector"),
+            body_of(deferred, "meadow_motion_vector"),
+            "`meadow_motion_vector` drifted between meadow_mesh.wgsl and \
+             DEFERRED_PBR_FRAGMENT_SOURCE"
+        );
+        for s in ["MeadowVertexOut", "MeadowMeshView"] {
+            assert_eq!(
+                struct_of(mesh, s),
+                struct_of(deferred, s),
+                "`{s}` drifted between meadow_mesh.wgsl and DEFERRED_PBR_FRAGMENT_SOURCE \
                  (fragment inputs are matched by location)"
             );
         }
