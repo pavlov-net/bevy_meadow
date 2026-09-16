@@ -1035,7 +1035,6 @@ fn compose_pbr_fragment_wgsl(
     sources: &MeadowMeshShaderSources,
     defs: &[ShaderDefVal],
     max_storage_buffers_per_shader_stage: u32,
-    rec2020: bool,
     variant: MeadowPbrVariant,
 ) -> Result<String, PbrComposeError> {
     let root_path = wesl::syntax::ModulePath {
@@ -1085,7 +1084,7 @@ fn compose_pbr_fragment_wgsl(
     // private cache, so they never appear on the `Assets<Shader>` clones
     // we collect). Applied last, like the root shader's own defs in
     // bevy's fold.
-    let mut global_defs: Vec<ShaderDefVal> = vec![
+    let global_defs: Vec<ShaderDefVal> = vec![
         ShaderDefVal::UInt(
             "AVAILABLE_STORAGE_BUFFER_BINDINGS".into(),
             max_storage_buffers_per_shader_stage,
@@ -1099,12 +1098,6 @@ fn compose_pbr_fragment_wgsl(
             max_storage_buffers_per_shader_stage >= 6,
         ),
     ];
-    if rec2020 {
-        global_defs.push(ShaderDefVal::Bool(
-            "WORKING_COLOR_SPACE_REC2020".into(),
-            true,
-        ));
-    }
 
     let mut constants = std::collections::BTreeMap::new();
     for shader_def in closure_defs
@@ -1174,14 +1167,12 @@ fn compose_pbr_fragment(
     sources: &MeadowMeshShaderSources,
     defs: &[ShaderDefVal],
     render_device: &RenderDevice,
-    rec2020: bool,
     variant: MeadowPbrVariant,
 ) -> Result<wgpu::ShaderModule, PbrComposeError> {
     let wgsl = compose_pbr_fragment_wgsl(
         sources,
         defs,
         render_device.limits().max_storage_buffers_per_shader_stage,
-        rec2020,
         variant,
     )?;
     Ok(render_device
@@ -1283,7 +1274,6 @@ fn ensure_pbr_fragment(
     defs_hash: u64,
     sources: &mut MeadowMeshShaderSources,
     render_device: &RenderDevice,
-    rec2020: bool,
 ) -> ComposeOutcome {
     if frag.defs_hash == Some(defs_hash) {
         return ComposeOutcome::Composed;
@@ -1291,7 +1281,7 @@ fn ensure_pbr_fragment(
     if frag.failed == Some((defs_hash, sources.generation)) {
         return ComposeOutcome::Failed;
     }
-    match compose_pbr_fragment(sources, defs, render_device, rec2020, variant) {
+    match compose_pbr_fragment(sources, defs, render_device, variant) {
         Ok(module) => {
             info!("meadow mesh-shader PBR fragment composed ({variant:?})");
             frag.module = Some(module);
@@ -1369,7 +1359,6 @@ fn prepare_meadow_mesh_pipelines(
     prepass_specialized: Res<SpecializedPrepassMaterialPipelineCache>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
-    working_color_space: Res<bevy::render::WorkingColorSpace>,
     force: Res<MeadowForceComputePath>,
     mut pipelines: ResMut<MeadowMeshPipelines>,
     mut shader_sources: ResMut<MeadowMeshShaderSources>,
@@ -1486,7 +1475,6 @@ fn prepare_meadow_mesh_pipelines(
             defs_hash,
             &mut shader_sources,
             &render_device,
-            working_color_space.is_rec2020(),
         );
         // No flat fallback can write the packed G-buffer: without a
         // composed fragment the key stays `None` and the compute path
@@ -1588,7 +1576,6 @@ fn prepare_meadow_mesh_pipelines(
         defs_hash,
         &mut shader_sources,
         &render_device,
-        working_color_space.is_rec2020(),
     ) {
         ComposeOutcome::Waiting => return,
         ComposeOutcome::Composed if fresh => {
