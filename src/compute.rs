@@ -91,9 +91,9 @@ const RT_FAR_THIN: f32 = 0.5;
 const RT_TARGET_FILL: f32 = 0.9;
 /// Bytes per solari `PackedVertex` (3 × vec4<f32>). Asserted against solari's
 /// own stride below so the two can't drift; kept as a local literal because
-/// the `bevy_solari` dep is non-wasm only.
+/// the `bevy_solari` dep is optional (`solari` feature).
 const RT_VERTEX_SIZE: u64 = 48;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "solari", not(target_family = "wasm")))]
 const _: () =
     assert!(RT_VERTEX_SIZE == bevy_solari::scene::RaytracingGeometryBuffers::VERTEX_STRIDE);
 /// Static near-band index pattern (quad between base and mid edges + tip
@@ -1350,7 +1350,7 @@ fn meadow_compute_node(
 
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{BufferInitDescriptor, CommandEncoder, CommandEncoderDescriptor};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "solari", not(target_family = "wasm")))]
 use bevy_solari::scene::RaytracingProducerEncoder;
 
 /// Consumer-set switch enabling the per-variant RT blade expansion. Off by
@@ -1708,8 +1708,8 @@ fn prepare_meadow_rt_buffers(
 /// inputs are all present), then NaN-pad `[cursor, cap)` in both bands.
 /// Records into solari's shared `RaytracingProducerEncoder` when its scene
 /// plugin is present — one submit covers every raytracing geometry producer,
-/// ahead of the BLAS builds — and otherwise falls back to a private encoder
-/// + submit so the pass works without a raytracer. Either way, queue
+/// ahead of the BLAS builds — and otherwise falls back to a private encoder +
+/// submit so the pass works without a raytracer. Either way, queue
 /// submission order guarantees a consumer's BLAS build (a later render set)
 /// sees the finished buffers.
 #[allow(clippy::too_many_arguments)]
@@ -1727,7 +1727,7 @@ fn dispatch_meadow_rt_expand(
     fallback_image: Res<bevy::render::texture::FallbackImage>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    #[cfg(not(target_family = "wasm"))] mut producer_encoder: Option<
+    #[cfg(all(feature = "solari", not(target_family = "wasm")))] mut producer_encoder: Option<
         ResMut<RaytracingProducerEncoder>,
     >,
     // 0 = nothing logged, 1 = first dispatch logged, 2 = nonzero-estimate
@@ -1773,12 +1773,12 @@ fn dispatch_meadow_rt_expand(
             label: Some("meadow_rt_expand_encoder"),
         })
     };
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "solari", not(target_family = "wasm")))]
     let encoder = match producer_encoder.as_mut() {
         Some(shared) => shared.encoder(&render_device),
         None => own_encoder.insert(new_own_encoder()),
     };
-    #[cfg(target_family = "wasm")]
+    #[cfg(not(all(feature = "solari", not(target_family = "wasm"))))]
     let encoder = own_encoder.insert(new_own_encoder());
 
     let pad_workgroups = RT_NEAR_MAX_BLADES.max(RT_FAR_MAX_BLADES).div_ceil(256);

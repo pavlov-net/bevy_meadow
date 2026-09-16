@@ -287,7 +287,7 @@ ping-pong buffer -- motion vectors come purely from the wind delta.
 ## Mesh-shader path
 
 An alternative renderer on GPU task/mesh pipelines
-(`mesh_path.rs` + `meadow_mesh.wgsl`), behind the `mesh-shaders` feature. Where
+(`mesh_path.rs` + `meadow_mesh.wesl`), behind the `mesh-shaders` feature. Where
 the GPU supports it, it runs about 2x faster than the compute path.
 
 A 128-wide task stage does the whole cull / gate / derive / compact step over a
@@ -297,20 +297,19 @@ stage is a pure expander with small outputs (large mesh outputs starve the SMs).
 It serves the main camera and every directional shadow cascade, and drives the
 engine's real per-view bind group, so PBR lighting and shadow receiving match
 the compute path. Placement is hash-identical between the two, and `cargo test`
-string-compares the shared derivation helpers and compiles the assembled mesh
-module, so the two paths can't silently drift.
+string-compares the shared derivation helpers and compiles the mesh module and
+its PBR fragments against the engine shader library, so the two paths cannot
+silently drift.
 
 The path is opt-in and self-selecting:
 
-- **Enabled** by the `mesh-shaders` feature (which pulls in `wgpu`, `naga_oil`,
-  and `naga`) *and* a GPU that reports the mesh/task-shader capability with
-  enough per-workgroup budget. Where either is missing, the compute path runs
-  automatically with byte-identical results.
+- **Enabled** by the `mesh-shaders` feature *and* a GPU that reports the
+  mesh/task-shader capability with enough per-workgroup budget. Where either is
+  missing, the compute path runs automatically with byte-identical results.
 - **`MeadowForceComputePath`** (a main-world resource) forces the compute path
   for A/B comparison; wire it into a debug UI.
-- **Fallbacks.** Deferred configs use the compute path. Motion vectors are
-  written only in single-sample (DLSS/TAA) configs; under MSAA the main pass
-  writes color and depth only.
+- **Fallbacks.** Motion vectors are written only in single-sample (DLSS/TAA)
+  configs; under MSAA the main pass writes color and depth only.
 
 ## License
 

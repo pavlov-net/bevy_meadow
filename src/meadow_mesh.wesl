@@ -22,16 +22,12 @@
 //   budget) throttle workgroup launch and starve the SMs. All 32 lanes
 //   expand vertices cooperatively (lane ↔ vertex, not lane ↔ blade).
 //
-// This file is NOT a standalone WGSL module. `mesh_path.rs` assembles the
-// final source as:
-//
-//     enable wgpu_mesh_shader;
-//     <meadow_shared.wesl>
-//     <this file>
-//
-// so `VariantParams` / `BladeAttrs` / `local_blade_position` /
-// `tuft_local_position` come from the shared library verbatim (no drift),
-// and the `enable` directive precedes all declarations as WGSL requires.
+// Imports `BladeAttrs` / `local_blade_position` / `tuft_local_position`
+// from the shared library, and the group-3 palette/view bindings, the
+// mesh → fragment varyings, and the palette + motion-vector helpers
+// shared with the PBR fragments from `meadow_mesh_bindings.wesl`, so none
+// of them can drift between stages. Compiled by bevy's pipeline cache
+// like every other WESL shader (`mesh_path.rs` queues the pipelines).
 //
 // Dispatch: one task workgroup per CPU-built `(patch_idx, slice_base)`
 // pair covering exactly the active patches' real blade counts
@@ -40,16 +36,24 @@
 // views). The flat work list can exceed wgpu's 65535 per-dimension
 // dispatch cap, so it folds over a fixed-stride 2D grid — see
 // `mesh.rs::MESH_TASK_DISPATCH_STRIDE`. The view is selected by a
-// dynamic-offset uniform (`mesh_view`), and the per-view cull data is
+// per-view-slot bind group (`mesh_view`), and the per-view cull data is
 // the SAME `view_cull` storage buffer the compute path uploads (frusta
 // + flags + lod_max + shadow_near; the mesh path ignores the base/cap
 // region fields).
 //
 // Bindings live at @group(3) in EVERY pipeline built from this module:
 // the main pipeline has bevy_pbr's view + binding-array groups at 0/1
-// (the composed PBR fragment hardcodes them) and an empty group 2; the
+// (the PBR fragment imports them at those slots) and an empty group 2; the
 // depth-only shadow pipeline fills slots 0-2 with empty bind groups so
 // the one module serves both layouts.
+
+import bevy_meadow::meadow_shared::{BladeAttrs, local_blade_position, tuft_local_position, wind_sway};
+import bevy_meadow::meadow_mesh_bindings::{
+    variant_params, patches, trunk_slots, heightfield, view_cull, task_slices, mesh_view,
+    PatchData, MeadowViewCull, MeadowVertexOut,
+};
+
+enable wgpu_mesh_shader;
 
 // ---------- budget constants ----------
 // MUST mirror `mesh.rs` (`MESH_TASK_BLADES` / `MESH_WG_BLADES` /
@@ -83,75 +87,6 @@ const MESH_SHADOW_OUT_PRIMS: u32 = 21u; // MESH_WG_SHADOW_BLADES × 1
 
 const MEADOW_VIEW_FLAG_SHADOW: u32 = 1u;
 const TUFT_SALT: u32 = 0x5C3Bu;
-
-// ---------- structs (MIRROR: meadow_compute.wesl) ----------
-// Any change to these structs or to the derivation helpers below MUST be
-// copied to/from `meadow_compute.wesl` — the two paths must derive
-// bit-identical blades, or switching between them (the runtime toggle)
-// shows different fields. `tests` in `mesh_path.rs` string-compares the
-// mirrored helper bodies.
-
-struct PatchData {
-    centre_xz_radius_seed: vec4<f32>,
-    blade_count_noise_canopy_flags: vec4<f32>,
-}
-
-struct TrunkDisc {
-    center_radius_fade: vec4<f32>,
-}
-
-struct PatchTrunkSlot {
-    count: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-    discs: array<TrunkDisc, 16>,
-}
-
-struct MeadowViewCull {
-    frustum: array<vec4<f32>, 6>,
-    params: vec4<f32>,
-    params2: vec4<f32>,
-}
-
-struct MeadowViewCullData {
-    count: u32,
-    views: array<MeadowViewCull, 6>,
-}
-
-// ---------- mesh-path-only per-view uniform ----------
-// Rust mirror: `mesh_path.rs::MeadowMeshViewUniform`. One entry per view
-// slot in a dynamic-offset uniform buffer; the pass binds the right
-// offset per view. Matrices are split jittered/unjittered so motion
-// vectors exclude the TAA/DLSS jitter, mirroring bevy_pbr's prepass.
-struct MeadowMeshView {
-    // Rasterization matrix (includes temporal jitter when active).
-    clip_from_world: mat4x4<f32>,
-    // Jitter-free current matrix (motion-vector numerator).
-    unjittered_clip_from_world: mat4x4<f32>,
-    // Previous frame's jitter-free matrix (motion-vector denominator).
-    prev_clip_from_world: mat4x4<f32>,
-    // x = view slot (indexes `view_cull.views`); yzw reserved.
-    params: vec4<u32>,
-}
-
-// ---------- bindings (@group(3); see header) ----------
-
-@group(3) @binding(0) var<uniform> variant_params: VariantParams;
-@group(3) @binding(1) var<storage, read> patches: array<PatchData>;
-@group(3) @binding(2) var<storage, read> trunk_slots: array<PatchTrunkSlot>;
-@group(3) @binding(3) var heightfield: texture_2d<f32>;
-@group(3) @binding(4) var<storage, read> view_cull: MeadowViewCullData;
-// CPU-built work list: one `(patch_idx, slice_base)` per task workgroup.
-// `count` (not `arrayLength`) bounds the grid — the buffer is grown-only
-// and the folded 2D dispatch's last row overshoots.
-struct MeadowTaskSlices {
-    count: u32,
-    pad: u32,
-    entries: array<vec2<u32>>,
-}
-@group(3) @binding(5) var<storage, read> task_slices: MeadowTaskSlices;
-@group(3) @binding(6) var<uniform> mesh_view: MeadowMeshView;
 
 // ---------- hash helpers (MIRROR: meadow_compute.wesl) ----------
 
@@ -289,37 +224,18 @@ fn patch_sphere_culled(centre: vec3<f32>, radius: f32, vc: MeadowViewCull, is_sh
     return false;
 }
 
-// ---------- wind + palette (MIRROR: meadow.wesl) ----------
+// ---------- wind (MIRROR: meadow.wesl) ----------
 
 fn wind_displacement(world_xz: vec2<f32>, blade_y_norm: f32, t: f32, clump: f32) -> vec2<f32> {
-    let speed_mul = variant_params.wind_state.x;
-    let gustiness = variant_params.wind_state.y;
-    let crest_k = variant_params.wind_state.z;
-    let amp = variant_params.wind.x * speed_mul;
-    let period = max(variant_params.wind.y, 1e-3);
-    let dir = normalize(variant_params.wind_direction.xy + vec2<f32>(0.0001, 0.0));
-    let phase = (t / period) * 6.2831853 + clump * 1.57 - dot(world_xz, dir) * crest_k;
-    let gust_osc = 0.6 + 0.4 * sin(t * 0.25 + world_xz.x * 0.11 + world_xz.y * 0.09);
-    let gust = mix(1.0, gust_osc, gustiness);
-    let sway = sin(phase) * amp * gust * blade_y_norm;
-    return dir * sway;
-}
-
-fn season_palette() -> vec3<f32> {
-    let a_idx = u32(variant_params.season_blend.x);
-    let b_idx = u32(variant_params.season_blend.y);
-    let t = variant_params.season_blend.z;
-    var a = variant_params.palette_summer.rgb;
-    var b = variant_params.palette_summer.rgb;
-    if (a_idx == 0u) { a = variant_params.palette_spring.rgb; }
-    else if (a_idx == 1u) { a = variant_params.palette_summer.rgb; }
-    else if (a_idx == 2u) { a = variant_params.palette_autumn.rgb; }
-    else { a = variant_params.palette_winter.rgb; }
-    if (b_idx == 0u) { b = variant_params.palette_spring.rgb; }
-    else if (b_idx == 1u) { b = variant_params.palette_summer.rgb; }
-    else if (b_idx == 2u) { b = variant_params.palette_autumn.rgb; }
-    else { b = variant_params.palette_winter.rgb; }
-    return mix(a, b, clamp(t, 0.0, 1.0));
+    return wind_sway(
+        world_xz,
+        blade_y_norm,
+        t,
+        clump,
+        variant_params.wind,
+        variant_params.wind_direction,
+        variant_params.wind_state,
+    );
 }
 
 // ---------- task stage ----------
@@ -598,16 +514,6 @@ fn blade_vertex(
 
 // ---------- mesh stage: full (main view) ----------
 
-struct MeadowVertexOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) world_position: vec4<f32>,
-    // Previous-frame world position (prev wind time; static root), for
-    // per-fragment motion vectors written to the meadow-owned MV target.
-    @location(1) prev_world_position: vec4<f32>,
-    // x = y_norm (shade/tip ramp), y = clump luminance.
-    @location(2) misc: vec2<f32>,
-}
-
 struct MeadowPrimOut {
     @builtin(triangle_indices) indices: vec3<u32>,
 }
@@ -739,55 +645,4 @@ fn meadow_mesh_shadow(
         shadow_mesh_out.primitives[t].indices =
             vec3<u32>(v_base, v_base + 1u, v_base + 2u);
     }
-}
-
-// ---------- fragments: flat-lit fallback ----------
-//
-// Used when PBR fragment composition is unavailable (debug / composition
-// failure). Season palette × height shade × fixed lambert — deliberately
-// simple; the shipping fragment is the wesl-composed PBR one
-// (`mesh_path.rs::PBR_FRAGMENT_SOURCE / compose_pbr_fragment`).
-
-fn flat_lit_color(misc: vec2<f32>) -> vec4<f32> {
-    let palette = season_palette();
-    let shade = mix(0.70, 1.00, misc.x);
-    let lum = misc.y;
-    let ndotl = 0.85;
-    return vec4<f32>(palette * shade * lum * ndotl, 1.0);
-}
-
-@fragment
-fn meadow_frag_flat(in: MeadowVertexOut) -> @location(0) vec4<f32> {
-    return flat_lit_color(in.misc);
-}
-
-// Jitter-free current/previous NDC delta — same UV-delta convention as
-// bevy_pbr's motion-vector prepass. Written to the MEADOW-OWNED motion
-// target (color target 1 of the main pass; z = valid flag) — bevy's real
-// MV prepass texture rides inside the mesh-view bind group as a sampled
-// resource, so it can't be an attachment of the same pass; a fullscreen
-// composite copies valid texels across afterwards (`meadow_mv_composite`).
-fn meadow_motion_vector(world: vec4<f32>, prev_world: vec4<f32>) -> vec2<f32> {
-    let clip = mesh_view.unjittered_clip_from_world * vec4<f32>(world.xyz, 1.0);
-    let prev_clip = mesh_view.prev_clip_from_world * vec4<f32>(prev_world.xyz, 1.0);
-    let ndc = clip.xy / clip.w;
-    let prev_ndc = prev_clip.xy / prev_clip.w;
-    return (ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
-}
-
-struct MeadowFlatMvOut {
-    @location(0) color: vec4<f32>,
-    @location(1) motion: vec4<f32>,
-}
-
-@fragment
-fn meadow_frag_flat_mv(in: MeadowVertexOut) -> MeadowFlatMvOut {
-    var out: MeadowFlatMvOut;
-    out.color = flat_lit_color(in.misc);
-    out.motion = vec4<f32>(
-        meadow_motion_vector(in.world_position, in.prev_world_position),
-        1.0,
-        0.0,
-    );
-    return out;
 }

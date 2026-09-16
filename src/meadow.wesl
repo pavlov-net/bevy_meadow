@@ -43,7 +43,7 @@ import bevy_pbr::render::{
 
 import bevy_meadow::meadow_shared::{
     VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, tuft_local_position,
-    wind_sway,
+    wind_sway, season_palette_of,
 };
 
 // Wind time comes from bevy's globals uniform (`globals.time`, wrapped
@@ -98,20 +98,13 @@ fn wind_displacement(world_xz: vec2<f32>, blade_y_norm: f32, t: f32, clump: f32)
 }
 
 fn season_palette() -> vec3<f32> {
-    let a_idx = u32(variant_params.season_blend.x);
-    let b_idx = u32(variant_params.season_blend.y);
-    let t = variant_params.season_blend.z;
-    var a = variant_params.palette_summer.rgb;
-    var b = variant_params.palette_summer.rgb;
-    if (a_idx == 0u) { a = variant_params.palette_spring.rgb; }
-    else if (a_idx == 1u) { a = variant_params.palette_summer.rgb; }
-    else if (a_idx == 2u) { a = variant_params.palette_autumn.rgb; }
-    else { a = variant_params.palette_winter.rgb; }
-    if (b_idx == 0u) { b = variant_params.palette_spring.rgb; }
-    else if (b_idx == 1u) { b = variant_params.palette_summer.rgb; }
-    else if (b_idx == 2u) { b = variant_params.palette_autumn.rgb; }
-    else { b = variant_params.palette_winter.rgb; }
-    return mix(a, b, clamp(t, 0.0, 1.0));
+    return season_palette_of(
+        variant_params.season_blend,
+        variant_params.palette_spring,
+        variant_params.palette_summer,
+        variant_params.palette_autumn,
+        variant_params.palette_winter,
+    );
 }
 
 // ---------- Vertex shader ----------

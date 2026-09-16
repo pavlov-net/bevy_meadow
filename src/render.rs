@@ -127,6 +127,11 @@ impl Plugin for MeadowRenderPlugin {
             crate::compute::MeadowRaytracingConfig,
         >::default());
 
+        // Mesh-path shaders (embedded assets; the render-world init loads
+        // them by handle and queues the pipelines).
+        #[cfg(feature = "mesh-shaders")]
+        crate::mesh_path::register_meadow_mesh_shaders(app);
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -179,7 +184,7 @@ impl Plugin for MeadowRenderPlugin {
         // vertex/index buffers). Gated by `MeadowRaytracingConfig`.
         crate::compute::build_meadow_raytracing(render_app);
 
-        // Task/mesh-shader path (raw wgpu pipelines; runtime-gated on
+        // Task/mesh-shader path (bevy mesh pipelines; runtime-gated on
         // EXPERIMENTAL_MESH_SHADER, force-compute toggle via
         // `MeadowForceComputePath`).
         #[cfg(feature = "mesh-shaders")]

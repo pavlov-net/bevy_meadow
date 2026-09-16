@@ -88,7 +88,7 @@ pub const MEADOW_MAX_VIEWS: usize = 6;
 /// (`compute.rs` builds it next to the active-patch list, feature-gated
 /// there). The task stage owns the whole cull/derive/compact step at
 /// full warp utilization; the mesh stage is a pure expander. MUST equal
-/// `MESH_TASK_BLADES` in `meadow_mesh.wgsl`. Ungated: `compute.rs`
+/// `MESH_TASK_BLADES` in `meadow_mesh.wesl`. Ungated: `compute.rs`
 /// (always compiled) references it.
 pub const MESH_TASK_BLADES: u32 = 128;
 
@@ -98,12 +98,12 @@ pub const MESH_TASK_BLADES: u32 = 128;
 /// grid: `x = min(n, STRIDE)`, `y = ceil(n / STRIDE)`, and the task
 /// shader reconstructs `flat = wg.y * STRIDE + wg.x`, bounds-checked
 /// against the count in the work-list header. MUST equal
-/// `MESH_TASK_DISPATCH_STRIDE` in `meadow_mesh.wgsl`.
+/// `MESH_TASK_DISPATCH_STRIDE` in `meadow_mesh.wesl`.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_TASK_DISPATCH_STRIDE: u32 = 32_768;
 
 /// Mesh-shader path: bytes per `SurvivorBlade` in the task payload
-/// (12 × f32). Must match the struct in `meadow_mesh.wgsl`; sizes the
+/// (12 × f32). Must match the struct in `meadow_mesh.wesl`; sizes the
 /// runtime `max_task_payload_size` support check.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_SURVIVOR_BLADE_BYTES: u32 = 48;
@@ -112,13 +112,13 @@ pub const MESH_SURVIVOR_BLADE_BYTES: u32 = 48;
 /// 5 × 11 = 55 verts / 5 × 9 = 45 tris — small per-workgroup outputs are
 /// load-bearing: large mesh outputs throttle workgroup launch and starve
 /// the SMs (profiling showed 1.5/48 warp slots occupied at the previous
-/// 253-vert budget). MUST equal `MESH_WG_BLADES` in `meadow_mesh.wgsl`.
+/// 253-vert budget). MUST equal `MESH_WG_BLADES` in `meadow_mesh.wesl`.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_WG_BLADES: u32 = 5;
 
 /// Mesh-shader path: tufts expanded per MESH workgroup (band 1).
 /// 3 × 21 = 63 verts / 21 tris. MUST equal `MESH_WG_TUFTS` in
-/// `meadow_mesh.wgsl`.
+/// `meadow_mesh.wesl`.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_WG_TUFTS: u32 = 3;
 
@@ -127,13 +127,13 @@ pub const MESH_WG_TUFTS: u32 = 3;
 /// template verts 0/1/10; drops the mid-blade curl bow, sub-texel at
 /// shadow-map density): 21 × 3 = 63 verts / 21 tris, 9× less shadow
 /// rasterization than the full ribbon. MUST equal
-/// `MESH_WG_SHADOW_BLADES` in `meadow_mesh.wgsl`.
+/// `MESH_WG_SHADOW_BLADES` in `meadow_mesh.wesl`.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_WG_SHADOW_BLADES: u32 = 21;
 
 /// Mesh-shader path: largest per-workgroup mesh output across the bands
 /// (band 1 tufts: 3 × 21 verts; band 0 blades: 5 × 9 tris). MUST equal
-/// `MESH_OUT_VERTS` / `MESH_OUT_PRIMS` in `meadow_mesh.wgsl`; sizes the
+/// `MESH_OUT_VERTS` / `MESH_OUT_PRIMS` in `meadow_mesh.wesl`; sizes the
 /// runtime output-limit support checks.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_OUT_VERTS: u32 = MESH_WG_TUFTS * TUFT_VERTS_PER_BLADE;

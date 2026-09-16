@@ -147,3 +147,31 @@ fn wind_sway(
     let sway = sin(phase) * amp * gust * blade_y_norm;
     return dir * sway;
 }
+
+// Seasonal palette blend: `season_blend.xy` index the from/to palettes
+// (0 spring, 1 summer, 2 autumn, 3 winter), `.z` is the blend factor.
+// Takes the `VariantParams` fields explicitly (like `wind_sway`) so the
+// raster material and the mesh path each bind `variant_params` at their
+// own group slot and share this one body.
+fn season_palette_of(
+    season_blend: vec4<f32>,
+    palette_spring: vec4<f32>,
+    palette_summer: vec4<f32>,
+    palette_autumn: vec4<f32>,
+    palette_winter: vec4<f32>,
+) -> vec3<f32> {
+    let a_idx = u32(season_blend.x);
+    let b_idx = u32(season_blend.y);
+    let t = season_blend.z;
+    var a = palette_summer.rgb;
+    var b = palette_summer.rgb;
+    if (a_idx == 0u) { a = palette_spring.rgb; }
+    else if (a_idx == 1u) { a = palette_summer.rgb; }
+    else if (a_idx == 2u) { a = palette_autumn.rgb; }
+    else { a = palette_winter.rgb; }
+    if (b_idx == 0u) { b = palette_spring.rgb; }
+    else if (b_idx == 1u) { b = palette_summer.rgb; }
+    else if (b_idx == 2u) { b = palette_autumn.rgb; }
+    else { b = palette_winter.rgb; }
+    return mix(a, b, clamp(t, 0.0, 1.0));
+}
