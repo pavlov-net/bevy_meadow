@@ -490,14 +490,21 @@ impl Plugin for MeadowPlugin {
         app.init_resource::<MeadowViewer>();
 
         app.add_systems(Startup, setup_meadow_meshes);
+        // Each broadcast also runs when the registry changes: a variant
+        // registered after a resource's last write otherwise keeps its
+        // `VariantParams` defaults until that resource next changes.
+        let registered = resource_changed::<MeadowVariantRegistry>;
         app.add_systems(
             Update,
             (
-                broadcast_wind_direction.run_if(resource_changed::<WindDirection>),
-                broadcast_wind_state.run_if(resource_changed::<MeadowWindState>),
-                broadcast_season.run_if(resource_changed::<MeadowSeasonState>),
-                broadcast_heightfield.run_if(resource_changed::<MeadowHeightfield>),
-                broadcast_viewer.run_if(resource_changed::<MeadowViewer>),
+                broadcast_wind_direction
+                    .run_if(resource_changed::<WindDirection>.or_eager(registered)),
+                broadcast_wind_state
+                    .run_if(resource_changed::<MeadowWindState>.or_eager(registered)),
+                broadcast_season.run_if(resource_changed::<MeadowSeasonState>.or_eager(registered)),
+                broadcast_heightfield
+                    .run_if(resource_changed::<MeadowHeightfield>.or_eager(registered)),
+                broadcast_viewer.run_if(resource_changed::<MeadowViewer>.or_eager(registered)),
                 spawn_meadow_render_drivers,
             ),
         );
