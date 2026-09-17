@@ -577,10 +577,7 @@ fn extract_meadow_variants(
         if patch.blade_count == 0 {
             continue;
         }
-        let gate = lod_params
-            .get(&patch.variant)
-            .copied()
-            .unwrap_or_default();
+        let gate = lod_params.get(&patch.variant).copied().unwrap_or_default();
         let dist = patch.centre.distance(viewer_xz);
         let n = patch.blade_count as f32;
 
@@ -1349,7 +1346,9 @@ fn meadow_compute_node(
 // go away simply vanishes from the BLAS instead of freezing.
 
 use bevy::render::extract_resource::ExtractResource;
-use bevy::render::render_resource::{BufferInitDescriptor, CommandEncoder, CommandEncoderDescriptor};
+use bevy::render::render_resource::{
+    BufferInitDescriptor, CommandEncoder, CommandEncoderDescriptor,
+};
 #[cfg(all(feature = "solari", not(target_family = "wasm")))]
 use bevy_solari::scene::RaytracingProducerEncoder;
 
@@ -1467,7 +1466,10 @@ fn init_meadow_rt_pipeline(
                 (0, uniform_buffer::<VariantParams>(false)),
                 (1, storage_buffer_read_only_sized(false, None)), // patches
                 (2, storage_buffer_read_only_sized(false, None)), // trunk_slots
-                (3, texture_2d(TextureSampleType::Float { filterable: false })), // heightfield
+                (
+                    3,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ), // heightfield
                 (5, storage_buffer_read_only_sized(false, None)), // active_patches
                 (9, uniform_buffer::<Vec4>(false)),               // rt_params
                 (10, storage_buffer_sized(false, None)),          // rt_cursor_near

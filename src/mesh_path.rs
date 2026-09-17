@@ -72,8 +72,8 @@ use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only, storage_buffer_read_only_sized, texture_2d, uniform_buffer,
 };
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor, BufferBinding,
-    BindGroupLayoutEntries, BufferId, CachedPipelineState, CachedRenderPipelineId,
+    BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntries, BufferBinding, BufferId, CachedPipelineState, CachedRenderPipelineId,
     ColorTargetState, ColorWrites, CompareFunction, DepthStencilState, DynamicUniformBuffer,
     Extent3d, FragmentState, LoadOp, MultisampleState, Operations, PipelineCache, PrimitiveState,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
@@ -472,8 +472,8 @@ fn init_meadow_mesh_path(
 
     // MV composite: plain fullscreen pipeline, everything about it is
     // static — queue it once here.
-    pipelines.composite_pipeline =
-        Some(pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+    pipelines.composite_pipeline = Some(pipeline_cache.queue_render_pipeline(
+        RenderPipelineDescriptor {
             label: Some("meadow_mv_composite_pipeline".into()),
             layout: vec![composite_bgl_desc()],
             vertex: fullscreen_shader.to_vertex_state(),
@@ -488,7 +488,8 @@ fn init_meadow_mesh_path(
                 ..default()
             }),
             ..default()
-        }));
+        },
+    ));
 
     pipelines.supported = true;
     // Lets the compute path's prepare (always compiled) keep the task
@@ -803,25 +804,25 @@ fn prepare_meadow_mesh_pipelines(
                 // 1-2 (bevy has empty + mesh/material groups there), and
                 // the meadow group at [`MEADOW_GROUP`].
                 let id = pipeline_cache.queue_mesh_pipeline(meadow_mesh_pipeline_descriptor(
-                "meadow_mesh_deferred_pipeline",
-                vec![
-                    descriptor.layout[0].clone(),
-                    empty_bgl_desc(),
-                    empty_bgl_desc(),
-                    meadow_mesh_bgl_desc(),
-                ],
-                &pipelines.geom_shader,
-                "meadow_mesh",
-                Some(FragmentState {
-                    shader: pipelines.deferred_fragment_shader.clone(),
-                    shader_defs: frag.shader_defs.clone(),
-                    entry_point: Some("fragment_deferred".into()),
-                    // Bevy's own prepass target list ([normal?, motion?,
-                    // gbuffer, lighting-id]) — `None` holes preserved so
-                    // target indices match `FragmentOutput`'s locations.
-                    targets: frag.targets.clone(),
-                    ..default()
-                }),
+                    "meadow_mesh_deferred_pipeline",
+                    vec![
+                        descriptor.layout[0].clone(),
+                        empty_bgl_desc(),
+                        empty_bgl_desc(),
+                        meadow_mesh_bgl_desc(),
+                    ],
+                    &pipelines.geom_shader,
+                    "meadow_mesh",
+                    Some(FragmentState {
+                        shader: pipelines.deferred_fragment_shader.clone(),
+                        shader_defs: frag.shader_defs.clone(),
+                        entry_point: Some("fragment_deferred".into()),
+                        // Bevy's own prepass target list ([normal?, motion?,
+                        // gbuffer, lighting-id]) — `None` holes preserved so
+                        // target indices match `FragmentOutput`'s locations.
+                        targets: frag.targets.clone(),
+                        ..default()
+                    }),
                     descriptor.multisample.count,
                     false,
                 ));
@@ -1188,12 +1189,7 @@ pub fn meadow_mesh_main_pass(
     );
     render_pass.set_bind_group(1, &mesh_view_bind_group.binding_array, &[]);
     render_pass.set_bind_group(2, &mesh_view_bind_group.empty, &[]);
-    draw_meadow_task_lists(
-        &mut render_pass,
-        0,
-        &bind_groups,
-        &buffers,
-    );
+    draw_meadow_task_lists(&mut render_pass, 0, &bind_groups, &buffers);
     pass_span.end(&mut render_pass);
 }
 
@@ -1289,9 +1285,10 @@ pub fn meadow_mesh_deferred_pass(
     let Some(key) = pipelines.current_deferred_key else {
         return;
     };
-    let Some(pipeline) =
-        compiled_pipeline(&pipeline_cache, pipelines.deferred_pipelines.get(&key).copied())
-    else {
+    let Some(pipeline) = compiled_pipeline(
+        &pipeline_cache,
+        pipelines.deferred_pipelines.get(&key).copied(),
+    ) else {
         return;
     };
     let Some(empty_bind_group) = &pipelines.empty_bind_group else {
@@ -1376,12 +1373,7 @@ pub fn meadow_mesh_deferred_pass(
         render_pass.set_bind_group(0, view_bind_group, view_offsets);
         render_pass.set_bind_group(1, empty_bind_group, &[]);
         render_pass.set_bind_group(2, empty_bind_group, &[]);
-        draw_meadow_task_lists(
-            &mut render_pass,
-            0,
-            &bind_groups,
-            &buffers,
-        );
+        draw_meadow_task_lists(&mut render_pass, 0, &bind_groups, &buffers);
         pass_span.end(&mut render_pass);
     }
 
@@ -1522,12 +1514,7 @@ pub fn meadow_mesh_shadow_pass(
         for slot_index in 0..MEADOW_GROUP as usize {
             render_pass.set_bind_group(slot_index, empty_bind_group, &[]);
         }
-        draw_meadow_task_lists(
-            &mut render_pass,
-            slot as usize,
-            &bind_groups,
-            &buffers,
-        );
+        draw_meadow_task_lists(&mut render_pass, slot as usize, &bind_groups, &buffers);
         pass_span.end(&mut render_pass);
     }
 }
