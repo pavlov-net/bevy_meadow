@@ -9,16 +9,13 @@
 // view bind group layout by construction.
 
 import bevy_pbr::render::{
-    mesh_view_bindings::view,
-    pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, calculate_view},
+    pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
 };
 import bevy_meadow::meadow_mesh_bindings::{MeadowVertexOut, meadow_motion_vector};
 import bevy_meadow::meadow_mesh_pbr_common::meadow_blade_pbr_input;
 
 fn shade_meadow_fragment(in: MeadowVertexOut, is_front: bool) -> vec4<f32> {
-    var pbr_input = meadow_blade_pbr_input(in, is_front);
-    pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
-    pbr_input.V = calculate_view(in.world_position, pbr_input.is_orthographic);
+    let pbr_input = meadow_blade_pbr_input(in, is_front);
 
     var color = apply_pbr_lighting(pbr_input);
     color = main_pass_post_lighting_processing(pbr_input, color);

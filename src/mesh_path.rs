@@ -1745,6 +1745,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compute_raster_fragments_compile_against_bevy_library() {
+        let Some(mut lib) = Library::with_bevy() else {
+            eprintln!("skipping: set BEVY_CHECKOUT to validate raster shaders");
+            return;
+        };
+        let shader = lib.add(Shader::from_wesl(
+            include_str!("meadow.wesl"),
+            "embedded://bevy_meadow/meadow.wesl",
+        ));
+        let base: Vec<ShaderDefVal> = vec![
+            ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 3),
+            "VERTEX_OUTPUT_INSTANCE_INDEX".into(),
+            "VERTEX_POSITIONS".into(),
+            "VERTEX_NORMALS".into(),
+            "VERTEX_UVS".into(),
+            "VERTEX_UVS_A".into(),
+            "VERTEX_TANGENTS".into(),
+        ];
+        lib.compile(shader, &base);
+        let mut deferred = base;
+        deferred.extend([
+            "PREPASS_PIPELINE".into(),
+            "DEPTH_PREPASS".into(),
+            "NORMAL_PREPASS_OR_DEFERRED_PREPASS".into(),
+            "MOTION_VECTOR_PREPASS_OR_DEFERRED_PREPASS".into(),
+            "DEFERRED_PREPASS".into(),
+            "MOTION_VECTOR_PREPASS".into(),
+            "PREPASS_FRAGMENT".into(),
+        ]);
+        lib.compile(shader, &deferred);
+    }
+
+    #[test]
+    fn grass_shading_normal_stays_in_view_hemisphere() {
+        use bevy::math::Vec3;
+        // CPU reference for meadow_shared.wesl::meadow_shading_normal.
+        // Exercise hillside angles on both sides of camera elevation,
+        // grazing views, and degenerate camera/blade coincidence.
+        fn normal(direction: Vec3) -> Vec3 {
+            if direction.length_squared() < 1e-12 {
+                return Vec3::Y;
+            }
+            let v = direction.normalize();
+            if v.y >= 0.1 {
+                return Vec3::Y;
+            }
+            let tangent = Vec3::Y - v * v.y;
+            if tangent.length_squared() < 1e-12 {
+                return v;
+            }
+            tangent.normalize() * (1.0_f32 - 0.1 * 0.1).sqrt() + v * 0.1
+        }
+        assert_eq!(normal(Vec3::ZERO), Vec3::Y);
+        for elevation in -100..=100 {
+            for azimuth in 0..16 {
+                let angle = azimuth as f32 * std::f32::consts::TAU / 16.0;
+                let v = Vec3::new(angle.cos(), elevation as f32 / 10.0, angle.sin()).normalize();
+                let n = normal(v);
+                assert!(n.is_finite());
+                assert!((n.length() - 1.0).abs() < 1e-5);
+                assert!(n.dot(v) >= 0.0999, "view {v:?}, normal {n:?}");
+                if v.y >= 0.1 {
+                    assert_eq!(n, Vec3::Y);
+                }
+            }
+        }
+        assert_eq!(normal(Vec3::Y), Vec3::Y);
+        assert_eq!(normal(Vec3::NEG_Y), Vec3::NEG_Y);
+    }
+
     /// Compile the task/mesh module through bevy's shader cache.
     fn compile_geom_module() -> Arc<String> {
         let mut lib = Library::meadow();

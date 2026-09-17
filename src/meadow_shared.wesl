@@ -175,3 +175,24 @@ fn season_palette_of(
     else { b = palette_winter.rgb; }
     return mix(a, b, clamp(t, 0.0, 1.0));
 }
+
+// Meadow's smoothed upright normal keeps dense grass lighting coherent, but
+// a hillside can put the camera below that normal's hemisphere. Solari's
+// BRDF rejects NdotV <= 0, making those blades black at camera elevation.
+// Preserve the upright normal whenever possible and tilt it just enough
+// toward the viewer otherwise. Shared by both raster rendering paths.
+fn meadow_shading_normal(view_direction: vec3<f32>) -> vec3<f32> {
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    let length_squared = dot(view_direction, view_direction);
+    if length_squared < 1e-12 { return up; }
+    let v = view_direction * inverseSqrt(length_squared);
+    let n_dot_v = v.y;
+    let margin = 0.1;
+    if n_dot_v >= margin { return up; }
+    let tangent = up - v * n_dot_v;
+    let tangent_length_squared = dot(tangent, tangent);
+    // Directly beneath a blade there is no unique upward tangent.
+    if tangent_length_squared < 1e-12 { return v; }
+    return tangent * inverseSqrt(tangent_length_squared) * sqrt(1.0 - margin * margin)
+        + v * margin;
+}

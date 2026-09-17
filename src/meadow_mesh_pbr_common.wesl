@@ -13,14 +13,16 @@
 
 import bevy_pbr::render::{
     pbr_types::{PbrInput, pbr_input_new},
-    pbr_functions::prepare_world_normal,
+    pbr_functions::calculate_view,
+    mesh_view_bindings::view,
     mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
 };
+import bevy_meadow::meadow_shared::meadow_shading_normal;
 import bevy_meadow::meadow_mesh_bindings::{MeadowVertexOut, season_palette};
 
-// Everything the G-buffer packs. The forward fragment additionally sets
-// `is_orthographic` / `V`, which the deferred lighting pass reconstructs
-// from depth instead.
+// Both paths need the view direction to keep the grass shading normal in
+// the visible hemisphere. Deferred lighting reconstructs that direction
+// from depth when it consumes the resulting G-buffer.
 fn meadow_blade_pbr_input(in: MeadowVertexOut, is_front: bool) -> PbrInput {
     var pbr_input = pbr_input_new();
     let palette = season_palette();
@@ -35,11 +37,10 @@ fn meadow_blade_pbr_input(in: MeadowVertexOut, is_front: bool) -> PbrInput {
     pbr_input.material.emissive = vec4<f32>(palette * tip_glow, 1.0);
     pbr_input.frag_coord = in.position;
     pbr_input.world_position = in.world_position;
-    // Same hardcoded upright normal as the compute path, including its
-    // double-sided back-face flip (the meadow StandardMaterial sets
-    // double_sided, so pbr_input_from_standard_material flips there).
-    pbr_input.world_normal = prepare_world_normal(vec3<f32>(0.0, 1.0, 0.0), true, is_front);
-    pbr_input.N = normalize(pbr_input.world_normal);
+    pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
+    pbr_input.V = calculate_view(in.world_position, pbr_input.is_orthographic);
+    pbr_input.world_normal = meadow_shading_normal(pbr_input.V);
+    pbr_input.N = pbr_input.world_normal;
     // No real MeshUniform row exists for mesh-emitted geometry; force the
     // shadow-receiver bit the same way meadow.wesl does.
     pbr_input.flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;

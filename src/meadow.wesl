@@ -43,7 +43,7 @@ import bevy_pbr::render::{
 
 import bevy_meadow::meadow_shared::{
     VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, tuft_local_position,
-    wind_sway, season_palette_of,
+    wind_sway, season_palette_of, meadow_shading_normal,
 };
 
 // Wind time comes from bevy's globals uniform (`globals.time`, wrapped
@@ -252,6 +252,8 @@ fn fragment(
 
 @if(!PREPASS_PIPELINE)
 fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
+    (*pbr_input).world_normal = meadow_shading_normal((*pbr_input).V);
+    (*pbr_input).N = (*pbr_input).world_normal;
     let blade_lum = (*pbr_input).material.base_color.rgb;
     let palette = season_palette();
     let shade = mix(0.70, 1.00, in.uv.y);
@@ -299,6 +301,8 @@ fn fragment(
 
 @if(PREPASS_PIPELINE && PREPASS_FRAGMENT && NORMAL_PREPASS_OR_DEFERRED_PREPASS)
 fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
+    (*pbr_input).world_normal = meadow_shading_normal((*pbr_input).V);
+    (*pbr_input).N = (*pbr_input).world_normal;
     let blade_lum = (*pbr_input).material.base_color.rgb;
     let palette = season_palette();
     let shade = mix(0.70, 1.00, in.uv.y);
