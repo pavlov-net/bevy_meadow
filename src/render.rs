@@ -123,6 +123,8 @@ impl Plugin for MeadowRenderPlugin {
         // default). A raytracer registers the produced geometry; mirrored to
         // the render world where the RT compute reads it.
         app.init_resource::<crate::compute::MeadowRaytracingConfig>();
+        app.init_resource::<crate::compute::MeadowRtDiagnostics>();
+        app.init_resource::<crate::compute::MeadowRtTelemetry>();
         app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
             crate::compute::MeadowRaytracingConfig,
         >::default());

@@ -484,6 +484,13 @@ impl Plugin for MeadowPlugin {
 
         app.init_resource::<MeadowVariantRegistry>();
         app.init_resource::<WindDirection>();
+        app.init_resource::<MeadowWindFreeze>();
+        app.init_resource::<MeadowSolariGeometryNormals>();
+        app.add_systems(
+            PostUpdate,
+            (broadcast_solari_geometry_normals, apply_wind_freeze)
+                .before(bevy::asset::AssetEventSystems),
+        );
         app.init_resource::<MeadowWindState>();
         app.init_resource::<MeadowSeasonState>();
         app.init_resource::<MeadowHeightfield>();
@@ -785,4 +792,83 @@ pub fn upload_trunk_slots(
     };
     buf.clear();
     buf.extend_from_slice(&rows);
+}
+
+/// Diagnostic freeze shared by visible geometry, motion vectors, and RT casters.
+#[derive(Resource, Default)]
+pub struct MeadowWindFreeze {
+    pub enabled: bool,
+}
+
+fn apply_wind_freeze(
+    freeze: Res<MeadowWindFreeze>,
+    time: Res<Time>,
+    direction: Res<WindDirection>,
+    state: Res<MeadowWindState>,
+    registry: Res<MeadowVariantRegistry>,
+    mut materials: ResMut<Assets<MeadowMaterial>>,
+    mut frozen: Local<Option<(Vec4, Vec4)>>,
+) {
+    if !freeze.enabled && frozen.is_none() {
+        return;
+    }
+    let dir = direction.0.normalize_or_zero();
+    let dir = if dir.length_squared() < 0.5 {
+        Vec2::X
+    } else {
+        dir
+    };
+    let current = (
+        Vec4::new(dir.x, dir.y, 0.0, 0.0),
+        Vec4::new(
+            state.speed.max(0.0),
+            state.gustiness.clamp(0.0, 1.0),
+            state.crest_wavenumber.max(0.0),
+            0.0,
+        ),
+    );
+    let packed = if freeze.enabled {
+        *frozen.get_or_insert_with(|| {
+            let mut snapshot = current;
+            // Positive encoding distinguishes a frozen phase of zero from live.
+            snapshot.1.w = time.elapsed_secs_wrapped() + 1.0;
+            snapshot
+        })
+    } else {
+        *frozen = None;
+        current
+    };
+    for (_, entry) in registry.iter() {
+        if let Some(mut mat) = materials.get_mut(&entry.material) {
+            let params = &mat.extension.variant_params;
+            if params.wind_direction != packed.0 || params.wind_state != packed.1 {
+                mat.extension.variant_params.wind_direction = packed.0;
+                mat.extension.variant_params.wind_state = packed.1;
+            }
+        }
+    }
+}
+
+/// Enable the geometric-normal G-buffer payload (`meadow_shared.wesl`), which
+/// the receiver pass of `solari::MeadowSolariPlugin` consumes. The payload
+/// overwrites the AO and clearcoat bytes, so it must be disabled whenever
+/// ordinary deferred lighting consumes the G-buffer.
+#[derive(Resource, Default)]
+pub struct MeadowSolariGeometryNormals {
+    pub enabled: bool,
+}
+
+fn broadcast_solari_geometry_normals(
+    config: Res<MeadowSolariGeometryNormals>,
+    registry: Res<MeadowVariantRegistry>,
+    mut materials: ResMut<Assets<MeadowMaterial>>,
+) {
+    let marker = if config.enabled { 1.0 } else { 0.0 };
+    for (_, entry) in registry.iter() {
+        if let Some(mut mat) = materials.get_mut(&entry.material)
+            && mat.extension.variant_params.width_range.z != marker
+        {
+            mat.extension.variant_params.width_range.z = marker;
+        }
+    }
 }

@@ -31,7 +31,7 @@ pub enum PatchOverrideMode {
 
 /// One placed patch returned from `place_patches`. The consumer
 /// uploads each into a `MeadowPatch` entity at chunk dispatch.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PatchPlacement {
     pub centre: Vec2,
     pub radius: f32,

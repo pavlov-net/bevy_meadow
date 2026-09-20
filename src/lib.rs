@@ -24,6 +24,9 @@
 //! - `MeadowWindState` — world-level resource carrying wind dynamics
 //!   (speed multiplier, gustiness, crest wavenumber). Broadcast to
 //!   every variant on change.
+//! - `solari::MeadowSolariPlugin` (`solari` feature) — blades as
+//!   `bevy_solari` shadow casters, and ray origins that start on the blade
+//!   for meadow pixels Solari lights.
 
 pub mod compute;
 pub mod material;
@@ -33,11 +36,17 @@ pub mod mesh_path;
 pub mod placement;
 pub mod plugin;
 pub mod render;
+mod rt_selection;
+#[cfg(all(feature = "solari", not(target_family = "wasm")))]
+pub mod solari;
 
 #[cfg(feature = "mesh-shaders")]
 pub use mesh_path::MeadowForceComputePath;
 
-pub use compute::{MeadowRaytracingConfig, MeadowRtBuffers, RtBandBuffers, RtVariantBuffers};
+pub use compute::{
+    MeadowRaytracingConfig, MeadowRtBuffers, MeadowRtDiagnostics, MeadowRtTelemetry,
+    MeadowRtVariantStats, RtBandBuffers, RtVariantBuffers,
+};
 pub use material::{
     MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PatchData, PatchTrunkSlot, TrunkDisc,
     VariantParams,
@@ -56,3 +65,5 @@ pub use plugin::{
     MeadowVariantId, MeadowVariantRegistry, MeadowViewer, MeadowWindState, PatchAudioTag,
     SeasonalPalette, WindDirection, WindParams, upload_placements, upload_trunk_slots,
 };
+
+pub use plugin::{MeadowSolariGeometryNormals, MeadowWindFreeze};

@@ -140,7 +140,7 @@ pub const MESH_OUT_VERTS: u32 = MESH_WG_TUFTS * TUFT_VERTS_PER_BLADE;
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_OUT_PRIMS: u32 = MESH_WG_BLADES * 9;
 
-const BLADE_INDICES: [u32; 27] = [
+pub(crate) const BLADE_INDICES: [u32; 27] = [
     0, 1, 3, 0, 3, 2, // layer 0 → 1
     2, 3, 5, 2, 5, 4, // layer 1 → 2
     4, 5, 7, 4, 7, 6, // layer 2 → 3

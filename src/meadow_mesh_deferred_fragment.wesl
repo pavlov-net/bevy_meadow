@@ -1,3 +1,5 @@
+import bevy_pbr::render::mesh_view_bindings::view;
+
 // Deferred G-buffer fragment for the mesh path on deferred main views:
 // the shared `PbrInput` (`meadow_mesh_pbr_common.wesl`) packed through
 // `deferred_gbuffer_from_pbr_input` + the lighting-pass id — bevy's
@@ -17,9 +19,11 @@
 // would drag in the previous-view uniform; the mesh-view matrices at
 // group 3 carry the same data.
 
+import bevy_meadow::meadow_shared::{MEADOW_GBUFFER_THIN_RECEIVER_BIT, meadow_pack_geometric_normal, meadow_triangle_normal};
+
 import bevy_pbr::deferred::functions::deferred_gbuffer_from_pbr_input;
 import bevy_pbr::prepass::io::FragmentOutput;
-import bevy_meadow::meadow_mesh_bindings::{MeadowVertexOut, meadow_motion_vector};
+import bevy_meadow::meadow_mesh_bindings::{MeadowVertexOut, meadow_motion_vector, variant_params};
 import bevy_meadow::meadow_mesh_pbr_common::meadow_blade_pbr_input;
 
 @fragment
@@ -27,10 +31,16 @@ fn fragment_deferred(
     in: MeadowVertexOut,
     @builtin(front_facing) is_front: bool,
 ) -> FragmentOutput {
+    // Evaluate derivatives uniformly before any material/discard branches.
+@if(!WEBGL2)
+    let triangle_normal = meadow_triangle_normal(in.position, view.main_pass_viewport, view.view_from_clip, view.view_from_world);
     let pbr_input = meadow_blade_pbr_input(in, is_front);
 
     var out: FragmentOutput;
     out.deferred = deferred_gbuffer_from_pbr_input(pbr_input);
+    out.deferred.a |= MEADOW_GBUFFER_THIN_RECEIVER_BIT;
+@if(!WEBGL2)
+    out.deferred = meadow_pack_geometric_normal(out.deferred, triangle_normal, variant_params.width_range.z > 0.5);
     out.deferred_lighting_pass_id = pbr_input.material.deferred_lighting_pass_id;
 @if(NORMAL_PREPASS)
     out.normal = vec4<f32>(pbr_input.N * 0.5 + vec3<f32>(0.5), 1.0);

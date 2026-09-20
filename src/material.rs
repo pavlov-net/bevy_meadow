@@ -42,7 +42,8 @@ pub type MeadowMaterial = ExtendedMaterial<StandardMaterial, MeadowExt>;
 pub struct VariantParams {
     /// Min/max blade height in metres, packed `(min, max, _, _)`.
     pub height_range: Vec4,
-    /// Min/max blade width in metres, packed `(min, max, _, _)`.
+    /// Min/max blade width in metres, packed `(min, max, solari_geometry_normal, _)`.
+    /// `z` enables a Solari-only G-buffer extension; zero for vanilla deferred.
     pub width_range: Vec4,
     /// `x = amplitude` (peak XZ displacement of a blade tip in
     /// metres), `y = period` (seconds per gust cycle),
@@ -58,7 +59,8 @@ pub struct VariantParams {
     /// `WindDirection` resource broadcasts to every variant on
     /// resource change.
     pub wind_direction: Vec4,
-    /// Wind dynamics packed `(speed_mul, gustiness, crest_wavenumber, _)`.
+    /// Wind dynamics packed `(speed_mul, gustiness, crest_wavenumber, freeze_time_plus_one)`.
+    /// A positive `w` freezes shared wind evaluation at `w - 1` seconds.
     /// Broadcast from the `MeadowWindState` resource; see that type's
     /// doc for per-field semantics.
     pub wind_state: Vec4,

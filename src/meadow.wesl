@@ -1,3 +1,5 @@
+import bevy_pbr::render::mesh_view_bindings::view;
+
 // Meadow blade raster shader — passthrough vertex + PBR fragment.
 //
 // Blade geometry is derived, culled, and compacted GPU-side once per
@@ -13,6 +15,8 @@
 // Structs + binding-free helpers live in `meadow_shared.wesl`; the
 // per-blade derivation (hash placement, heightfield sample, LOD gate)
 // lives in `meadow_compute.wesl`.
+
+import bevy_meadow::meadow_shared::{MEADOW_GBUFFER_THIN_RECEIVER_BIT, meadow_pack_geometric_normal, meadow_triangle_normal};
 
 import bevy_pbr::render::view_transformations::position_world_to_clip;
 
@@ -157,7 +161,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     // Wind sway in world XZ on the upper portion of the blade —
     // recomputed each frame (time-varying); cheap relative to the
     // full derivation.
-    let wind = wind_displacement(blade.world_xz, y_norm, globals.time, blade.clump_seed);
+    let wind = wind_displacement(blade.world_xz, 1.0, globals.time, blade.clump_seed) * y_norm;
     let target_world_xz = blade_world_xz + wind;
     let root_world_xz = blade.world_xz;
 
@@ -188,7 +192,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     // (`rec.prev_*`, == current root for static placement) and wind
     // (previous frame's time) so TAA can cancel the per-vertex sway delta.
     let prev_t = globals.time - globals.delta_time;
-    let prev_wind = wind_displacement(rec.prev_root_xz, y_norm, prev_t, blade.clump_seed);
+    let prev_wind = wind_displacement(rec.prev_root_xz, 1.0, prev_t, blade.clump_seed) * y_norm;
     let prev_blade_world_xz = rec.prev_root_xz + vec2<f32>(rotated_x, rotated_z);
     let prev_target_xz = prev_blade_world_xz + prev_wind;
     let prev_final_xz = mix(rec.prev_root_xz, prev_target_xz, collapse_t);
@@ -280,6 +284,8 @@ fn fragment(
     @builtin(front_facing) is_front: bool,
 ) -> FragmentOutput {
 @if(NORMAL_PREPASS_OR_DEFERRED_PREPASS) {
+@if(DEFERRED_PREPASS && !WEBGL2)
+    let triangle_normal = meadow_triangle_normal(in.position, view.main_pass_viewport, view.view_from_clip, view.view_from_world);
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     apply_blade_palette(in, &pbr_input);
     pbr_input.material.base_color = alpha_discard(
@@ -287,7 +293,12 @@ fn fragment(
         pbr_input.material.alpha_cutoff,
         pbr_input.material.base_color,
     );
-    return deferred_output(in, pbr_input);
+    var out = deferred_output(in, pbr_input);
+@if(DEFERRED_PREPASS)
+    out.deferred.a |= MEADOW_GBUFFER_THIN_RECEIVER_BIT;
+@if(DEFERRED_PREPASS && !WEBGL2)
+    out.deferred = meadow_pack_geometric_normal(out.deferred, triangle_normal, variant_params.width_range.z > 0.5);
+    return out;
 } @else {
     // Motion-vector-only prepass — VertexOutput has no
     // `world_normal`, so we can't build a `PbrInput`. The

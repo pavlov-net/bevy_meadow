@@ -1776,6 +1776,270 @@ mod tests {
             "PREPASS_FRAGMENT".into(),
         ]);
         lib.compile(shader, &deferred);
+        // WebGL packs depth into the material-properties word: the desktop
+        // Solari extension must be absent even if its runtime marker is set.
+        deferred.push("WEBGL2".into());
+        let webgl = lib.compile(shader, &deferred);
+        assert!(!webgl.contains("meadow_pack_geometric_normal"));
+    }
+
+    #[test]
+    fn triangle_normal_reconstruction_respects_jitter_viewport_and_large_world_origin() {
+        use bevy::math::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
+        // Three samples on one small triangle; finite differences of the
+        // reconstructed plane must preserve its normal, including reversed-Z,
+        // jitter, a viewport origin, and reduced render resolution.
+        let points = [
+            Vec3::new(-0.01, 0.0, -3.0),
+            Vec3::new(0.0, 0.013, -3.004),
+            Vec3::new(0.012, 0.006, -3.02),
+        ];
+        let normal = (points[1] - points[0])
+            .cross(points[2] - points[0])
+            .normalize();
+        let viewport = Vec4::new(17.0, 23.0, 960.0, 540.0);
+        for mut projection in [
+            Mat4::perspective_infinite_reverse_rh(1.0, 16.0 / 9.0, 0.1),
+            Mat4::orthographic_rh(-2.0, 2.0, -1.0, 1.0, 100.0, 0.1),
+        ] {
+            projection.z_axis.x += 0.37 / viewport.z;
+            projection.z_axis.y -= 0.21 / viewport.w;
+            let inverse = projection.inverse();
+            let reconstructed = points.map(|p| {
+                let ndc = projection.project_point3(p);
+                let uv = Vec2::new(ndc.x, ndc.y) * Vec2::new(0.5, -0.5) + Vec2::splat(0.5);
+                let pixel =
+                    uv * Vec2::new(viewport.z, viewport.w) + Vec2::new(viewport.x, viewport.y);
+                let recovered_uv =
+                    (pixel - Vec2::new(viewport.x, viewport.y)) / Vec2::new(viewport.z, viewport.w);
+                let recovered_ndc = Vec3::new(
+                    recovered_uv.x * 2.0 - 1.0,
+                    1.0 - recovered_uv.y * 2.0,
+                    ndc.z,
+                );
+                inverse.project_point3(recovered_ndc)
+            });
+            let reconstructed_normal = (reconstructed[1] - reconstructed[0])
+                .cross(reconstructed[2] - reconstructed[0])
+                .normalize();
+            for origin in [1442.0, 1_000_000.0] {
+                let world_from_view = Mat4::from_rotation_translation(
+                    Quat::from_rotation_y(0.7),
+                    Vec3::new(origin, 100.0, -origin),
+                );
+                let normal_to_world = Mat3::from_mat4(world_from_view.inverse()).transpose();
+                let actual = (normal_to_world * reconstructed_normal).normalize();
+                let expected = (normal_to_world * normal).normalize();
+                assert!(actual.dot(expected) > 0.99999, "{actual:?} vs {expected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn geometric_normal_payload_preserves_material_and_has_safe_fallback() {
+        use bevy::math::{Vec2, Vec3};
+        const BIT: u32 = 1 << 28;
+        // CPU reference of `meadow_pack_geometric_normal` and
+        // `meadow_unpack_geometric_normal_oct`: the payload leaves
+        // emissive/base color, reflectance/metallic and every other A bit
+        // intact.
+        fn pack(mut pixel: [u32; 4], normal: Vec3, enabled: bool) -> [u32; 4] {
+            let magnitude = normal.abs();
+            let scale = magnitude.max_element();
+            if !enabled || !(scale > 1e-20) || !magnitude.cmplt(Vec3::splat(1e30)).all() {
+                return pixel;
+            }
+            let normal = normal / scale;
+            let n = normal / normal.abs().element_sum();
+            let sign_x = if n.x >= 0.0 { 1.0 } else { -1.0 };
+            let sign_y = if n.y >= 0.0 { 1.0 } else { -1.0 };
+            let oct = if n.z >= 0.0 {
+                Vec2::new(n.x, n.y)
+            } else {
+                Vec2::new((1.0 - n.y.abs()) * sign_x, (1.0 - n.x.abs()) * sign_y)
+            } * 0.5
+                + Vec2::splat(0.5);
+            let encoded = (oct.clamp(Vec2::ZERO, Vec2::ONE) * 255.0).round();
+            pixel[2] =
+                (pixel[2] & 0xFFFF) | ((encoded.x as u32) << 16) | ((encoded.y as u32) << 24);
+            pixel[3] |= BIT;
+            pixel
+        }
+        fn decode(pixel: [u32; 4]) -> Vec3 {
+            let x = ((pixel[2] >> 16) & 255) as f32 / 255.0 * 2.0 - 1.0;
+            let y = (pixel[2] >> 24) as f32 / 255.0 * 2.0 - 1.0;
+            let mut n = Vec3::new(x, y, 1.0 - x.abs() - y.abs());
+            let t = (-n.z).clamp(0.0, 1.0);
+            n.x += if n.x >= 0.0 { -t } else { t };
+            n.y += if n.y >= 0.0 { -t } else { t };
+            n.normalize()
+        }
+        let original = [0x12345678, 0x89ABCDEF, 0xFEDCBA98, 0x0F123456];
+        for normal in [
+            Vec3::X,
+            -Vec3::X,
+            Vec3::Y,
+            -Vec3::Y,
+            Vec3::Z,
+            -Vec3::Z,
+            Vec3::new(0.3, -0.7, -0.2),
+            Vec3::new(-0.2, 0.5, 0.8),
+        ] {
+            assert_eq!(pack(original, normal, false), original);
+            let packed = pack(original, normal, true);
+            assert_eq!(packed[0..2], original[0..2]);
+            assert_eq!(packed[2] & 0xFFFF, original[2] & 0xFFFF);
+            assert_eq!(packed[3] & !BIT, original[3]);
+            assert_ne!(packed[3] & BIT, 0);
+            assert!(decode(packed).dot(normal.normalize()) > 0.9998);
+        }
+        for invalid in [
+            Vec3::ZERO,
+            Vec3::splat(1e-30),
+            Vec3::splat(f32::NAN),
+            Vec3::new(f32::INFINITY, 1.0, 0.0),
+            Vec3::splat(1e31),
+        ] {
+            assert_eq!(pack(original, invalid, true), original);
+        }
+    }
+
+    /// `PACKED_NORMAL_TANGENT_GUARD` in `meadow_receivers.wesl`.
+    const PACKED_NORMAL_TANGENT_GUARD: f32 = 0.02;
+
+    /// A unit normal after the payload's two-unorm8 octahedral round trip.
+    fn oct8x2(n: bevy::math::Vec3) -> bevy::math::Vec3 {
+        use bevy::math::{Vec2, Vec3};
+        let v = n / n.abs().element_sum();
+        let sign = |x: f32| if x >= 0.0 { 1.0 } else { -1.0 };
+        let e = if v.z >= 0.0 {
+            Vec2::new(v.x, v.y)
+        } else {
+            Vec2::new((1.0 - v.y.abs()) * sign(v.x), (1.0 - v.x.abs()) * sign(v.y))
+        };
+        let e = ((e * 0.5 + Vec2::splat(0.5)) * 255.0).round() / 255.0;
+        let f = e * 2.0 - Vec2::ONE;
+        let mut n = Vec3::new(f.x, f.y, 1.0 - f.x.abs() - f.y.abs());
+        let t = (-n.z).clamp(0.0, 1.0);
+        n.x -= sign(n.x) * t;
+        n.y -= sign(n.y) * t;
+        n.normalize()
+    }
+
+    /// CPU model of how Solari consumes a packed normal: the ray origin moves
+    /// along ±n toward the ray's side, and only when |n·d| exceeds the guard
+    /// the receiver pass hands over with the normal. The negated comparison
+    /// mirrors the shader: a NaN cosine takes the no-offset branch.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn packed_normal_offset(
+        p: bevy::math::Vec3,
+        n: bevy::math::Vec3,
+        d: bevy::math::Vec3,
+    ) -> bevy::math::Vec3 {
+        let cosine = n.dot(d);
+        if !(cosine.abs() > PACKED_NORMAL_TANGENT_GUARD) {
+            return p;
+        }
+        let n = if cosine > 0.0 { n } else { -n };
+        let distance = (4.0 * f32::EPSILON * n.abs().dot(p.abs())).max(0.00001);
+        p + n * distance
+    }
+
+    #[test]
+    fn oct8x2_quantization_sign_reversal_does_not_introduce_a_grazing_self_hit() {
+        use bevy::math::Vec3;
+        let n = Vec3::new(0.52699474, 0.847_684_3, 0.06089206).normalize();
+        let d = Vec3::new(-0.833_263_8, 0.49988333, 0.23619491).normalize();
+        let q = oct8x2(n);
+        // The quantized normal lands on the other side of this grazing ray.
+        assert!(n.dot(d) < 0.0 && q.dot(d) > 0.0);
+        let p = Vec3::ZERO;
+        // Intersection distance along `d` with the true blade plane through `p`.
+        let plane_hit = |origin: Vec3| n.dot(p - origin) / n.dot(d);
+        // Unguarded, even the 10 micron minimum offset invents a ~1 cm self hit.
+        assert!(plane_hit(p + q * 0.00001) > 0.001);
+        assert_eq!(packed_normal_offset(p, q, d), p);
+        assert_eq!(packed_normal_offset(p, q, -d), p);
+    }
+
+    #[test]
+    fn oct8x2_round_trip_normals_never_choose_wrong_side_outside_guard() {
+        use bevy::math::Vec3;
+        for x in -16..=16 {
+            for y in -16..=16 {
+                for z in [-16, -3, 3, 16] {
+                    let n = Vec3::new(x as f32, y as f32, z as f32).normalize();
+                    let q = oct8x2(n);
+                    let axis = if n.x.abs() < 0.8 { Vec3::X } else { Vec3::Y };
+                    let tangent = n.cross(axis).normalize();
+                    for cosine in [-0.1, -0.03, -0.001, 0.001, 0.03, 0.1] {
+                        let d = (tangent + n * cosine).normalize();
+                        if q.dot(d).abs() > PACKED_NORMAL_TANGENT_GUARD {
+                            assert!(q.dot(d) * n.dot(d) > 0.0);
+                        } else {
+                            assert_eq!(
+                                packed_normal_offset(Vec3::splat(1442.0), q, d),
+                                Vec3::splat(1442.0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Solari receiver pass compiles against the real bevy and
+    /// bevy_solari shader libraries, and binds nothing in group 1 beyond its
+    /// own five resources: importing Solari's helpers must not drag Solari's
+    /// lighting bindings into meadow's pipeline layout.
+    #[test]
+    fn receiver_shader_compiles_against_bevy_and_solari_libraries() {
+        let (Some(mut lib), Some(root)) = (Library::with_bevy(), bevy_checkout()) else {
+            eprintln!("skipping: set BEVY_CHECKOUT to validate the receiver shader");
+            return;
+        };
+        let solari = root.join("crates/bevy_solari/src");
+        if !solari.join("realtime/receiver_override.wesl").exists()
+            || !solari.join("scene/triangle_anchor.wesl").exists()
+        {
+            eprintln!("skipping: the bevy checkout has no Solari receiver-override interface");
+            return;
+        }
+        lib.add_wesl_dir("bevy_solari", &solari, &solari);
+        let shader = lib.add(Shader::from_wesl(
+            include_str!("meadow_receivers.wesl"),
+            "embedded://bevy_meadow/meadow_receivers.wesl",
+        ));
+        let wgsl = lib.compile(shader, &[]);
+        assert!(
+            wgsl.contains("fn resolve_meadow_receivers("),
+            "entry `resolve_meadow_receivers` lost"
+        );
+        assert_eq!(
+            wgsl.matches("@group(1)").count(),
+            5,
+            "group 1 must hold exactly meadow's five receiver bindings:\n{wgsl}"
+        );
+
+        // bevy_pbr's deferred flags share the G-buffer A byte with meadow's
+        // bits 27 and 28 (flag bits 3 and 4).
+        let types = std::fs::read_to_string(root.join("crates/bevy_pbr/src/deferred/types.wesl"))
+            .expect("readable deferred types");
+        for line in types.lines().filter(|l| l.starts_with("const DEFERRED_")) {
+            let Some(shift) = line.split("<<").nth(1).and_then(|s| {
+                s.trim()
+                    .trim_end_matches(';')
+                    .trim_end_matches('u')
+                    .parse::<u32>()
+                    .ok()
+            }) else {
+                continue;
+            };
+            assert!(
+                shift != 3 && shift != 4,
+                "bevy_pbr deferred flag collides with a meadow G-buffer bit: {line}"
+            );
+        }
     }
 
     #[test]
@@ -1840,6 +2104,29 @@ mod tests {
                 "entry `{entry}` lost"
             );
         }
+    }
+
+    /// Validate RT expansion and padding together: their storage layouts
+    /// must track the CPU allocation when the near ribbon topology changes.
+    #[test]
+    fn rt_compute_module_compiles_and_validates() {
+        let mut lib = Library::meadow();
+        let shader = lib.add(Shader::from_wesl(
+            include_str!("meadow_compute.wesl"),
+            "embedded://bevy_meadow/meadow_compute.wesl",
+        ));
+        let wgsl = lib.compile(shader, &[]);
+        for entry in ["expand_rt_blades", "rt_pad_unused"] {
+            assert!(
+                wgsl.contains(&format!("fn {entry}(")),
+                "entry `{entry}` lost"
+            );
+        }
+        assert_eq!(
+            crate::compute::RT_NEAR_MAX_BLADES * crate::mesh::BLADE_INDICES_PER_BLADE / 3,
+            294_912,
+            "near fidelity must not increase the triangle budget",
+        );
     }
 
     /// Run the validated module through naga's SPIR-V backend with

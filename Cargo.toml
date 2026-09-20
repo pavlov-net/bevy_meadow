@@ -25,11 +25,13 @@ publish = false
 # compute path stays the portable fallback. `MeadowForceComputePath`
 # forces the compute path at runtime for comparison.
 mesh-shaders = []
-# Record the raytracing blade expansion into `bevy_solari`'s shared
-# per-frame producer encoder (`RaytracingProducerEncoder`, a fork-only
-# API — the consuming workspace redirects `bevy_solari` to the fork via
-# `[patch]`). Off, the pass records into a private encoder + submit and
-# builds against upstream bevy.
+# `bevy_solari` integration: the `solari` module (caster proxies and the
+# receiver ray-origin pass), and the raytracing blade expansion recorded
+# into solari's shared per-frame producer encoder
+# (`RaytracingProducerEncoder`). Both use fork-only API — the consuming
+# workspace redirects `bevy_solari` to the fork via `[patch]`. Off, the
+# expansion records into a private encoder + submit and the crate builds
+# against upstream bevy.
 solari = ["dep:bevy_solari"]
 default = ["solari"]
 

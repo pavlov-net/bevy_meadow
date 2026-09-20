@@ -129,6 +129,7 @@ fn wind_sway(
     wind_direction: vec4<f32>,
     wind_state: vec4<f32>,
 ) -> vec2<f32> {
+    let wind_time = select(t, wind_state.w - 1.0, wind_state.w > 0.0);
     let speed_mul = wind_state.x;
     let gustiness = wind_state.y;
     let crest_k = wind_state.z;
@@ -141,8 +142,8 @@ fn wind_sway(
     // lockstep without drowning the spatial gradient that produces the
     // traveling crest. The earlier `clump * 4π` swamped the spatial
     // signal so blades visibly sloshed independently.
-    let phase = (t / period) * 6.2831853 + clump * 1.57 - dot(world_xz, dir) * crest_k;
-    let gust_osc = 0.6 + 0.4 * sin(t * 0.25 + world_xz.x * 0.11 + world_xz.y * 0.09);
+    let phase = (wind_time / period) * 6.2831853 + clump * 1.57 - dot(world_xz, dir) * crest_k;
+    let gust_osc = 0.6 + 0.4 * sin(wind_time * 0.25 + world_xz.x * 0.11 + world_xz.y * 0.09);
     let gust = mix(1.0, gust_osc, gustiness);
     let sway = sin(phase) * amp * gust * blade_y_norm;
     return dir * sway;
@@ -195,4 +196,72 @@ fn meadow_shading_normal(view_direction: vec3<f32>) -> vec3<f32> {
     if tangent_length_squared < 1e-12 { return v; }
     return tangent * inverseSqrt(tangent_length_squared) * sqrt(1.0 - margin * margin)
         + v * margin;
+}
+
+// G-buffer A bit 27 marks a meadow pixel as a thin two-sided receiver. The
+// contract is private to meadow: both raster paths write it and meadow's
+// Solari receiver pass (`meadow_receivers.wesl`) is its only reader. bevy_pbr's
+// deferred flags occupy bits 24..26 and the packed normal bits 0..23; neither
+// is altered.
+const MEADOW_GBUFFER_THIN_RECEIVER_BIT: u32 = 1u << 27u;
+
+// G-buffer A bit 28 marks a geometric-normal payload in B, read only by
+// meadow's Solari receiver pass and meaningful only together with bit 27. B
+// bits 0..15 keep reflectance/metallic; bits 16..23 and 24..31 carry the
+// octahedral triangle normal as two unorm8 values. The payload overwrites the
+// AO and clearcoat bytes that deferred lighting reads, so the caller gates it
+// with `width_range.z`.
+const MEADOW_GBUFFER_GEOMETRIC_NORMAL_BIT: u32 = 1u << 28u;
+
+// Reconstruct each invocation's OWN rasterized position in view space.
+// Differentiating absolute world-position varyings loses precision far from
+// the origin. This keeps coordinates small without extra vertex varyings or
+// sampling neighboring surfaces. Viewport must match the geometry pass,
+// including resolution overrides; view_from_clip must include its jitter.
+fn meadow_triangle_normal(
+    frag_coord: vec4<f32>,
+    viewport: vec4<f32>,
+    view_from_clip: mat4x4<f32>,
+    view_from_world: mat4x4<f32>,
+) -> vec3<f32> {
+    // Same conversion as bevy_render::view::{frag_coord_to_ndc,
+    // position_ndc_to_view}, kept binding-free for shared meadow modules.
+    let uv = (frag_coord.xy - viewport.xy) / viewport.zw;
+    let ndc = vec3<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), frag_coord.z);
+    let homogeneous_view = view_from_clip * vec4<f32>(ndc, 1.0);
+    let view_position = homogeneous_view.xyz / homogeneous_view.w;
+    let view_normal = cross(dpdx(view_position), dpdy(view_position));
+    // Inverse-transpose normal transform also handles a scaled camera.
+    let normal_to_world = transpose(mat3x3<f32>(view_from_world[0].xyz,
+        view_from_world[1].xyz, view_from_world[2].xyz));
+    return normal_to_world * view_normal;
+}
+
+fn meadow_pack_geometric_normal(
+    gbuffer: vec4<u32>,
+    triangle_normal: vec3<f32>,
+    enabled: bool,
+) -> vec4<u32> {
+    var result = gbuffer;
+    let magnitude = abs(triangle_normal);
+    let scale = max(magnitude.x, max(magnitude.y, magnitude.z));
+    // Avoid normalizing a collapsed, non-finite, or numerically tiny
+    // derivative cross product. Absence of bit 28 invokes consumer fallback.
+    if (!enabled || !(scale > 1e-20) || !all(magnitude < vec3<f32>(1e30))) {
+        return result;
+    }
+    let normal = triangle_normal / scale;
+    let n = normal / (abs(normal.x) + abs(normal.y) + abs(normal.z));
+    let wrap = (1.0 - abs(n.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), n.xy >= vec2<f32>(0.0));
+    let oct = select(wrap, n.xy, n.z >= 0.0) * 0.5 + 0.5;
+    let encoded = vec2<u32>(round(clamp(oct, vec2<f32>(0.0), vec2<f32>(1.0)) * 255.0));
+    result.b = (result.b & 0xFFFFu) | (encoded.x << 16u) | (encoded.y << 24u);
+    result.a |= MEADOW_GBUFFER_GEOMETRIC_NORMAL_BIT;
+    return result;
+}
+
+// Octahedral coordinates in [0,1]² of the packed payload, in the convention of
+// `bevy_render::utils::octahedral_decode`. Valid only when A bit 28 is set.
+fn meadow_unpack_geometric_normal_oct(gbuffer_b: u32) -> vec2<f32> {
+    return vec2<f32>(f32((gbuffer_b >> 16u) & 255u), f32(gbuffer_b >> 24u)) / 255.0;
 }
