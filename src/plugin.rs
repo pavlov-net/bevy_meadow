@@ -93,15 +93,45 @@ impl Default for WindParams {
     }
 }
 
-/// Four-corner seasonal albedo. The palette system on
-/// `Changed<WorldClock>` lerps between adjacent corners and writes
-/// the result into every variant's `VariantParams.season_blend`.
-#[derive(Debug, Clone, Copy)]
+/// Four-corner seasonal albedo (linear). The shader blends two corners by
+/// [`MeadowSeasonState`], which `broadcast_season` writes into every
+/// variant's `VariantParams.season_blend`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeasonalPalette {
     pub spring: Vec3,
     pub summer: Vec3,
     pub autumn: Vec3,
     pub winter: Vec3,
+}
+
+impl SeasonalPalette {
+    /// The corner for a [`MeadowSeasonState`] index: 0 spring, 1 summer,
+    /// 2 autumn, anything else winter (the shader's mapping).
+    pub fn corner(&self, idx: u32) -> Vec3 {
+        match idx {
+            0 => self.spring,
+            1 => self.summer,
+            2 => self.autumn,
+            _ => self.winter,
+        }
+    }
+
+    /// The blended albedo the shader's `season_palette_of` produces for
+    /// `season`.
+    pub fn at(&self, season: &MeadowSeasonState) -> Vec3 {
+        self.corner(season.from_idx)
+            .lerp(self.corner(season.to_idx), season.blend_t.clamp(0.0, 1.0))
+    }
+
+    /// Every corner multiplied by `scale`.
+    pub fn scaled(&self, scale: f32) -> Self {
+        Self {
+            spring: self.spring * scale,
+            summer: self.summer * scale,
+            autumn: self.autumn * scale,
+            winter: self.winter * scale,
+        }
+    }
 }
 
 impl Default for SeasonalPalette {
@@ -239,6 +269,42 @@ impl MeadowVariantRegistry {
         id
     }
 
+    /// Replace a registered variant's seasonal palette and push it into the
+    /// variant's material. Returns `false` for an unknown id. The material
+    /// is written only when the palette differs, so an unchanged palette
+    /// does not re-extract it.
+    pub fn set_palette(
+        &mut self,
+        id: MeadowVariantId,
+        palette: SeasonalPalette,
+        meadow_materials: &mut Assets<MeadowMaterial>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        entry.variant.palette = palette;
+        let params = palette_params(&palette);
+        if let Some(mut mat) = meadow_materials.get_mut(&entry.material) {
+            let current = &mat.extension.variant_params;
+            if [
+                current.palette_spring,
+                current.palette_summer,
+                current.palette_autumn,
+                current.palette_winter,
+            ] != params
+            {
+                let p = &mut mat.extension.variant_params;
+                [
+                    p.palette_spring,
+                    p.palette_summer,
+                    p.palette_autumn,
+                    p.palette_winter,
+                ] = params;
+            }
+        }
+        true
+    }
+
     pub fn get(&self, id: MeadowVariantId) -> Option<&RegisteredVariant> {
         self.entries.get(&id)
     }
@@ -252,7 +318,24 @@ impl MeadowVariantRegistry {
     }
 }
 
+/// `VariantParams.palette_{spring,summer,autumn,winter}` for `palette`.
+fn palette_params(palette: &SeasonalPalette) -> [Vec4; 4] {
+    [
+        palette.spring,
+        palette.summer,
+        palette.autumn,
+        palette.winter,
+    ]
+    .map(|c| c.extend(0.0))
+}
+
 fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
+    let [
+        palette_spring,
+        palette_summer,
+        palette_autumn,
+        palette_winter,
+    ] = palette_params(&variant.palette);
     // `wind_direction` / `wind_state` come from `VariantParams::default()`
     // so the freshly-registered variant has sane values before the
     // broadcast systems run for the first time.
@@ -260,30 +343,10 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
         height_range: Vec4::new(variant.height_range.0, variant.height_range.1, 0.0, 0.0),
         width_range: Vec4::new(variant.width_range.0, variant.width_range.1, 0.0, 0.0),
         wind: Vec4::new(variant.wind.amplitude, variant.wind.period, 0.0, 0.0),
-        palette_spring: Vec4::new(
-            variant.palette.spring.x,
-            variant.palette.spring.y,
-            variant.palette.spring.z,
-            0.0,
-        ),
-        palette_summer: Vec4::new(
-            variant.palette.summer.x,
-            variant.palette.summer.y,
-            variant.palette.summer.z,
-            0.0,
-        ),
-        palette_autumn: Vec4::new(
-            variant.palette.autumn.x,
-            variant.palette.autumn.y,
-            variant.palette.autumn.z,
-            0.0,
-        ),
-        palette_winter: Vec4::new(
-            variant.palette.winter.x,
-            variant.palette.winter.y,
-            variant.palette.winter.z,
-            0.0,
-        ),
+        palette_spring,
+        palette_summer,
+        palette_autumn,
+        palette_winter,
         season_blend: Vec4::new(0.0, 1.0, 0.0, 0.0),
         // `x = full_distance`, `y = max_view_distance`,
         // `z = rim_falloff_fraction`, `w = unused`. The shader's

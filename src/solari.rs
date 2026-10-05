@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use bevy::asset::embedded_asset;
 use bevy::core_pipeline::Core3d;
 use bevy::core_pipeline::prepass::ViewPrepassTextures;
-use bevy::platform::collections::HashSet;
+use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::render::diagnostic::RecordDiagnostics;
 use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
@@ -50,7 +50,9 @@ use bevy_solari::scene::{
 use crate::compute::{
     MeadowRaytracingConfig, MeadowRtBuffers, MeadowRtDiagnostics, MeadowRtExpanded,
 };
-use crate::plugin::{MeadowPatch, MeadowVariantId, MeadowVariantRegistry};
+use crate::plugin::{
+    MeadowPatch, MeadowSeasonState, MeadowVariantId, MeadowVariantRegistry, SeasonalPalette,
+};
 
 /// [`RaytracingInstanceTag`] of near-band casters, the only geometry that
 /// reproduces the rasterised blade and may anchor a receiver pixel. Far chords
@@ -145,18 +147,25 @@ struct MeadowRtProxy {
     band: MeadowRtBand,
 }
 
+/// Mean of the raster blade's height shade, `mix(0.70, 1.00, uv.y)` in
+/// `meadow.wesl`, over the blade.
+const MEAN_BLADE_SHADE: f32 = 0.85;
+
 /// Keep one proxy entity per (live variant, band) while the casters are
-/// enabled. Proxies carry a black-emissive `StandardMaterial` (only occlusion
-/// matters for shadows) and [`RaytracingGeometry`].
+/// enabled. Proxies carry [`RaytracingGeometry`] and a per-variant
+/// `StandardMaterial` whose albedo is the variant's current seasonal palette
+/// times the mean blade shade, so Solari bounces light off the casters at the
+/// raster blades' colour.
 fn manage_meadow_rt_proxies(
     mut commands: Commands,
     config: Option<Res<MeadowRaytracingConfig>>,
     registry: Option<Res<MeadowVariantRegistry>>,
+    season: Res<MeadowSeasonState>,
     diagnostics: Option<Res<MeadowRtDiagnostics>>,
     patches: Query<&MeadowPatch>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     proxies: Query<(Entity, &MeadowRtProxy)>,
-    mut material: Local<Option<Handle<StandardMaterial>>>,
+    mut variant_materials: Local<HashMap<MeadowVariantId, Handle<StandardMaterial>>>,
 ) {
     let enabled = config.is_some_and(|c| c.enabled);
     if !enabled && proxies.is_empty() {
@@ -188,11 +197,35 @@ fn manage_meadow_rt_proxies(
             commands.entity(entity).despawn();
         }
     }
+    // A handful of variants: compare every frame so a material also catches
+    // up after the casters were off across a palette or season change.
+    if let Some(registry) = registry.as_deref() {
+        for (id, handle) in variant_materials.iter() {
+            let Some(entry) = registry.get(*id) else {
+                continue;
+            };
+            let albedo = proxy_albedo(&entry.variant.palette, &season);
+            // Compare first: `get_mut` alone marks the asset modified.
+            if materials
+                .get(handle)
+                .is_some_and(|m| m.base_color != albedo)
+                && let Some(mut m) = materials.get_mut(handle)
+            {
+                m.base_color = albedo;
+            }
+        }
+    }
     for (variant, band) in want {
-        let mat = material
-            .get_or_insert_with(|| {
+        let palette = registry
+            .as_deref()
+            .and_then(|r| r.get(variant))
+            .map(|entry| entry.variant.palette)
+            .unwrap_or_default();
+        let mat = variant_materials
+            .entry(variant)
+            .or_insert_with(|| {
                 materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.3, 0.5, 0.2),
+                    base_color: proxy_albedo(&palette, &season),
                     perceptual_roughness: 1.0,
                     metallic: 0.0,
                     emissive: LinearRgba::BLACK,
@@ -208,6 +241,13 @@ fn manage_meadow_rt_proxies(
             Transform::IDENTITY,
         ));
     }
+}
+
+/// Linear albedo of a variant's casters: the palette at `season` times the
+/// mean blade shade.
+fn proxy_albedo(palette: &SeasonalPalette, season: &MeadowSeasonState) -> Color {
+    let c = palette.at(season) * MEAN_BLADE_SHADE;
+    Color::linear_rgb(c.x, c.y, c.z)
 }
 
 /// Render world: bind each proxy's band buffers so Solari rebuilds its BLAS
