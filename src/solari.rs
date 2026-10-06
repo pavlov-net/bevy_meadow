@@ -205,10 +205,13 @@ fn manage_meadow_rt_proxies(
                 continue;
             };
             let albedo = proxy_albedo(&entry.variant.palette, &season);
-            // Compare first: `get_mut` alone marks the asset modified.
+            // Compare first: `get_mut` alone marks the asset modified, and a
+            // modified material makes Solari re-convert every material. The
+            // season blend moves every frame, so only a perceptible change
+            // rewrites the albedo.
             if materials
                 .get(handle)
-                .is_some_and(|m| m.base_color != albedo)
+                .is_some_and(|m| albedo_differs(m.base_color, albedo))
                 && let Some(mut m) = materials.get_mut(handle)
             {
                 m.base_color = albedo;
@@ -241,6 +244,20 @@ fn manage_meadow_rt_proxies(
             Transform::IDENTITY,
         ));
     }
+}
+
+/// Largest per-channel linear albedo difference the casters ignore: below an
+/// 8-bit sRGB step for the dark grass albedos the palettes hold.
+const PROXY_ALBEDO_EPSILON: f32 = 1.0 / 1024.0;
+
+/// Whether `current` and `target` differ by more than
+/// [`PROXY_ALBEDO_EPSILON`] in any linear channel.
+fn albedo_differs(current: Color, target: Color) -> bool {
+    let a = current.to_linear();
+    let b = target.to_linear();
+    (a.red - b.red).abs() > PROXY_ALBEDO_EPSILON
+        || (a.green - b.green).abs() > PROXY_ALBEDO_EPSILON
+        || (a.blue - b.blue).abs() > PROXY_ALBEDO_EPSILON
 }
 
 /// Linear albedo of a variant's casters: the palette at `season` times the
