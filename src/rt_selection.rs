@@ -173,17 +173,30 @@ impl RtSelection {
         far_capacity: usize,
     ) -> bool {
         // Share this inexpensive gate with the async task scheduler.
-        self.last_update
-            .as_ref()
-            .is_none_or(|(old_viewer, old_near, old_far, keys)| {
-                old_viewer.distance_squared(viewer) > 0.25
-                    || *old_near != near_capacity
-                    || *old_far != far_capacity
-                    || keys.len() != placements.len()
+        self.needs_viewer_update(viewer, near_capacity, far_capacity)
+            || self.last_update.as_ref().is_some_and(|(_, _, _, keys)| {
+                keys.len() != placements.len()
                     || !keys
                         .iter()
                         .zip(placements)
                         .all(|(key, (index, p))| *key == placement_key(*index, p))
+            })
+    }
+
+    /// `needs_update` without the placement comparison, for callers that
+    /// know the placements match the last update.
+    pub(crate) fn needs_viewer_update(
+        &self,
+        viewer: Vec2,
+        near_capacity: usize,
+        far_capacity: usize,
+    ) -> bool {
+        self.last_update
+            .as_ref()
+            .is_none_or(|(old_viewer, old_near, old_far, _)| {
+                old_viewer.distance_squared(viewer) > 0.25
+                    || *old_near != near_capacity
+                    || *old_far != far_capacity
             })
     }
 
@@ -530,6 +543,9 @@ mod tests {
         s.update(&patches, Vec2::new(0.6, 0.0), 50, 50);
         assert_eq!(s.selection_center, Vec2::new(0.6, 0.0));
         patches[0].1.seed += 1;
+        assert!(s.needs_update(&patches, Vec2::new(0.6, 0.0), 50, 50));
+        assert!(!s.needs_viewer_update(Vec2::new(0.6, 0.0), 50, 50));
+        assert!(s.needs_viewer_update(Vec2::new(0.6, 0.0), 51, 50));
         s.update(&patches, Vec2::new(0.7, 0.0), 50, 50);
         assert_eq!(s.selection_center, Vec2::new(0.7, 0.0));
     }

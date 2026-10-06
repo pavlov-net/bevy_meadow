@@ -49,6 +49,7 @@ use bevy::render::texture::GpuImage;
 use bevy::render::view::{ExtractedView, RetainedViewEntity};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderStartup, RenderSystems};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::material::{MeadowMaterial, VariantParams};
 use crate::mesh::{
@@ -203,9 +204,10 @@ pub struct VariantGpuBuffers {
     pub cursors: Buffer,
     /// Per-variant list of live patch indices (dispatch X dim source).
     pub active_patches: Buffer,
-    /// CPU copy of the last-uploaded active-patch list — it only changes
-    /// when patches stream in/out, so steady frames skip the re-upload.
-    pub uploaded_active_patches: Vec<u32>,
+    /// Active-patch list last uploaded into `active_patches`. The list only
+    /// changes when patches stream in/out, so steady frames skip the
+    /// re-upload. Holding the `Arc` keeps its pointer from being reused.
+    pub uploaded_active_patches: Option<Arc<Vec<u32>>>,
     /// Mesh-shader path task work list (`MeadowTaskSlices`: a count
     /// header then `(patch_index, slice_base)` entries): one entry per
     /// 128-blade slice of each active patch, so the mesh path's folded
@@ -218,10 +220,10 @@ pub struct VariantGpuBuffers {
     pub num_task_slices: u32,
     /// Allocated capacity of `task_slices` (entries). Tracks resizes.
     pub task_slice_capacity: u32,
-    /// CPU copy of the last-uploaded work list — the list only changes
-    /// when patches stream in/out, so steady frames skip the (up to
-    /// ~1 MB) re-upload.
-    pub uploaded_task_slices: Vec<[u32; 2]>,
+    /// Work list last uploaded into `task_slices`. The list only changes
+    /// when patches stream in/out, so steady frames skip the (up to several
+    /// MB) re-upload.
+    pub uploaded_task_slices: Option<Arc<Vec<[u32; 2]>>>,
     /// Per-variant `MeadowViewCullData` (frusta + per-view base/cap).
     /// Storage (not uniform) to match the compute shader's
     /// `var<storage, read> view_cull` at group-0 binding 4.
@@ -253,16 +255,28 @@ pub struct MeadowGpuBuffers {
     pub by_variant: HashMap<MeadowVariantId, VariantGpuBuffers>,
 }
 
+/// One variant's live `(patch_index, placement)` pairs. The extract cache
+/// replaces the `Arc` only when the contents change, so pointer identity
+/// implies equal contents.
+type LivePlacements = Arc<Vec<(u32, crate::placement::PatchPlacement)>>;
+
+fn same_placements(a: &LivePlacements, b: &LivePlacements) -> bool {
+    Arc::ptr_eq(a, b) || a == b
+}
+
 // Selection runs off-thread: dense patches must not stall rendering while
 // the camera moves. Publish only complete mappings for the current patches.
 #[derive(Default)]
 struct RtSelectionJob {
     state: Option<RtSelection>,
     task: Option<bevy::tasks::Task<RtSelection>>,
-    task_inputs: Vec<(u32, crate::placement::PatchPlacement)>,
-    snapshot_inputs: Vec<(u32, crate::placement::PatchPlacement)>,
-    near: std::sync::Arc<Vec<[u32; 2]>>,
-    far: std::sync::Arc<Vec<[u32; 2]>>,
+    /// Placements the in-flight task selects from or, while idle, the ones
+    /// `state` matches. While they are the live list, only viewer motion
+    /// can make the selection stale.
+    inputs: LivePlacements,
+    snapshot_inputs: LivePlacements,
+    near: Arc<Vec<[u32; 2]>>,
+    far: Arc<Vec<[u32; 2]>>,
     near_generation: u64,
     far_generation: u64,
     transition: [f32; 2],
@@ -275,12 +289,7 @@ struct RtSelectionJob {
     far_selected: usize,
 }
 impl RtSelectionJob {
-    fn update(
-        &mut self,
-        live: Vec<(u32, crate::placement::PatchPlacement)>,
-        viewer: Vec2,
-        diagnostics: MeadowRtDiagnostics,
-    ) {
+    fn update(&mut self, live: &LivePlacements, viewer: Vec2, diagnostics: MeadowRtDiagnostics) {
         // The radius shapes the selection only in exact-only mode.
         let exact_radius = diagnostics.exact_only.then_some(diagnostics.exact_radius_m);
         if self.exact_radius != exact_radius {
@@ -289,14 +298,14 @@ impl RtSelectionJob {
                 exact_radius,
                 ..Default::default()
             };
-            self.near = std::sync::Arc::new(vec![RT_VACANT_SLOT; RT_NEAR_MAX_BLADES as usize]);
-            self.far = std::sync::Arc::new(vec![RT_VACANT_SLOT; RT_FAR_MAX_BLADES as usize]);
+            self.near = Arc::new(vec![RT_VACANT_SLOT; RT_NEAR_MAX_BLADES as usize]);
+            self.far = Arc::new(vec![RT_VACANT_SLOT; RT_FAR_MAX_BLADES as usize]);
             self.near_generation = next_rt_snapshot_generation();
             self.far_generation = next_rt_snapshot_generation();
         }
         // A streamed-out or replaced patch must disappear immediately even
         // while the worker is preparing the next mapping.
-        if live != self.snapshot_inputs {
+        if !self.snapshot_inputs.is_empty() && !same_placements(live, &self.snapshot_inputs) {
             let current: HashMap<_, _> = live.iter().copied().collect();
             let invalid: bevy::platform::collections::HashSet<_> = self
                 .snapshot_inputs
@@ -309,7 +318,7 @@ impl RtSelectionJob {
                     (&mut self.near, &mut self.near_generation),
                     (&mut self.far, &mut self.far_generation),
                 ] {
-                    let slots = std::sync::Arc::make_mut(slots);
+                    let slots = Arc::make_mut(slots);
                     let mut changed = false;
                     for slot in slots {
                         if invalid.contains(&slot[0]) {
@@ -323,21 +332,21 @@ impl RtSelectionJob {
                 }
                 self.near_selected = occupied_rt_slots(&self.near);
                 self.far_selected = occupied_rt_slots(&self.far);
-                self.snapshot_inputs.retain(|(i, _)| !invalid.contains(i));
+                Arc::make_mut(&mut self.snapshot_inputs).retain(|(i, _)| !invalid.contains(i));
             }
         }
         if let Some(task) = self.task.as_mut() {
             if let Some(state) = bevy::tasks::block_on(bevy::tasks::poll_once(task)) {
-                if self.task_inputs == live {
+                if same_placements(&self.inputs, live) {
                     // New snapshots get distinct generations even if the worker
                     // state was recreated after a world transition or RT toggle.
-                    let inputs_changed = self.snapshot_inputs != live;
+                    let inputs_changed = !same_placements(&self.snapshot_inputs, live);
                     if self.near.as_ref() != &state.near_slots || inputs_changed {
-                        self.near = std::sync::Arc::new(state.near_slots.clone());
+                        self.near = Arc::new(state.near_slots.clone());
                         self.near_generation = next_rt_snapshot_generation();
                     }
                     if self.far.as_ref() != &state.far_slots || inputs_changed {
-                        self.far = std::sync::Arc::new(state.far_slots.clone());
+                        self.far = Arc::new(state.far_slots.clone());
                         self.far_generation = next_rt_snapshot_generation();
                     }
                     self.transition = state.near_transition;
@@ -346,7 +355,7 @@ impl RtSelectionJob {
                     self.far_selected = occupied_rt_slots(&state.far_slots);
                     self.candidate_count = state.candidate_count;
                     self.coverage_radius = state.coverage_radius;
-                    self.snapshot_inputs = live.clone();
+                    self.snapshot_inputs = Arc::clone(live);
                 }
                 self.state = Some(state);
                 self.task = None;
@@ -354,24 +363,24 @@ impl RtSelectionJob {
         }
         if self.task.is_none() {
             let state = self.state.get_or_insert_with(Default::default);
-            if state.needs_update(
-                &live,
-                viewer,
-                RT_NEAR_MAX_BLADES as usize,
-                RT_FAR_MAX_BLADES as usize,
-            ) {
+            let (near_capacity, far_capacity) =
+                (RT_NEAR_MAX_BLADES as usize, RT_FAR_MAX_BLADES as usize);
+            let stale = if Arc::ptr_eq(&self.inputs, live) {
+                state.needs_viewer_update(viewer, near_capacity, far_capacity)
+            } else {
+                state.needs_update(live, viewer, near_capacity, far_capacity)
+            };
+            if stale {
                 let mut state = self.state.take().unwrap();
-                self.task_inputs = live.clone();
+                self.inputs = Arc::clone(live);
+                let live = Arc::clone(live);
                 self.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-                    state.update_mode(
-                        &live,
-                        viewer,
-                        RT_NEAR_MAX_BLADES as usize,
-                        RT_FAR_MAX_BLADES as usize,
-                        exact_radius,
-                    );
+                    state.update_mode(&live, viewer, near_capacity, far_capacity, exact_radius);
                     state
                 }));
+            } else {
+                // The selection's placement keys match `live`.
+                self.inputs = Arc::clone(live);
             }
         }
     }
@@ -382,6 +391,95 @@ fn occupied_rt_slots(slots: &[[u32; 2]]) -> usize {
 fn next_rt_snapshot_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+/// Swap in `next` only when the contents differ, so consumers can treat an
+/// unchanged `Arc` pointer as unchanged contents.
+fn replace_if_changed<T: PartialEq>(list: &mut Arc<Vec<T>>, next: Vec<T>) {
+    if **list != next {
+        *list = Arc::new(next);
+    }
+}
+
+/// One variant's lists derived from its live `MeadowPatch` entities, shared
+/// with the render world. Each `Arc` is replaced only when its contents
+/// change (see `replace_if_changed`).
+#[derive(Default)]
+struct VariantPatchLists {
+    active_patches: Arc<Vec<u32>>,
+    task_slices: Arc<Vec<[u32; 2]>>,
+    /// `(patch_index, placement)` per active patch, for RT selection.
+    rt_live: LivePlacements,
+}
+
+/// Patch-derived lists for every registered variant. They depend only on
+/// the `MeadowPatch` set, the registry (placements, membership) and the
+/// task-list gate, so `extract_meadow_variants` rebuilds them only when one
+/// of those changes.
+#[derive(Default)]
+struct MeadowPatchLists {
+    by_variant: HashMap<MeadowVariantId, VariantPatchLists>,
+    /// Task-list gate of the last rebuild, `None` before the first.
+    task_slices_built: Option<bool>,
+}
+impl MeadowPatchLists {
+    fn rebuild<'a>(
+        &mut self,
+        registry: &MeadowVariantRegistry,
+        patches: impl Iterator<Item = &'a MeadowPatch>,
+        build_task_slices: bool,
+    ) {
+        // `(patch_index, blade_count)` per non-empty patch, by variant.
+        let mut members: HashMap<MeadowVariantId, Vec<(u32, u32)>> = HashMap::default();
+        for patch in patches {
+            if patch.blade_count > 0 {
+                members
+                    .entry(patch.variant)
+                    .or_default()
+                    .push((patch.patch_index, patch.blade_count));
+            }
+        }
+        self.by_variant.retain(|id, _| registry.get(*id).is_some());
+        for (id, entry) in registry.iter() {
+            let members = members.remove(id).unwrap_or_default();
+            let lists = self.by_variant.entry(*id).or_default();
+            replace_if_changed(
+                &mut lists.active_patches,
+                members.iter().map(|&(index, _)| index).collect(),
+            );
+            // Mesh-path task work list: exact 128-blade slices per patch
+            // (see `VariantGpuBuffers::task_slices`).
+            let mut task_slices = Vec::new();
+            if build_task_slices {
+                task_slices.reserve_exact(
+                    members
+                        .iter()
+                        .map(|&(_, blades)| blades.div_ceil(MESH_TASK_BLADES) as usize)
+                        .sum(),
+                );
+                for &(index, blades) in &members {
+                    task_slices.extend(
+                        (0..blades)
+                            .step_by(MESH_TASK_BLADES as usize)
+                            .map(|slice_base| [index, slice_base]),
+                    );
+                }
+            }
+            replace_if_changed(&mut lists.task_slices, task_slices);
+            replace_if_changed(
+                &mut lists.rt_live,
+                members
+                    .iter()
+                    .filter_map(|&(index, _)| {
+                        entry
+                            .placements
+                            .get(index as usize)
+                            .copied()
+                            .map(|p| (index, p))
+                    })
+                    .collect(),
+            );
+        }
+    }
 }
 
 /// Per-variant extracted data the prepare/compute steps need.
@@ -396,10 +494,12 @@ pub struct ExtractedVariant {
     pub trunk_slots: AssetId<bevy::render::storage::ShaderBuffer>,
     pub heightfield: AssetId<Image>,
     pub variant_params: VariantParams,
-    pub active_patches: Vec<u32>,
+    /// Replaced only when its contents change.
+    pub active_patches: Arc<Vec<u32>>,
     /// Mesh-path task work list: `(patch_index, slice_base)` per
-    /// 128-blade slice of each active patch.
-    pub task_slices: Vec<[u32; 2]>,
+    /// 128-blade slice of each active patch. Replaced only when its
+    /// contents change.
+    pub task_slices: Arc<Vec<[u32; 2]>>,
     /// LOD-weighted estimate of main-view NEAR-band (blade) survivors —
     /// bounds the main near region. Sized off what renders, not the active
     /// set, let alone the full placement list (tens of millions of blades).
@@ -411,8 +511,8 @@ pub struct ExtractedVariant {
     /// within `SHADOW_MAX_DIST` of the viewer cast) — bounds each cascade
     /// region.
     pub est_shadow_records: u32,
-    pub rt_near_slots: std::sync::Arc<Vec<[u32; 2]>>,
-    pub rt_far_slots: std::sync::Arc<Vec<[u32; 2]>>,
+    pub rt_near_slots: Arc<Vec<[u32; 2]>>,
+    pub rt_far_slots: Arc<Vec<[u32; 2]>>,
     pub rt_near_generation: u64,
     pub rt_far_generation: u64,
     pub rt_transition: [f32; 2],
@@ -591,34 +691,26 @@ fn init_meadow_draw_bgl(mut commands: Commands) {
 
 // ---------- ExtractSchedule ----------
 
-/// One variant's LOD/shadow gate parameters, snapshotted from the registry
-/// for the survivor estimates in `extract_meadow_variants`. `Default`
-/// mirrors `MeadowLodCurve`'s defaults (for patches whose variant is
-/// missing from the registry).
-#[derive(Clone, Copy)]
-struct LodGate {
+/// One variant's LOD/shadow gate parameters plus the survivor estimates
+/// `extract_meadow_variants` accumulates against them each frame.
+struct VariantEstimate {
+    id: MeadowVariantId,
     full: f32,
     tuft_start: f32,
     tuft_density_near: f32,
-}
-
-impl Default for LodGate {
-    fn default() -> Self {
-        Self {
-            full: 40.0,
-            tuft_start: 55.0,
-            tuft_density_near: 0.12,
-        }
-    }
+    main_near: f32,
+    main_far: f32,
+    shadow: f32,
 }
 
 /// Extract per-variant data: material handle + `variant_params` from
 /// the registry, the live patch-index list from `MeadowPatch` entities,
-/// and the total blade sum (over all placements) for buffer sizing.
+/// and viewer-dependent survivor estimates for buffer sizing.
 fn extract_meadow_variants(
     registry: Extract<Option<Res<MeadowVariantRegistry>>>,
     materials: Extract<Res<Assets<MeadowMaterial>>>,
-    patches: Extract<Query<&MeadowPatch>>,
+    patches: Extract<Query<Ref<MeadowPatch>>>,
+    mut removed_patches: Extract<RemovedComponents<MeadowPatch>>,
     viewer: Extract<Option<Res<MeadowViewer>>>,
     rt_config: Extract<Option<Res<MeadowRaytracingConfig>>>,
     diagnostics: Extract<Res<MeadowRtDiagnostics>>,
@@ -629,7 +721,10 @@ fn extract_meadow_variants(
     #[cfg(feature = "mesh-shaders")] mesh_path: Res<MeadowMeshPathActive>,
     mut out: ResMut<MeadowExtractedVariants>,
     mut selections: Local<HashMap<MeadowVariantId, RtSelectionJob>>,
+    mut lists: Local<MeadowPatchLists>,
 ) {
+    let patches_removed = !removed_patches.is_empty();
+    removed_patches.clear();
     out.by_variant.clear();
     let mut stats = Vec::new();
     let diagnostics = MeadowRtDiagnostics {
@@ -640,6 +735,7 @@ fn extract_meadow_variants(
             4.0
         },
     };
+    let registry_changed = (*registry).as_ref().is_some_and(DetectChanges::is_changed);
     let Some(registry) = registry.as_deref() else {
         return;
     };
@@ -658,99 +754,90 @@ fn extract_meadow_variants(
     // buffer-capacity estimate by the fraction of each patch's blades that
     // actually survive the LOD gate at the viewer distance — instead of
     // sizing for every active blade (the LOD culls most far ones).
-    let lod_params: HashMap<MeadowVariantId, LodGate> = registry
+    let mut estimates: Vec<VariantEstimate> = registry
         .iter()
-        .map(|(id, e)| {
-            (
-                *id,
-                LodGate {
-                    full: e.variant.lod.full_distance,
-                    tuft_start: e.variant.lod.tuft_start,
-                    tuft_density_near: e.variant.lod.tuft_density_near,
-                },
-            )
+        .map(|(id, e)| VariantEstimate {
+            id: *id,
+            full: e.variant.lod.full_distance,
+            tuft_start: e.variant.lod.tuft_start,
+            tuft_density_near: e.variant.lod.tuft_density_near,
+            main_near: 0.0,
+            main_far: 0.0,
+            shadow: 0.0,
         })
         .collect();
 
     // Per-variant active footprint from live entities (streaming correctness
     // — only loaded-chunk patches have entities). We accumulate SURVIVOR
-    // ESTIMATES, not raw blade counts: `main_est` weights each patch's blades
-    // by its LOD survival fraction at the viewer distance; `shadow_est` uses
-    // the tighter shadow view distance (only near grass casts). Sizing the
-    // buffers off what actually renders — not the whole active set, let alone
-    // the full placement list — is what keeps the storage binding far under
-    // the 2 GB limit. The kernel's `slot >= cap` guard covers any under-est.
-    #[derive(Default)]
-    struct ActiveAcc {
-        indices: Vec<u32>,
-        task_slices: Vec<[u32; 2]>,
-        main_near: f32,
-        main_far: f32,
-        shadow_est: f32,
-    }
-    let mut active: HashMap<MeadowVariantId, ActiveAcc> = HashMap::default();
+    // ESTIMATES, not raw blade counts: `main_near`/`main_far` weight each
+    // patch's blades by its LOD survival fraction at the viewer distance;
+    // `shadow` uses the tighter shadow view distance (only near grass casts).
+    // Sizing the buffers off what actually renders — not the whole active
+    // set, let alone the full placement list — is what keeps the storage
+    // binding far under the 2 GB limit. The kernel's `slot >= cap` guard
+    // covers any under-est. The same pass detects patch-set changes.
+    let mut patches_changed = patches_removed;
     for patch in patches.iter() {
+        patches_changed |= patch.is_changed();
         if patch.blade_count == 0 {
             continue;
         }
-        let gate = lod_params.get(&patch.variant).copied().unwrap_or_default();
+        // Variants are few; a linear scan beats hashing per patch.
+        let Some(est) = estimates.iter_mut().find(|e| e.id == patch.variant) else {
+            continue;
+        };
         let dist = patch.centre.distance(viewer_xz);
         let n = patch.blade_count as f32;
-
-        let acc = active.entry(patch.variant).or_default();
-        acc.indices.push(patch.patch_index);
-        // Mesh-path task work list: exact 128-blade slices for this
-        // patch (see `VariantGpuBuffers::task_slices`).
-        if build_task_slices {
-            let mut slice_base = 0u32;
-            while slice_base < patch.blade_count {
-                acc.task_slices.push([patch.patch_index, slice_base]);
-                slice_base += MESH_TASK_BLADES;
-            }
-        }
         // Band is per-patch (centre distance vs `tuft_start`), matching the
         // kernel. Band 0 (near blade) inside `tuft_start`, tapering to none
         // by then; band 1 (far tuft) beyond, sparse — bounded by
         // `tuft_density_near`. Frustum culling only reduces further, so both
         // are safe upper bounds.
-        if dist < gate.tuft_start {
-            let near_survive = 1.0
-                - ((dist - gate.full) / (gate.tuft_start - gate.full).max(1e-3)).clamp(0.0, 1.0);
-            acc.main_near += n * near_survive;
+        if dist < est.tuft_start {
+            let near_survive =
+                1.0 - ((dist - est.full) / (est.tuft_start - est.full).max(1e-3)).clamp(0.0, 1.0);
+            est.main_near += n * near_survive;
         } else {
-            acc.main_far += n * gate.tuft_density_near;
+            est.main_far += n * est.tuft_density_near;
         }
         if dist <= SHADOW_MAX_DIST + patch.radius {
             // Shadow casters are band 0 (SHADOW_MAX_DIST < tuft_start). Sized
             // for the full 0..SHADOW_MAX_DIST estimate per shadow slot; the
             // per-cascade radial clip thins each further, so this over-
             // estimates (safe).
-            let shadow_survive = 1.0
-                - ((dist - gate.full) / (SHADOW_MAX_DIST - gate.full).max(1e-3)).clamp(0.0, 1.0);
-            acc.shadow_est += n * shadow_survive;
+            let shadow_survive =
+                1.0 - ((dist - est.full) / (SHADOW_MAX_DIST - est.full).max(1e-3)).clamp(0.0, 1.0);
+            est.shadow += n * shadow_survive;
         }
     }
 
-    selections.retain(|id, _| rt_enabled && active.contains_key(id));
-    for (id, entry) in registry.iter() {
+    if registry_changed || patches_changed || lists.task_slices_built != Some(build_task_slices) {
+        lists.rebuild(
+            registry,
+            patches.iter().map(Ref::into_inner),
+            build_task_slices,
+        );
+        lists.task_slices_built = Some(build_task_slices);
+    }
+
+    selections.retain(|id, _| {
+        rt_enabled
+            && lists
+                .by_variant
+                .get(id)
+                .is_some_and(|l| !l.active_patches.is_empty())
+    });
+    // `estimates` was built from this same registry iteration order.
+    for ((id, entry), est) in registry.iter().zip(&estimates) {
         let Some(material) = materials.get(&entry.material) else {
             continue;
         };
-        let acc = active.remove(id).unwrap_or_default();
+        let Some(variant_lists) = lists.by_variant.get(id) else {
+            continue;
+        };
         let selection = selections.entry(*id).or_default();
-        if rt_enabled && !acc.indices.is_empty() {
-            let live = acc
-                .indices
-                .iter()
-                .filter_map(|&index| {
-                    entry
-                        .placements
-                        .get(index as usize)
-                        .copied()
-                        .map(|p| (index, p))
-                })
-                .collect::<Vec<_>>();
-            selection.update(live, viewer_xz, diagnostics);
+        if rt_enabled && !variant_lists.active_patches.is_empty() {
+            selection.update(&variant_lists.rt_live, viewer_xz, diagnostics);
             stats.push(MeadowRtVariantStats {
                 variant: *id,
                 exact_only: diagnostics.exact_only,
@@ -776,11 +863,11 @@ fn extract_meadow_variants(
                 trunk_slots: material.extension.trunk_slots.id(),
                 heightfield: material.extension.heightfield.id(),
                 variant_params: material.extension.variant_params,
-                active_patches: acc.indices,
-                task_slices: acc.task_slices,
-                est_main_near: acc.main_near.ceil() as u32,
-                est_main_far: acc.main_far.ceil() as u32,
-                est_shadow_records: acc.shadow_est.ceil() as u32,
+                active_patches: Arc::clone(&variant_lists.active_patches),
+                task_slices: Arc::clone(&variant_lists.task_slices),
+                est_main_near: est.main_near.ceil() as u32,
+                est_main_far: est.main_far.ceil() as u32,
+                est_shadow_records: est.shadow.ceil() as u32,
                 rt_near_slots: if rt_enabled {
                     selection.near.clone()
                 } else {
@@ -1182,7 +1269,7 @@ pub(crate) fn prepare_meadow_gpu_buffers(
                         u64::from(active_len) * 4,
                         storage,
                     ),
-                    uploaded_active_patches: Vec::new(),
+                    uploaded_active_patches: None,
                     task_slices: make_buf(
                         "meadow_task_slices",
                         task_slices_size(slice_len),
@@ -1190,7 +1277,7 @@ pub(crate) fn prepare_meadow_gpu_buffers(
                     ),
                     num_task_slices: 0,
                     task_slice_capacity: slice_len,
-                    uploaded_task_slices: Vec::new(),
+                    uploaded_task_slices: None,
                     view_cull: StorageBuffer::default(),
                     num_active: 0,
                     cap_main_near,
@@ -1215,7 +1302,7 @@ pub(crate) fn prepare_meadow_gpu_buffers(
                 BufferUsages::STORAGE | BufferUsages::COPY_DST,
             );
             vb.active_capacity = active_len;
-            vb.uploaded_active_patches.clear();
+            vb.uploaded_active_patches = None;
         }
         if slice_len > vb.task_slice_capacity {
             vb.task_slices = make_buf(
@@ -1224,7 +1311,7 @@ pub(crate) fn prepare_meadow_gpu_buffers(
                 BufferUsages::STORAGE | BufferUsages::COPY_DST,
             );
             vb.task_slice_capacity = slice_len;
-            vb.uploaded_task_slices.clear();
+            vb.uploaded_task_slices = None;
         }
         vb.base_offsets = base_offsets;
         vb.num_active = ev.active_patches.len() as u32;
@@ -1252,19 +1339,29 @@ pub(crate) fn prepare_meadow_gpu_buffers(
 
         // Upload the active patch indices — only when the list changed
         // (patch streaming); steady frames upload nothing.
-        if !ev.active_patches.is_empty() && vb.uploaded_active_patches != ev.active_patches {
+        if !ev.active_patches.is_empty()
+            && !vb
+                .uploaded_active_patches
+                .as_ref()
+                .is_some_and(|uploaded| Arc::ptr_eq(uploaded, &ev.active_patches))
+        {
             render_queue.write_buffer(
                 &vb.active_patches,
                 0,
-                bytemuck::cast_slice(&ev.active_patches),
+                bytemuck::cast_slice(ev.active_patches.as_slice()),
             );
-            vb.uploaded_active_patches.clone_from(&ev.active_patches);
+            vb.uploaded_active_patches = Some(Arc::clone(&ev.active_patches));
         }
         // Upload the mesh-path task work list — header (count) + entries,
         // `MeadowTaskSlices` in the WGSL — only when the device can run
         // the mesh path AND the list changed (patch streaming), so steady
         // frames upload nothing.
-        if mesh_path.available && vb.uploaded_task_slices != ev.task_slices {
+        if mesh_path.available
+            && !vb
+                .uploaded_task_slices
+                .as_ref()
+                .is_some_and(|uploaded| Arc::ptr_eq(uploaded, &ev.task_slices))
+        {
             render_queue.write_buffer(
                 &vb.task_slices,
                 0,
@@ -1274,10 +1371,10 @@ pub(crate) fn prepare_meadow_gpu_buffers(
                 render_queue.write_buffer(
                     &vb.task_slices,
                     8,
-                    bytemuck::cast_slice(&ev.task_slices),
+                    bytemuck::cast_slice(ev.task_slices.as_slice()),
                 );
             }
-            vb.uploaded_task_slices.clone_from(&ev.task_slices);
+            vb.uploaded_task_slices = Some(Arc::clone(&ev.task_slices));
         }
 
         // Static indirect fields per (view, band): each band's own
@@ -1532,7 +1629,7 @@ pub struct MeadowRtVariantStats {
 
 /// Shared snapshot published by extraction, readable from main-world UI.
 #[derive(Resource, Clone, Default)]
-pub struct MeadowRtTelemetry(pub std::sync::Arc<std::sync::Mutex<Vec<MeadowRtVariantStats>>>);
+pub struct MeadowRtTelemetry(pub Arc<std::sync::Mutex<Vec<MeadowRtVariantStats>>>);
 
 /// One band's RT geometry (solari's 48-byte vertex layout + u32 indices),
 /// sized to its fixed blade capacity. Stable handles (never realloc): the
@@ -2162,9 +2259,14 @@ mod tests {
     use super::*;
 
     /// Run `job` until its worker has published and no further task is due.
-    fn settle(job: &mut RtSelectionJob, diagnostics: MeadowRtDiagnostics) {
+    fn settle(
+        job: &mut RtSelectionJob,
+        live: &LivePlacements,
+        viewer: Vec2,
+        diagnostics: MeadowRtDiagnostics,
+    ) {
         for _ in 0..10_000 {
-            job.update(Vec::new(), Vec2::ZERO, diagnostics);
+            job.update(live, viewer, diagnostics);
             if job.task.is_none() {
                 return;
             }
@@ -2182,21 +2284,72 @@ mod tests {
             exact_only,
             exact_radius_m,
         };
+        let live = LivePlacements::default();
         let mut job = RtSelectionJob::default();
-        settle(&mut job, diagnostics(false, 4.0));
+        settle(&mut job, &live, Vec2::ZERO, diagnostics(false, 4.0));
 
         let published = (job.near_generation, job.far_generation);
-        job.update(Vec::new(), Vec2::ZERO, diagnostics(false, 6.0));
+        job.update(&live, Vec2::ZERO, diagnostics(false, 6.0));
         assert_eq!((job.near_generation, job.far_generation), published);
 
-        job.update(Vec::new(), Vec2::ZERO, diagnostics(true, 6.0));
+        job.update(&live, Vec2::ZERO, diagnostics(true, 6.0));
         assert_ne!(job.near_generation, published.0);
         assert_ne!(job.far_generation, published.1);
-        settle(&mut job, diagnostics(true, 6.0));
+        settle(&mut job, &live, Vec2::ZERO, diagnostics(true, 6.0));
 
         let published = (job.near_generation, job.far_generation);
-        job.update(Vec::new(), Vec2::ZERO, diagnostics(true, 7.0));
+        job.update(&live, Vec2::ZERO, diagnostics(true, 7.0));
         assert_ne!(job.near_generation, published.0);
         assert_ne!(job.far_generation, published.1);
+    }
+
+    /// An unchanged live list reselects only on viewer motion, and a patch
+    /// dropped from it leaves the published slots the same frame.
+    #[test]
+    fn unchanged_live_list_reselects_on_motion_and_purges_removed_patches() {
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let diagnostics = MeadowRtDiagnostics {
+            exact_only: false,
+            exact_radius_m: 4.0,
+        };
+        let placement = |x, seed| crate::placement::PatchPlacement {
+            centre: Vec2::new(x, 0.0),
+            radius: 2.0,
+            blade_count: 100,
+            seed,
+            edge_noise_amp: 0.2,
+            canopy_density_at_centre: 0.0,
+        };
+        let both: LivePlacements = Arc::new(vec![(0, placement(2.0, 12)), (1, placement(6.0, 13))]);
+        let mut job = RtSelectionJob::default();
+        settle(&mut job, &both, Vec2::ZERO, diagnostics);
+        assert!(job.near.iter().any(|slot| slot[0] == 1));
+
+        job.update(&both, Vec2::new(0.4, 0.0), diagnostics);
+        assert!(job.task.is_none());
+        job.update(&both, Vec2::new(1.0, 0.0), diagnostics);
+        assert!(job.task.is_some());
+        settle(&mut job, &both, Vec2::new(1.0, 0.0), diagnostics);
+        assert_eq!(job.center, Vec2::new(1.0, 0.0));
+
+        let one: LivePlacements = Arc::new(vec![(0, placement(2.0, 12))]);
+        let generation = job.near_generation;
+        job.update(&one, Vec2::new(1.0, 0.0), diagnostics);
+        assert!(job.near.iter().all(|slot| slot[0] != 1));
+        assert!(job.far.iter().all(|slot| slot[0] != 1));
+        assert_ne!(job.near_generation, generation);
+    }
+
+    #[test]
+    fn replace_if_changed_keeps_pointer_for_equal_contents() {
+        let mut list = Arc::<Vec<u32>>::default();
+        let empty = Arc::clone(&list);
+        replace_if_changed(&mut list, Vec::new());
+        assert!(Arc::ptr_eq(&list, &empty));
+        replace_if_changed(&mut list, vec![1, 2]);
+        assert!(!Arc::ptr_eq(&list, &empty));
+        let filled = Arc::clone(&list);
+        replace_if_changed(&mut list, vec![1, 2]);
+        assert!(Arc::ptr_eq(&list, &filled));
     }
 }
