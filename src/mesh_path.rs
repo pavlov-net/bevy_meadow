@@ -2058,37 +2058,65 @@ mod tests {
         use bevy::math::Vec3;
         // CPU reference for meadow_shared.wesl::meadow_shading_normal.
         // Exercise hillside angles on both sides of camera elevation,
-        // grazing views, and degenerate camera/blade coincidence.
-        fn normal(direction: Vec3) -> Vec3 {
+        // grazing views, blade normals on either side of the view, and
+        // degenerate camera/blade coincidence.
+        fn normal(blade: Vec3, weight: f32, direction: Vec3) -> Vec3 {
             if direction.length_squared() < 1e-12 {
                 return Vec3::Y;
             }
             let v = direction.normalize();
-            if v.y >= 0.1 {
-                return Vec3::Y;
+            let mut n = Vec3::Y;
+            if weight > 0.0 && blade.length_squared() > 1e-12 {
+                let mut facing = blade.normalize();
+                if facing.dot(v) < 0.0 {
+                    facing = -facing;
+                }
+                let blended = Vec3::Y.lerp(facing, weight.min(1.0));
+                if blended.length_squared() > 1e-6 {
+                    n = blended.normalize();
+                }
             }
-            let tangent = Vec3::Y - v * v.y;
+            let n_dot_v = n.dot(v);
+            if n_dot_v >= 0.1 {
+                return n;
+            }
+            let tangent = n - v * n_dot_v;
             if tangent.length_squared() < 1e-12 {
                 return v;
             }
             tangent.normalize() * (1.0_f32 - 0.1 * 0.1).sqrt() + v * 0.1
         }
-        assert_eq!(normal(Vec3::ZERO), Vec3::Y);
+        assert_eq!(normal(Vec3::Z, 1.0, Vec3::ZERO), Vec3::Y);
+        let blades = [
+            Vec3::ZERO,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::new(0.3, -0.2, 0.9),
+            Vec3::new(-0.6, 0.5, -0.1),
+        ];
         for elevation in -100..=100 {
             for azimuth in 0..16 {
                 let angle = azimuth as f32 * std::f32::consts::TAU / 16.0;
                 let v = Vec3::new(angle.cos(), elevation as f32 / 10.0, angle.sin()).normalize();
-                let n = normal(v);
-                assert!(n.is_finite());
-                assert!((n.length() - 1.0).abs() < 1e-5);
-                assert!(n.dot(v) >= 0.0999, "view {v:?}, normal {n:?}");
-                if v.y >= 0.1 {
-                    assert_eq!(n, Vec3::Y);
+                for blade in blades {
+                    for weight in [0.0, 0.3, 0.5, 1.0] {
+                        let n = normal(blade, weight, v);
+                        assert!(n.is_finite());
+                        assert!((n.length() - 1.0).abs() < 1e-5);
+                        assert!(
+                            n.dot(v) >= 0.0999,
+                            "view {v:?}, blade {blade:?}, normal {n:?}"
+                        );
+                        if weight == 0.0 && v.y >= 0.1 {
+                            assert_eq!(n, Vec3::Y);
+                        }
+                    }
                 }
             }
         }
-        assert_eq!(normal(Vec3::Y), Vec3::Y);
-        assert_eq!(normal(Vec3::NEG_Y), Vec3::NEG_Y);
+        assert_eq!(normal(Vec3::X, 0.0, Vec3::Y), Vec3::Y);
+        assert_eq!(normal(Vec3::X, 0.0, Vec3::NEG_Y), Vec3::NEG_Y);
     }
 
     /// Compile the task/mesh module through bevy's shader cache.

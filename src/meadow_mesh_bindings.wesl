@@ -90,10 +90,14 @@ struct MeadowVertexOut {
     // Previous-frame world position (prev wind time; static root), for
     // per-fragment motion vectors written to the meadow-owned MV target.
     @location(1) prev_world_position: vec4<f32>,
-    // Height up the blade in [0, 1] (shade/tip ramp).
+    // Length fraction up the blade (height fraction up a tuft arm) in
+    // [0, 1] (shade/tip ramp).
     @location(2) y_norm: f32,
     // Linear blade albedo (`meadow_blade_albedo`), constant per blade.
     @location(3) @interpolate(flat) albedo: vec3<f32>,
+    // xyz = the blade's front-face normal (`meadow_blade_world_normal`),
+    // w = its weight in the shading normal (0 for tufts and far blades).
+    @location(4) blade_normal: vec4<f32>,
 }
 
 // Jitter-free current/previous NDC delta — same UV-delta convention as

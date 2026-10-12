@@ -36,7 +36,8 @@ fn meadow_blade_pbr_input(in: MeadowVertexOut, is_front: bool) -> PbrInput {
     pbr_input.world_position = in.world_position;
     pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr_input.V = calculate_view(in.world_position, pbr_input.is_orthographic);
-    pbr_input.world_normal = meadow_shading_normal(pbr_input.V);
+    pbr_input.world_normal =
+        meadow_shading_normal(in.blade_normal.xyz, in.blade_normal.w, pbr_input.V);
     pbr_input.N = pbr_input.world_normal;
     // No real MeshUniform row exists for mesh-emitted geometry; force the
     // shadow-receiver bit the same way meadow.wesl does.

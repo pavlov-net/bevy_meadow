@@ -77,22 +77,167 @@ struct CompactedBladeRecord {
     albedo: u32,                // @44 -> 48  `meadow_pack_albedo`; 0 in shadow views
 }
 
-// Local-blade vertex computation. `vert_idx ∈ [0, 11)`; layer = idx
-// pair (i*2, i*2+1) for i = 0..4, with idx 10 the tip. Half-width
-// tapers as `1 - y²`; forward curl quadratic in y. Pure — depends only
-// on the blade's height/width.
-fn local_blade_position(vert_idx: u32, blade: BladeAttrs) -> vec3<f32> {
+// ---------- blade template ----------
+//
+// Vertex `vert_idx ∈ [0, 11)`: layer `i = 0..4` is the pair (2i, 2i+1) at
+// length fraction `0.2 i`, left then right; idx 10 is the tip at length
+// fraction 1. The local frame is x = across the blade, y = up, z = the
+// direction the blade leans. Pure functions of the blade's height, width
+// and yaw, so every path that expands a blade (raster, mesh shader,
+// raytracing casters) builds the same surface.
+
+// Arc length of a blade over its `height`: the bend brings a typical tip
+// back to about that height. MUST equal `mesh.rs::BLADE_LENGTH_PER_HEIGHT`.
+const MEADOW_BLADE_LENGTH: f32 = 1.1;
+
+// Width scale of the base-to-tip chord triangle that conserves the
+// template's silhouette area: the ribbon's area over the chord's
+// (0.596 / 0.5) for `meadow_blade_taper` sampled at the five layers.
+const MEADOW_CHORD_WIDTH_SCALE: f32 = 1.19;
+
+// Tilt of the shading normal toward the blade edges, as the tangent of the
+// tilt angle at the edge: the blade reads as slightly folded along its
+// midrib, so its two halves catch the light differently.
+const MEADOW_BLADE_ROUNDING: f32 = 0.6;
+
+// Length fraction of a template vertex: 0 at the root, 1 at the tip.
+fn blade_length_fraction(vert_idx: u32) -> f32 {
     if (vert_idx == 10u) {
-        let y = 1.0;
-        let curl = 0.42 * y * y * blade.height;
-        return vec3<f32>(0.0, y * blade.height, curl);
+        return 1.0;
     }
-    let layer = vert_idx >> 1u;
-    let side = i32(vert_idx & 1u) * 2 - 1; // -1 or +1
-    let y = f32(layer) * 0.2;
-    let half_w = 0.5 * (1.0 - y * y) * blade.width;
-    let curl = 0.42 * y * y * blade.height;
-    return vec3<f32>(f32(side) * half_w, y * blade.height, curl);
+    return f32(vert_idx >> 1u) * 0.2;
+}
+
+// Template side of a vertex: -1 left edge, +1 right edge, 0 at the tip.
+fn blade_side(vert_idx: u32) -> f32 {
+    if (vert_idx == 10u) {
+        return 0.0;
+    }
+    return f32(i32(vert_idx & 1u) * 2 - 1);
+}
+
+// Half-width factor along the blade: near-parallel sides low down, then a
+// straight run to a sharp tip.
+fn meadow_blade_taper(t: f32) -> f32 {
+    return (1.0 - t) * (1.0 + 0.6 * t);
+}
+
+// The blade's lean as (angle from vertical at the root, further bend to
+// the tip), in radians. Drawn from the fractional digits of the yaw, a
+// hash every path carries. Most blades stand with a soft bend; about one
+// in five lies well over.
+fn meadow_blade_lean(blade: BladeAttrs) -> vec2<f32> {
+    let u_bend = fract(blade.yaw * 1.4323945);
+    let u_root = fract(blade.yaw * 4.7746483);
+    let root = 0.08 + 0.32 * u_root;
+    let u2 = u_bend * u_bend;
+    let bend = 0.3 + 0.6 * u_bend + 0.9 * u2 * u2;
+    return vec2<f32>(root, bend);
+}
+
+// Local-blade vertex position. The centreline is a constant-curvature arc
+// of length `MEADOW_BLADE_LENGTH * height` that leaves the ground at the
+// lean's root angle and turns by its bend toward the tip.
+fn local_blade_position(vert_idx: u32, blade: BladeAttrs) -> vec3<f32> {
+    let t = blade_length_fraction(vert_idx);
+    let lean = meadow_blade_lean(blade);
+    let length = MEADOW_BLADE_LENGTH * blade.height;
+    // Integral of (sin a, cos a) along the arc; the bend is at least 0.3.
+    let a = lean.x + lean.y * t;
+    let up = length * (sin(a) - sin(lean.x)) / lean.y;
+    let forward = length * (cos(lean.x) - cos(a)) / lean.y;
+    let half_w = 0.5 * meadow_blade_taper(t) * blade.width;
+    return vec3<f32>(blade_side(vert_idx) * half_w, up, forward);
+}
+
+// World-space normal of the blade's front face (the template triangles'
+// counter-clockwise side) at a vertex, tilted toward its edge by
+// `MEADOW_BLADE_ROUNDING`. `cy`/`sy` are the yaw's cosine and sine, as in
+// the vertex expansion; `wind_full` is the tip's wind displacement, a
+// shear along the length that leans the surface with it. Unnormalized, so
+// interpolation rounds it between the edges.
+fn meadow_blade_world_normal(
+    vert_idx: u32,
+    blade: BladeAttrs,
+    cy: f32,
+    sy: f32,
+    wind_full: vec2<f32>,
+) -> vec3<f32> {
+    let lean = meadow_blade_lean(blade);
+    let a = lean.x + lean.y * blade_length_fraction(vert_idx);
+    let length = MEADOW_BLADE_LENGTH * blade.height;
+    let across = vec3<f32>(cy, 0.0, -sy);
+    let along = vec3<f32>(
+        sy * length * sin(a) + wind_full.x,
+        length * cos(a),
+        cy * length * sin(a) + wind_full.y,
+    );
+    let face = normalize(cross(across, along));
+    return face + across * (blade_side(vert_idx) * MEADOW_BLADE_ROUNDING);
+}
+
+// Weight of the blade's own normal in its shading normal at view depth
+// `depth`: 1 near, falling to 0 (the upright normal) where blades shrink
+// toward a pixel and per-blade normals would shimmer.
+const MEADOW_BLADE_NORMAL_FADE: vec2<f32> = vec2<f32>(15.0, 45.0);
+
+fn meadow_blade_normal_weight(depth: f32) -> f32 {
+    return 1.0 - smoothstep(MEADOW_BLADE_NORMAL_FADE.x, MEADOW_BLADE_NORMAL_FADE.y, depth);
+}
+
+// Template vertex `vert_idx` of a near-band blade, or of a far-band tuft
+// (`tuft`), in the local frame; w is the shade/wind ramp `y_norm`: the
+// length fraction up a blade, the height fraction up a tuft arm.
+fn meadow_template_vertex(vert_idx: u32, tuft: bool, blade: BladeAttrs) -> vec4<f32> {
+    if (tuft) {
+        let local = tuft_local_position(vert_idx, blade);
+        return vec4<f32>(local, local.y / max(blade.height, 1e-3));
+    }
+    return vec4<f32>(local_blade_position(vert_idx, blade), blade_length_fraction(vert_idx));
+}
+
+// World position of a template vertex (`meadow_template_vertex`): the local
+// frame turned by the yaw's cosine/sine `cy`/`sy`, the tip's wind
+// displacement `wind_full` scaled by `y_norm`, and the blade collapsed
+// toward its root by `collapse_t` (0 puts every vertex at the root, so the
+// blade's triangles are degenerate).
+fn meadow_place_vertex(
+    local_vertex: vec4<f32>,
+    root_xz: vec2<f32>,
+    ground_y: f32,
+    cy: f32,
+    sy: f32,
+    wind_full: vec2<f32>,
+    collapse_t: f32,
+) -> vec3<f32> {
+    let local = local_vertex.xyz;
+    let rotated = vec2<f32>(cy * local.x + sy * local.z, -sy * local.x + cy * local.z);
+    let xz = mix(root_xz, root_xz + rotated + wind_full * local_vertex.w, collapse_t);
+    let y = mix(ground_y, ground_y + local.y, collapse_t);
+    return vec3<f32>(xz.x, y, xz.y);
+}
+
+// Shading-normal varying of a template vertex at view depth `depth`: xyz
+// the blade's own normal (`meadow_blade_world_normal`, with the tip wind
+// `wind_full` it sways by), w its weight (`meadow_blade_normal_weight`).
+// Tufts, and blades past the fade, carry weight 0 and skip the normal.
+fn meadow_blade_normal_varying(
+    vert_idx: u32,
+    tuft: bool,
+    blade: BladeAttrs,
+    cy: f32,
+    sy: f32,
+    wind_full: vec2<f32>,
+    depth: f32,
+) -> vec4<f32> {
+    var weight = 0.0;
+    if (!tuft) {
+        weight = meadow_blade_normal_weight(depth);
+    }
+    if (weight <= 0.0) {
+        return vec4<f32>(0.0, 1.0, 0.0, 0.0);
+    }
+    return vec4<f32>(meadow_blade_world_normal(vert_idx, blade, cy, sy, wind_full), weight);
 }
 
 // Local-tuft vertex computation (far LOD band). `vert_idx ∈ [0, 21)`
@@ -184,6 +329,63 @@ fn hash01_u32(v: u32) -> f32 {
 fn hash01_pair(a: u32, b: u32) -> f32 {
     let h = hash_u32(a ^ (b * 0x9E3779B9u));
     return f32(h & 0x00FFFFFFu) / f32(0x01000000u);
+}
+
+// ---------- LOD gate ----------
+
+// Largest blade count of a patch. MUST equal `mesh.rs::MAX_BLADES_PER_PATCH`.
+const MEADOW_MAX_BLADES_PER_PATCH: u32 = 262144u;
+
+// Blades of a patch that pass a survival `threshold` in [0, 1]: the gate
+// keeps the first `ceil(threshold * blade_count)` blade indices. Every
+// blade's root is drawn from a hash of its index, so a prefix is a uniform
+// spatial subset, and work launched for the prefix alone covers every
+// survivor (`compute.rs::task_slice_bound`).
+fn meadow_gate_count(threshold: f32, blade_count: u32) -> u32 {
+    return min(u32(ceil(clamp(threshold, 0.0, 1.0) * f32(blade_count))), blade_count);
+}
+
+// Grass farther than this from the player casts no shadow-map shadow, in
+// metres. MUST equal `mesh.rs::SHADOW_MAX_DIST`.
+const MEADOW_SHADOW_MAX_DIST: f32 = 50.0;
+
+// Shadow-caster LOD ramp at planar player distance `dist`: 0 within
+// `shadow_full_dist` (`VariantParams.density.z`), 1 at
+// `MEADOW_SHADOW_MAX_DIST`. Keyed on player distance like the other bands,
+// so a patch's caster count is the same in every cascade and view.
+fn meadow_shadow_ramp(dist: f32, shadow_full_dist: f32) -> f32 {
+    return clamp(
+        (dist - shadow_full_dist) / max(MEADOW_SHADOW_MAX_DIST - shadow_full_dist, 1e-3),
+        0.0,
+        1.0,
+    );
+}
+
+// Survival threshold (`meadow_gate_count`) of a patch's band in a view, at
+// the planar player distance `dist` of its centre and the view's far LOD
+// distance `lod_max`:
+// - near blades (band 0) taper 1 -> 0 across [full_distance, tuft_start];
+// - shadow casters (band 0, shadow views) thin from 1 to
+//   `shadow_far_density` over `meadow_shadow_ramp`;
+// - far tufts (band 1) ramp tuft.y -> tuft.z across [tuft_start, lod_max].
+// The CPU twin is `compute.rs::task_slice_bound`.
+fn meadow_band_threshold(
+    params: VariantParams,
+    band: u32,
+    is_shadow: bool,
+    dist: f32,
+    lod_max: f32,
+) -> f32 {
+    let tuft_start = params.tuft.x;
+    if (band == 1u) {
+        let ramp_t = clamp((dist - tuft_start) / max(lod_max - tuft_start, 1e-3), 0.0, 1.0);
+        return mix(params.tuft.y, params.tuft.z, ramp_t);
+    }
+    if (is_shadow) {
+        return mix(1.0, params.density.w, meadow_shadow_ramp(dist, params.density.z));
+    }
+    let lod_full = params.lod.x;
+    return 1.0 - clamp((dist - lod_full) / max(tuft_start - lod_full, 1e-3), 0.0, 1.0);
 }
 
 // ---------- per-blade palette variance ----------
@@ -294,22 +496,42 @@ fn meadow_blade_base_color(albedo: vec3<f32>, y_norm: f32) -> vec3<f32> {
 fn meadow_blade_emissive(albedo: vec3<f32>, y_norm: f32) -> vec3<f32> {
     return albedo * smoothstep(0.7, 1.0, y_norm) * 0.06;
 }
-// Meadow's smoothed upright normal keeps dense grass lighting coherent, but
-// a hillside can put the camera below that normal's hemisphere. Solari's
-// BRDF rejects NdotV <= 0, making those blades black at camera elevation.
-// Preserve the upright normal whenever possible and tilt it just enough
-// toward the viewer otherwise. Shared by both raster rendering paths.
-fn meadow_shading_normal(view_direction: vec3<f32>) -> vec3<f32> {
+// Grass shading normal. Near blades shade with their own normal
+// (`meadow_blade_world_normal`, interpolated), turned to the side facing
+// the viewer, so the blades of a meadow catch the light differently. With
+// `blade_weight` it blends to the upright normal, which keeps sub-pixel
+// grass lighting coherent; weight 0 is the upright normal exactly.
+//
+// A hillside can put the camera below the normal's hemisphere, and
+// Solari's BRDF rejects NdotV <= 0, making those blades black. The normal
+// is kept whenever NdotV clears a margin and tilted just enough toward the
+// viewer otherwise. Shared by both raster rendering paths.
+fn meadow_shading_normal(
+    blade_normal: vec3<f32>,
+    blade_weight: f32,
+    view_direction: vec3<f32>,
+) -> vec3<f32> {
     let up = vec3<f32>(0.0, 1.0, 0.0);
     let length_squared = dot(view_direction, view_direction);
     if length_squared < 1e-12 { return up; }
     let v = view_direction * inverseSqrt(length_squared);
-    let n_dot_v = v.y;
+    var n = up;
+    let blade_length_squared = dot(blade_normal, blade_normal);
+    if blade_weight > 0.0 && blade_length_squared > 1e-12 {
+        var facing = blade_normal * inverseSqrt(blade_length_squared);
+        if dot(facing, v) < 0.0 { facing = -facing; }
+        let blended = mix(up, facing, min(blade_weight, 1.0));
+        let blended_length_squared = dot(blended, blended);
+        if blended_length_squared > 1e-6 {
+            n = blended * inverseSqrt(blended_length_squared);
+        }
+    }
+    let n_dot_v = dot(n, v);
     let margin = 0.1;
-    if n_dot_v >= margin { return up; }
-    let tangent = up - v * n_dot_v;
+    if n_dot_v >= margin { return n; }
+    let tangent = n - v * n_dot_v;
     let tangent_length_squared = dot(tangent, tangent);
-    // Directly beneath a blade there is no unique upward tangent.
+    // A normal facing straight away from the viewer has no unique tangent.
     if tangent_length_squared < 1e-12 { return v; }
     return tangent * inverseSqrt(tangent_length_squared) * sqrt(1.0 - margin * margin)
         + v * margin;

@@ -29,14 +29,21 @@ use bevy::prelude::*;
 /// performance cap, not a correctness invariant: the GPU path indexes
 /// `blades[]` by per-view-band base offset + survivor ordinal, so blade
 /// count is bounded by buffer capacity and the kernel's `slot < cap`
-/// guard — not by any bit-packed index. Freely retunable.
-pub const MAX_BLADES_PER_PATCH: u32 = 65_536;
+/// guard — not by any bit-packed index. Retunable together with
+/// `MEADOW_MAX_BLADES_PER_PATCH` in `meadow_shared.wesl`, which MUST equal it.
+pub const MAX_BLADES_PER_PATCH: u32 = 262_144;
 
 /// Vertices per blade: 5 layers × 2 sides + 1 tip = 11.
 pub const BLADE_VERTS_PER_BLADE: u32 = 11;
 
 /// Indices per blade: 4 quad layers (12 indices) + 1 tip triangle (3) = 27.
 pub const BLADE_INDICES_PER_BLADE: u32 = 27;
+
+/// Arc length of a blade over its height. A blade bends along this length,
+/// so no part of it lies farther than this multiple of its height from its
+/// root (before wind sway). MUST equal `MEADOW_BLADE_LENGTH` in
+/// `meadow_shared.wesl`.
+pub const BLADE_LENGTH_PER_HEIGHT: f32 = 1.1;
 
 /// Fanned arms per far-LOD tuft.
 pub const TUFT_ARMS: u32 = 7;
@@ -62,14 +69,16 @@ pub const BLADE_RECORD_SIZE: u64 = 48;
 /// 5 × u32). One record per (view, band) in the per-variant indirect buffer.
 pub const INDIRECT_ARGS_SIZE: u64 = 20;
 
-/// Grass farther than this (camera view-depth) casts no shadow. Cascades
-/// reach 140 m but grass shadows beyond ~50 m read as nothing. Caps each
-/// shadow view's far radial clip (`min(cascade_far, SHADOW_MAX_DIST)`).
+/// Grass farther than this casts no shadow-map shadow. Cascades reach
+/// 140 m but grass shadows beyond ~50 m read as nothing. Caps each shadow
+/// view's far radial clip (camera view depth,
+/// `min(cascade_far, SHADOW_MAX_DIST)`) and ends the shadow density ramp
+/// (planar player distance, `meadow_shared.wesl::meadow_shadow_ramp`).
+/// MUST equal `MEADOW_SHADOW_MAX_DIST` in `meadow_shared.wesl`.
 ///
-/// The shadow *density ramp* (full near the camera → sparse far) lives in
-/// `VariantParams.density.z/.w` (`shadow_full_dist` / `shadow_far_density`)
-/// so it hot-reloads without a Rust rebuild; this const is the matching hard
-/// cut, plus the Rust-side buffer-sizing input below.
+/// The ramp's start and far density live in `VariantParams.density.z/.w`
+/// (`shadow_full_dist` / `shadow_far_density`) so they hot-reload without a
+/// Rust rebuild; this const is also a Rust-side buffer-sizing input below.
 pub const SHADOW_MAX_DIST: f32 = 50.0;
 
 /// Max simultaneous cull views the compute pass writes: 1 main camera +
@@ -124,7 +133,7 @@ pub const MESH_WG_TUFTS: u32 = 3;
 
 /// Mesh-shader path: blades expanded per MESH workgroup in SHADOW
 /// cascades, where a blade is a single proxy triangle (base edge + tip —
-/// template verts 0/1/10; drops the mid-blade curl bow, sub-texel at
+/// template verts 0/1/10; drops the mid-blade bend, sub-texel at
 /// shadow-map density): 21 × 3 = 63 verts / 21 tris, 9× less shadow
 /// rasterization than the full ribbon. MUST equal
 /// `MESH_WG_SHADOW_BLADES` in `meadow_mesh.wesl`.
@@ -294,5 +303,22 @@ mod tests {
         };
         assert_eq!(band_marker(&build_blade_template_mesh()), 0.0);
         assert_eq!(band_marker(&build_tuft_template_mesh()), 1.0);
+    }
+
+    /// The shaders carry their own copies of the blade cap, the blade's arc
+    /// length and the shadow distance.
+    #[test]
+    fn constants_match_the_shaders() {
+        let shared = include_str!("meadow_shared.wesl");
+        for line in [
+            format!("const MEADOW_MAX_BLADES_PER_PATCH: u32 = {MAX_BLADES_PER_PATCH}u;"),
+            format!("const MEADOW_BLADE_LENGTH: f32 = {BLADE_LENGTH_PER_HEIGHT:?};"),
+            format!("const MEADOW_SHADOW_MAX_DIST: f32 = {SHADOW_MAX_DIST:?};"),
+        ] {
+            assert!(
+                shared.contains(&line),
+                "`{line}` missing from meadow_shared.wesl"
+            );
+        }
     }
 }

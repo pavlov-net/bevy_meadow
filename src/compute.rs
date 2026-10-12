@@ -57,8 +57,8 @@ use crate::mesh::{
     SHADOW_MAX_DIST,
 };
 use crate::plugin::{
-    MeadowPalettes, MeadowPatch, MeadowVariantId, MeadowVariantRegistry, MeadowViewer,
-    palette_table,
+    MeadowLodCurve, MeadowPalettes, MeadowPatch, MeadowVariant, MeadowVariantId,
+    MeadowVariantRegistry, MeadowViewer, palette_table,
 };
 use crate::render::{MeadowRenderDriver, RenderMeadowMeshIds};
 use crate::rt_selection::{INACTIVE as RT_VACANT_SLOT, RT_NEAR_DISTANCE, RtSelection};
@@ -213,19 +213,19 @@ pub struct VariantGpuBuffers {
     pub uploaded_active_patches: Option<Arc<Vec<u32>>>,
     /// Mesh-shader path task work list (`MeadowTaskSlices`: a count
     /// header then `(patch_index, slice_base)` entries): one entry per
-    /// 128-blade slice of each active patch, so the mesh path's folded
-    /// `draw_mesh_tasks` grid (see `mesh.rs::MESH_TASK_DISPATCH_STRIDE`)
-    /// launches exactly the needed task workgroups instead of a grid
-    /// sized for the 65536-blade maximum (mostly immediate early-outs on
-    /// typical patches). A stub when the mesh path is unavailable.
+    /// 128-blade slice of the blades each active patch's LOD gate can pass
+    /// (`task_slice_bound`), so the mesh path's folded `draw_mesh_tasks`
+    /// grid (see `mesh.rs::MESH_TASK_DISPATCH_STRIDE`) launches only task
+    /// workgroups that can hold survivors. A stub when the mesh path is
+    /// unavailable.
     pub task_slices: Buffer,
     /// Entries in `task_slices` this frame.
     pub num_task_slices: u32,
     /// Allocated capacity of `task_slices` (entries). Tracks resizes.
     pub task_slice_capacity: u32,
-    /// Work list last uploaded into `task_slices`. The list only changes
-    /// when patches stream in/out, so steady frames skip the (up to several
-    /// MB) re-upload.
+    /// Work list last uploaded into `task_slices`. The list changes when
+    /// patches stream in/out or the viewer moves a couple of metres, so
+    /// steady frames skip the re-upload.
     pub uploaded_task_slices: Option<Arc<Vec<[u32; 2]>>>,
     /// Per-variant `MeadowViewCullData` (frusta + per-view base/cap).
     /// Storage (not uniform) to match the compute shader's
@@ -416,29 +416,104 @@ struct VariantPatchLists {
 
 /// Patch-derived lists for every registered variant. They depend only on
 /// the `MeadowPatch` set, the registry (placements, membership) and the
-/// task-list gate, so `extract_meadow_variants` rebuilds them only when one
+/// task-list key, so `extract_meadow_variants` rebuilds them only when one
 /// of those changes.
 #[derive(Default)]
 struct MeadowPatchLists {
     by_variant: HashMap<MeadowVariantId, VariantPatchLists>,
-    /// Task-list gate of the last rebuild, `None` before the first.
-    task_slices_built: Option<bool>,
+    /// What the task list was last built for, `None` before the first
+    /// rebuild: whether it is built at all, the viewer position and whether
+    /// shadow views exist (`task_slice_bound`).
+    task_key: Option<(bool, Vec2, bool)>,
 }
+
+/// Viewer travel, in metres, that rebuilds the mesh-path task list.
+const TASK_LIST_REBUILD_DISTANCE: f32 = 2.0;
+
+/// Viewer distance, in metres, from the position a task list was built for
+/// within which its slice bounds hold: the travel before a rebuild plus the
+/// lag of the viewer position the kernels read (`VariantParams`).
+const TASK_LIST_VIEWER_STEP: f32 = 2.0 * TASK_LIST_REBUILD_DISTANCE;
+
+/// CPU twin of `meadow_shared.wesl::meadow_gate_count`: the blades of a
+/// patch that pass a survival `threshold`, a prefix of its blade indices.
+fn gate_count(threshold: f32, blade_count: u32) -> u32 {
+    ((threshold.clamp(0.0, 1.0) * blade_count as f32).ceil() as u32).min(blade_count)
+}
+
+/// Near-blade survival threshold at planar player distance `dist`: the
+/// main-view band-0 arm of `meadow_shared.wesl::meadow_band_threshold`.
+fn near_survival(lod: &MeadowLodCurve, dist: f32) -> f32 {
+    1.0 - ((dist - lod.full_distance) / (lod.tuft_start - lod.full_distance).max(1e-3))
+        .clamp(0.0, 1.0)
+}
+
+/// Shadow-caster survival threshold at planar player distance `dist`: the
+/// shadow-view arm of `meadow_shared.wesl::meadow_band_threshold`.
+fn shadow_survival(lod: &MeadowLodCurve, dist: f32) -> f32 {
+    let ramp = ((dist - lod.shadow_full_dist) / (SHADOW_MAX_DIST - lod.shadow_full_dist).max(1e-3))
+        .clamp(0.0, 1.0);
+    1.0 + (lod.shadow_far_density - 1.0) * ramp
+}
+
+/// Upper bound on the blades of a patch that the LOD gate passes in any
+/// view while the viewer stays within `TASK_LIST_VIEWER_STEP` of
+/// `viewer_xz`. Survivors are a prefix of the blade indices, so the task
+/// list covers only this many. Every threshold falls with distance, so
+/// each band's is taken at the nearest the viewer can come; `shadows`
+/// adds the shadow casters' threshold to band 0.
+fn task_slice_bound(
+    variant: &MeadowVariant,
+    centre: Vec2,
+    blade_count: u32,
+    viewer_xz: Vec2,
+    shadows: bool,
+) -> u32 {
+    let lod = &variant.lod;
+    let dist = centre.distance(viewer_xz);
+    let nearest = (dist - TASK_LIST_VIEWER_STEP).max(0.0);
+    let farthest = dist + TASK_LIST_VIEWER_STEP;
+    let mut threshold = 0.0_f32;
+    // Band 0 (near blades, shadow casters) inside `tuft_start`.
+    if nearest < lod.tuft_start {
+        threshold = near_survival(lod, nearest);
+        if shadows {
+            threshold = threshold.max(shadow_survival(lod, nearest));
+        }
+    }
+    // Band 1 (far tufts) beyond it.
+    if farthest >= lod.tuft_start {
+        let (tuft_near, tuft_far) = variant.tuft_survival();
+        threshold = threshold.max(tuft_near.max(tuft_far));
+    }
+    gate_count(threshold, blade_count)
+}
+
 impl MeadowPatchLists {
+    /// Whether the task list holds for these inputs: built (or not) the same
+    /// way, with the same shadow views, and for a viewer within
+    /// `TASK_LIST_REBUILD_DISTANCE` when it is built.
+    fn task_list_current(&self, build_task_slices: bool, viewer_xz: Vec2, shadows: bool) -> bool {
+        self.task_key.is_some_and(|(built, viewer, with_shadows)| {
+            built == build_task_slices
+                && with_shadows == shadows
+                && (!built || viewer.distance(viewer_xz) <= TASK_LIST_REBUILD_DISTANCE)
+        })
+    }
+
     fn rebuild<'a>(
         &mut self,
         registry: &MeadowVariantRegistry,
         patches: impl Iterator<Item = &'a MeadowPatch>,
         build_task_slices: bool,
+        viewer_xz: Vec2,
+        shadows: bool,
     ) {
-        // `(patch_index, blade_count)` per non-empty patch, by variant.
-        let mut members: HashMap<MeadowVariantId, Vec<(u32, u32)>> = HashMap::default();
+        // Non-empty patches, by variant.
+        let mut members: HashMap<MeadowVariantId, Vec<&MeadowPatch>> = HashMap::default();
         for patch in patches {
             if patch.blade_count > 0 {
-                members
-                    .entry(patch.variant)
-                    .or_default()
-                    .push((patch.patch_index, patch.blade_count));
+                members.entry(patch.variant).or_default().push(patch);
             }
         }
         self.by_variant.retain(|id, _| registry.get(*id).is_some());
@@ -447,23 +522,24 @@ impl MeadowPatchLists {
             let lists = self.by_variant.entry(*id).or_default();
             replace_if_changed(
                 &mut lists.active_patches,
-                members.iter().map(|&(index, _)| index).collect(),
+                members.iter().map(|p| p.patch_index).collect(),
             );
-            // Mesh-path task work list: exact 128-blade slices per patch
-            // (see `VariantGpuBuffers::task_slices`).
+            // Mesh-path task work list: 128-blade slices over each patch's
+            // gate bound (see `VariantGpuBuffers::task_slices`).
             let mut task_slices = Vec::new();
             if build_task_slices {
-                task_slices.reserve_exact(
-                    members
-                        .iter()
-                        .map(|&(_, blades)| blades.div_ceil(MESH_TASK_BLADES) as usize)
-                        .sum(),
-                );
-                for &(index, blades) in &members {
+                for p in &members {
+                    let bound = task_slice_bound(
+                        &entry.variant,
+                        p.centre,
+                        p.blade_count,
+                        viewer_xz,
+                        shadows,
+                    );
                     task_slices.extend(
-                        (0..blades)
+                        (0..bound)
                             .step_by(MESH_TASK_BLADES as usize)
-                            .map(|slice_base| [index, slice_base]),
+                            .map(|slice_base| [p.patch_index, slice_base]),
                     );
                 }
             }
@@ -472,16 +548,17 @@ impl MeadowPatchLists {
                 &mut lists.rt_live,
                 members
                     .iter()
-                    .filter_map(|&(index, _)| {
+                    .filter_map(|p| {
                         entry
                             .placements
-                            .get(index as usize)
+                            .get(p.patch_index as usize)
                             .copied()
-                            .map(|p| (index, p))
+                            .map(|placement| (p.patch_index, placement))
                     })
                     .collect(),
             );
         }
+        self.task_key = Some((build_task_slices, viewer_xz, shadows));
     }
 }
 
@@ -510,7 +587,7 @@ pub struct ExtractedVariant {
     /// set, let alone the full placement list (tens of millions of blades).
     pub est_main_near: u32,
     /// Estimate of main-view FAR-band (tuft) survivors — bounds the main
-    /// far region (sparse: blade_count × tuft_density_near).
+    /// far region (sparse: blade_count × the near tuft survival, `MeadowVariant::tuft_survival`).
     pub est_main_far: u32,
     /// LOD-weighted estimate of shadow survivors (band 0; only blades
     /// within `SHADOW_MAX_DIST` of the viewer cast) — bounds each cascade
@@ -610,7 +687,7 @@ pub fn build_meadow_compute(render_app: &mut SubApp) {
         .add_systems(
             ExtractSchedule,
             (
-                extract_meadow_variants,
+                extract_meadow_variants.after(extract_meadow_cascade_bounds),
                 extract_meadow_driver,
                 extract_meadow_cascade_bounds,
             ),
@@ -721,9 +798,9 @@ fn init_meadow_draw_bgl(mut commands: Commands) {
 /// `extract_meadow_variants` accumulates against them each frame.
 struct VariantEstimate {
     id: MeadowVariantId,
-    full: f32,
-    tuft_start: f32,
-    tuft_density_near: f32,
+    lod: MeadowLodCurve,
+    /// Near tuft survival fraction (`MeadowVariant::tuft_survival`).
+    tuft_near: f32,
     main_near: f32,
     main_far: f32,
     shadow: f32,
@@ -737,7 +814,7 @@ fn extract_meadow_variants(
     materials: Extract<Res<Assets<MeadowMaterial>>>,
     patches: Extract<Query<Ref<MeadowPatch>>>,
     mut removed_patches: Extract<RemovedComponents<MeadowPatch>>,
-    viewer: Extract<Option<Res<MeadowViewer>>>,
+    (viewer, cascade_bounds): (Extract<Option<Res<MeadowViewer>>>, Res<MeadowCascadeBounds>),
     rt_config: Extract<Option<Res<MeadowRaytracingConfig>>>,
     diagnostics: Extract<Res<MeadowRtDiagnostics>>,
     telemetry: Extract<Res<MeadowRtTelemetry>>,
@@ -786,9 +863,8 @@ fn extract_meadow_variants(
         .iter()
         .map(|(id, e)| VariantEstimate {
             id: *id,
-            full: e.variant.lod.full_distance,
-            tuft_start: e.variant.lod.tuft_start,
-            tuft_density_near: e.variant.lod.tuft_density_near,
+            lod: e.variant.lod,
+            tuft_near: e.variant.tuft_survival().0,
             main_near: 0.0,
             main_far: 0.0,
             shadow: 0.0,
@@ -815,37 +891,36 @@ fn extract_meadow_variants(
             continue;
         };
         let dist = patch.centre.distance(viewer_xz);
-        let n = patch.blade_count as f32;
         // Band is per-patch (centre distance vs `tuft_start`), matching the
-        // kernel. Band 0 (near blade) inside `tuft_start`, tapering to none
-        // by then; band 1 (far tuft) beyond, sparse — bounded by
-        // `tuft_density_near`. Frustum culling only reduces further, so both
-        // are safe upper bounds.
-        if dist < est.tuft_start {
-            let near_survive =
-                1.0 - ((dist - est.full) / (est.tuft_start - est.full).max(1e-3)).clamp(0.0, 1.0);
-            est.main_near += n * near_survive;
+        // kernel: band 0 (near blades, shadow casters) inside `tuft_start`,
+        // band 1 (far tufts) beyond. The kernels' survival thresholds
+        // (`meadow_band_threshold`) at the patch centre; frustum and
+        // cascade culling only reduce further, so these are safe upper
+        // bounds.
+        if dist < est.lod.tuft_start {
+            est.main_near += gate_count(near_survival(&est.lod, dist), patch.blade_count) as f32;
+            // Sized per shadow slot for every caster; each cascade's
+            // radial clip thins it further.
+            est.shadow += gate_count(shadow_survival(&est.lod, dist), patch.blade_count) as f32;
         } else {
-            est.main_far += n * est.tuft_density_near;
-        }
-        if dist <= SHADOW_MAX_DIST + patch.radius {
-            // Shadow casters are band 0 (SHADOW_MAX_DIST < tuft_start). Sized
-            // for the full 0..SHADOW_MAX_DIST estimate per shadow slot; the
-            // per-cascade radial clip thins each further, so this over-
-            // estimates (safe).
-            let shadow_survive =
-                1.0 - ((dist - est.full) / (SHADOW_MAX_DIST - est.full).max(1e-3)).clamp(0.0, 1.0);
-            est.shadow += n * shadow_survive;
+            est.main_far += gate_count(est.tuft_near, patch.blade_count) as f32;
         }
     }
 
-    if registry_changed || patches_changed || lists.task_slices_built != Some(build_task_slices) {
+    // One rule decides shadow views: grass serves the dominant
+    // shadow-mapped directional light's cascades.
+    let shadows = cascade_bounds.dominant_light_bits.is_some();
+    if registry_changed
+        || patches_changed
+        || !lists.task_list_current(build_task_slices, viewer_xz, shadows)
+    {
         lists.rebuild(
             registry,
             patches.iter().map(Ref::into_inner),
             build_task_slices,
+            viewer_xz,
+            shadows,
         );
-        lists.task_slices_built = Some(build_task_slices);
     }
 
     selections.retain(|id, _| {
@@ -2430,5 +2505,94 @@ mod tests {
         let filled = Arc::clone(&list);
         replace_if_changed(&mut list, vec![1, 2]);
         assert!(Arc::ptr_eq(&list, &filled));
+    }
+
+    /// The task list must cover every blade the kernels' prefix gate passes
+    /// in any view, for any viewer within the step of the build position.
+    #[test]
+    fn task_slice_bound_covers_the_gate_within_the_viewer_step() {
+        let variant = MeadowVariant {
+            blades_per_m2: 500.0,
+            lod: MeadowLodCurve {
+                full_distance: 15.0,
+                ..MeadowLodCurve::default()
+            },
+            ..MeadowVariant::default()
+        };
+        let lod = &variant.lod;
+        let (tuft_near, tuft_far) = variant.tuft_survival();
+        let blade_count = 40_000;
+        // Mirror of `meadow_band_threshold`: main views use the near or tuft
+        // arm, shadow views the shadow arm of band 0 (tufts never cast).
+        let gate = |dist: f32, shadow: bool| -> u32 {
+            let threshold = if dist >= lod.tuft_start {
+                if shadow {
+                    return 0;
+                }
+                let t = ((dist - lod.tuft_start) / (lod.max_view_distance - lod.tuft_start))
+                    .clamp(0.0, 1.0);
+                tuft_near + (tuft_far - tuft_near) * t
+            } else if shadow {
+                shadow_survival(lod, dist)
+            } else {
+                near_survival(lod, dist)
+            };
+            gate_count(threshold, blade_count)
+        };
+        let centre = Vec2::new(3.0, -2.0);
+        for step in 0..260 {
+            let built = centre + Vec2::new(step as f32 * 0.5, 0.0);
+            for shadows in [false, true] {
+                let bound = task_slice_bound(&variant, centre, blade_count, built, shadows);
+                for k in 0..16 {
+                    let angle = k as f32 * std::f32::consts::TAU / 16.0;
+                    let viewer = built + Vec2::from_angle(angle) * TASK_LIST_VIEWER_STEP * 0.999;
+                    let dist = centre.distance(viewer);
+                    let needed = gate(dist, false).max(if shadows { gate(dist, true) } else { 0 });
+                    assert!(
+                        bound >= needed,
+                        "built at {built:?}, viewer {viewer:?}: bound {bound} < {needed}"
+                    );
+                }
+            }
+        }
+        // Shadow casters thin with player distance, so the band-0 scan
+        // shrinks before `tuft_start` with shadow views too.
+        let with_shadows =
+            task_slice_bound(&variant, centre, blade_count, centre + Vec2::X * 50.0, true);
+        assert!(with_shadows < blade_count / 2, "{with_shadows}");
+        // Far patches scan only their tuft share.
+        let far = task_slice_bound(
+            &variant,
+            centre,
+            blade_count,
+            centre + Vec2::X * 90.0,
+            false,
+        );
+        assert_eq!(far, gate_count(tuft_near, blade_count));
+    }
+
+    /// Tufts keep their count per area at any blade density.
+    #[test]
+    fn tuft_survival_scales_with_blade_density() {
+        let reference = MeadowVariant {
+            blades_per_m2: crate::plugin::TUFT_REFERENCE_BLADES_PER_M2,
+            ..MeadowVariant::default()
+        };
+        let dense = MeadowVariant {
+            blades_per_m2: 600.0,
+            ..MeadowVariant::default()
+        };
+        let (near, far) = reference.tuft_survival();
+        assert_eq!(
+            (near, far),
+            (
+                reference.lod.tuft_density_near,
+                reference.lod.tuft_density_far
+            )
+        );
+        let (dense_near, dense_far) = dense.tuft_survival();
+        assert!((dense_near * 600.0 - near * reference.blades_per_m2).abs() < 1e-4);
+        assert!((dense_far * 600.0 - far * reference.blades_per_m2).abs() < 1e-4);
     }
 }

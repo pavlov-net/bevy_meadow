@@ -182,7 +182,8 @@ a dense temperate meadow; override fields as needed. The groups:
 ### Levels of detail
 
 `MeadowLodCurve` controls how grass thins with distance. Every blade survives
-within `full_distance`; a per-blade hash gate fades survival to zero by
+within `full_distance`; the LOD gate keeps a shrinking prefix of each patch's
+blades (a uniform spatial subset: roots hash from the blade index), down to none by
 `max_view_distance`, after which `VisibilityRange` culls the patch entity.
 Past `tuft_start`, patches switch from individual blades to sparse fanned
 **tufts** whose density ramps `tuft_density_near -> tuft_density_far` and whose

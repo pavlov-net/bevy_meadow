@@ -78,6 +78,23 @@ impl Default for MeadowVariant {
     }
 }
 
+impl MeadowVariant {
+    /// The tuft survival fractions `(near, far)` the kernels apply to this
+    /// variant's blades: the LOD curve's, rescaled from
+    /// [`TUFT_REFERENCE_BLADES_PER_M2`] to `blades_per_m2`.
+    pub fn tuft_survival(&self) -> (f32, f32) {
+        let scale = TUFT_REFERENCE_BLADES_PER_M2 / self.blades_per_m2.max(1e-3);
+        (
+            (self.lod.tuft_density_near * scale).min(1.0),
+            (self.lod.tuft_density_far * scale).min(1.0),
+        )
+    }
+}
+
+/// Blade density, per m², that [`MeadowLodCurve`]'s tuft survival
+/// fractions are stated at.
+pub const TUFT_REFERENCE_BLADES_PER_M2: f32 = 150.0;
+
 /// Per-variant wind parameters. Direction is *not* per-variant — it
 /// lives on `WindDirection` so meadow + tree foliage agree on the
 /// gust direction.
@@ -260,8 +277,8 @@ impl MeadowPalettes {
     }
 }
 
-/// Distance LOD thresholds (metres). The per-blade hash gate in the
-/// vertex shader linearly tapers blade survival probability across
+/// Distance LOD thresholds (metres). The LOD gate in the blade kernels
+/// linearly tapers the surviving share of each patch's blades across
 /// `full_distance..max_view_distance` — at `full_distance` every
 /// blade survives, at `max_view_distance` none do. Beyond
 /// `max_view_distance` the patch as a whole is culled by
@@ -278,9 +295,14 @@ pub struct MeadowLodCurve {
     /// (band 1) instead of blades (band 0). Near blades taper to nothing
     /// by here; sparse tufts ramp in.
     pub tuft_start: f32,
-    /// Tuft survival fraction at `tuft_start` (densest).
+    /// Tuft survival fraction at `tuft_start` (densest), stated for a
+    /// variant of [`TUFT_REFERENCE_BLADES_PER_M2`] blades/m². Tufts sample a
+    /// patch's blades, so the variant scales it by that reference over its
+    /// own `blades_per_m2` ([`MeadowVariant::tuft_survival`]): the far band
+    /// keeps its tufts per area at any blade density.
     pub tuft_density_near: f32,
-    /// Tuft survival fraction at `max_view_distance` (sparsest).
+    /// Tuft survival fraction at `max_view_distance` (sparsest), stated and
+    /// scaled like `tuft_density_near`.
     pub tuft_density_far: f32,
     /// Player distance beyond which tuft height fades toward zero,
     /// reaching 0 at `max_view_distance`, so the band dissolves into the
@@ -407,13 +429,14 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
     // `wind_direction` / `wind_state` come from `VariantParams::default()`
     // so the freshly-registered variant has sane values before the
     // broadcast systems run for the first time.
+    let (tuft_near, tuft_far) = variant.tuft_survival();
     VariantParams {
         height_range: Vec4::new(variant.height_range.0, variant.height_range.1, 0.0, 0.0),
         width_range: Vec4::new(variant.width_range.0, variant.width_range.1, 0.0, 0.0),
         wind: Vec4::new(variant.wind.amplitude, variant.wind.period, 0.0, 0.0),
         // `x = full_distance`, `y = max_view_distance`,
         // `z = rim_falloff_fraction`, `w = unused`. The shader's
-        // per-blade hash gate uses these to taper density linearly
+        // LOD gate uses these to taper density linearly
         // across `full..max_view`.
         lod: Vec4::new(
             variant.lod.full_distance,
@@ -429,8 +452,8 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
         ),
         tuft: Vec4::new(
             variant.lod.tuft_start,
-            variant.lod.tuft_density_near,
-            variant.lod.tuft_density_far,
+            tuft_near,
+            tuft_far,
             variant.lod.height_fade_start,
         ),
         // Overwritten by `broadcast_heightfield` when the consumer

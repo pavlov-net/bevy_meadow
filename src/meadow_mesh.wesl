@@ -50,9 +50,11 @@
 // the one module serves both layouts.
 
 import bevy_meadow::meadow_shared::{
-    BladeAttrs, local_blade_position, tuft_local_position, wind_sway, hash_u32, hash01_u32,
-    hash01_pair, meadow_patch_palette, meadow_max_height_scale, meadow_patch_noise,
-    meadow_blade_height_scale, meadow_blade_albedo, meadow_pack_albedo, meadow_unpack_albedo,
+    BladeAttrs, MEADOW_CHORD_WIDTH_SCALE, MEADOW_MAX_BLADES_PER_PATCH, wind_sway, hash_u32,
+    hash01_u32, meadow_template_vertex, meadow_place_vertex, meadow_blade_normal_varying,
+    meadow_gate_count, meadow_band_threshold, meadow_shadow_ramp, meadow_patch_palette,
+    meadow_max_height_scale, meadow_patch_noise, meadow_blade_height_scale, meadow_blade_albedo,
+    meadow_pack_albedo, meadow_unpack_albedo,
 };
 import bevy_meadow::meadow_mesh_bindings::{
     variant_params, patches, trunk_slots, heightfield, view_cull, task_slices, mesh_view, palettes,
@@ -74,9 +76,9 @@ const MESH_WG_BLADES: u32 = 5u;
 // Tufts expanded per mesh workgroup (band 1): 3 × 21 = 63 verts, 21 tris.
 const MESH_WG_TUFTS: u32 = 3u;
 // Shadow-cascade blades per mesh workgroup: a shadow blade is a single
-// proxy triangle (base edge + curled/wind-swept tip = template verts
+// proxy triangle (base edge + leaning, wind-swept tip = template verts
 // 0/1/10), so 21 × 3 = 63 verts / 21 tris — 9× less rasterization than
-// the full ribbon, with a silhouette that only loses the mid-blade curl
+// the full ribbon, with a silhouette that only loses the mid-blade
 // bow (sub-texel at shadow-map density).
 const MESH_WG_SHADOW_BLADES: u32 = 21u;
 // Task-grid X stride (MUST mirror `mesh.rs::MESH_TASK_DISPATCH_STRIDE`):
@@ -92,7 +94,6 @@ const MESH_SHADOW_OUT_VERTS: u32 = 63u; // MESH_WG_SHADOW_BLADES × 3
 const MESH_SHADOW_OUT_PRIMS: u32 = 21u; // MESH_WG_SHADOW_BLADES × 1
 
 const MEADOW_VIEW_FLAG_SHADOW: u32 = 1u;
-const TUFT_SALT: u32 = 0x5C3Bu;
 
 // ---------- derivation helpers (MIRROR: meadow_compute.wesl) ----------
 
@@ -285,7 +286,7 @@ fn meadow_task(
     let patch_idx = slice.x;
     let slice_base = slice.y;
     let p = patches[patch_idx];
-    let blade_count = min(u32(p.blade_count_noise_canopy_flags.x), 65536u);
+    let blade_count = min(u32(p.blade_count_noise_canopy_flags.x), MEADOW_MAX_BLADES_PER_PATCH);
     if (blade_count == 0u || slice_base >= blade_count) {
         return vec3<u32>(0u, 0u, 0u);
     }
@@ -304,7 +305,6 @@ fn meadow_task(
         return vec3<u32>(0u, 0u, 0u);
     }
 
-    let lod_full = variant_params.lod.x;
     let lod_max = vc.params.y;
     let tuft_start = variant_params.tuft.x;
     let dist = length(variant_params.viewer_world_xz.xy - centre_xz);
@@ -331,11 +331,6 @@ fn meadow_task(
         }
     }
 
-    // Same survival-threshold formulas as `cull_and_compact`.
-    let near_t = clamp((dist - lod_full) / max(tuft_start - lod_full, 1e-3), 0.0, 1.0);
-    let near_threshold = 1.0 - near_t;
-    let tuft_ramp_t = clamp((dist - tuft_start) / max(lod_max - tuft_start, 1e-3), 0.0, 1.0);
-    let tuft_density = mix(variant_params.tuft.y, variant_params.tuft.z, tuft_ramp_t);
     let height_fade_start = variant_params.tuft.w;
     var tuft_height_scale = 1.0;
     if (band == 1u) {
@@ -343,89 +338,63 @@ fn meadow_task(
             clamp((lod_max - dist) / max(lod_max - height_fade_start, 1e-3), 0.0, 1.0);
     }
 
-    var threshold = near_threshold;
-    if (band == 1u) {
-        threshold = tuft_density;
-    } else if (is_shadow) {
-        let shadow_full_dist = variant_params.density.z;
-        let shadow_far_density = variant_params.density.w;
-        let ramp_t = clamp(
-            (view_depth - shadow_full_dist) / max(lod_max - shadow_full_dist, 1e-3),
-            0.0,
-            1.0,
-        );
-        threshold = mix(1.0, shadow_far_density, ramp_t);
-    }
-    if (threshold <= 0.0) {
+    // The gate keeps a prefix of the blade indices; a slice past it has no
+    // survivors. The CPU work list already stops near the prefix
+    // (`compute.rs::task_slice_bound`).
+    let threshold = meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max);
+    let survivors = meadow_gate_count(threshold, blade_count);
+    if (slice_base >= survivors) {
         return vec3<u32>(0u, 0u, 0u);
     }
 
-    // Per-lane: gate + derive lane `lid`'s blade slot. MIRROR of
+    // Per-lane: derive lane `lid`'s blade slot. MIRROR of
     // `cull_and_compact`'s per-blade body (band routing, cascade clip,
     // trunk-disc collapse, heightfield sample).
-    let p_seed = bitcast<u32>(p.centre_xz_radius_seed.w);
     let b = slice_base + lid;
     var survived = false;
     var out: SurvivorBlade;
-    if (b < blade_count) {
-        var survived_gate = false;
-        if (band == 0u) {
-            if (is_shadow) {
-                survived_gate = hash01_pair(p_seed, b) <= threshold;
-            } else {
-                survived_gate = hash01_u32(p_seed ^ b) <= threshold;
-            }
-        } else {
-            survived_gate = hash01_pair(p_seed, b ^ TUFT_SALT) <= threshold;
+    if (b < survivors) {
+        let blade = derive_blade(b, p);
+        var cast_ok = true;
+        if (is_shadow) {
+            let bvd = dot(
+                vf.xyz,
+                vec3<f32>(blade.world_xz.x, centre_y, blade.world_xz.y),
+            ) + vf.w;
+            cast_ok = bvd >= vc.params2.z && bvd <= lod_max;
         }
-        if (survived_gate) {
-            let blade = derive_blade(b, p);
-            var cast_ok = true;
+        let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
+        if (cast_ok && collapse_t > 1e-4) {
+            let ground_y = sample_heightfield(blade.world_xz) + 0.02;
+            let noise = meadow_patch_noise(palette, blade.world_xz);
+            var wind_now = wind_displacement(
+                blade.world_xz, 1.0, variant_params.wind.z, blade.clump_seed);
+            var wind_prev = wind_displacement(
+                blade.world_xz, 1.0, variant_params.wind.w, blade.clump_seed);
             if (is_shadow) {
-                let bvd = dot(
-                    vf.xyz,
-                    vec3<f32>(blade.world_xz.x, centre_y, blade.world_xz.y),
-                ) + vf.w;
-                cast_ok = bvd >= vc.params2.z && bvd <= lod_max;
+                // Fade shadow-caster sway with player distance: a far
+                // blade's shadow is sub-texel in the cascade, and
+                // animating it reads as shimmering noise. Same ramp
+                // the shadow density uses, so sway settles exactly
+                // where the casters thin out.
+                let sway_atten = 1.0 - meadow_shadow_ramp(dist, variant_params.density.z);
+                wind_now = wind_now * sway_atten;
+                wind_prev = wind_prev * sway_atten;
             }
-            let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
-            if (cast_ok && collapse_t > 1e-4) {
-                let ground_y = sample_heightfield(blade.world_xz) + 0.02;
-                let noise = meadow_patch_noise(palette, blade.world_xz);
-                var wind_now = wind_displacement(
-                    blade.world_xz, 1.0, variant_params.wind.z, blade.clump_seed);
-                var wind_prev = wind_displacement(
-                    blade.world_xz, 1.0, variant_params.wind.w, blade.clump_seed);
-                if (is_shadow) {
-                    // Fade shadow-caster sway with camera distance: a far
-                    // blade's shadow is sub-texel in the cascade, and
-                    // animating it reads as shimmering noise. Same ramp
-                    // the shadow density uses, so sway settles exactly
-                    // where the casters thin out.
-                    let sway_atten = 1.0 - clamp(
-                        (view_depth - variant_params.density.z)
-                            / max(lod_max - variant_params.density.z, 1e-3),
-                        0.0,
-                        1.0,
-                    );
-                    wind_now = wind_now * sway_atten;
-                    wind_prev = wind_prev * sway_atten;
-                }
-                out.world_xz = blade.world_xz;
-                out.yaw = blade.yaw;
-                out.height = blade.height * meadow_blade_height_scale(palette, noise, blade.seed)
-                    * tuft_height_scale;
-                out.width = blade.width;
-                out.albedo = 0u;
-                if (!is_shadow) {
-                    out.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
-                }
-                out.ground_y = ground_y;
-                out.collapse_t = collapse_t;
-                out.wind_now = wind_now;
-                out.wind_prev = wind_prev;
-                survived = true;
+            out.world_xz = blade.world_xz;
+            out.yaw = blade.yaw;
+            out.height = blade.height * meadow_blade_height_scale(palette, noise, blade.seed)
+                * tuft_height_scale;
+            out.width = blade.width;
+            out.albedo = 0u;
+            if (!is_shadow) {
+                out.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
             }
+            out.ground_y = ground_y;
+            out.collapse_t = collapse_t;
+            out.wind_now = wind_now;
+            out.wind_prev = wind_prev;
+            survived = true;
         }
     }
 
@@ -470,40 +439,6 @@ const BLADE_TRIS = array<vec3<u32>, 9>(
     vec3<u32>(6u, 7u, 9u), vec3<u32>(6u, 9u, 8u),
     vec3<u32>(8u, 9u, 10u),
 );
-
-// Expand one template vertex of a blade/tuft to world space.
-// `wind_full` is the blade's full-amplitude wind displacement (task-
-// computed; sway is linear in y_norm — see `SurvivorBlade`), so the
-// previous-frame position is this same function with the previous wind.
-// Returns (world.xyz, y_norm).
-fn blade_vertex(
-    vert_idx: u32,
-    band: u32,
-    blade: BladeAttrs,
-    ground_y: f32,
-    collapse_t: f32,
-    wind_full: vec2<f32>,
-) -> vec4<f32> {
-    var local: vec3<f32>;
-    if (band == 1u) {
-        local = tuft_local_position(vert_idx, blade);
-    } else {
-        local = local_blade_position(vert_idx, blade);
-    }
-    let cy = cos(blade.yaw);
-    let sy = sin(blade.yaw);
-    let rotated_x = cy * local.x + sy * local.z;
-    let rotated_z = -sy * local.x + cy * local.z;
-    let blade_world_xz = blade.world_xz + vec2<f32>(rotated_x, rotated_z);
-    let blade_world_y = ground_y + local.y;
-    let y_norm = local.y / max(blade.height, 1e-3);
-
-    let target_world_xz = blade_world_xz + wind_full * y_norm;
-
-    let final_xz = mix(blade.world_xz, target_world_xz, collapse_t);
-    let final_y = mix(ground_y, blade_world_y, collapse_t);
-    return vec4<f32>(final_xz.x, final_y, final_xz.y, y_norm);
-}
 
 // ---------- mesh stage: full (main view) ----------
 
@@ -551,14 +486,28 @@ fn meadow_mesh(
         let s = payload.survivors[base + t / n_verts];
         let v = t % n_verts;
         let blade = BladeAttrs(s.world_xz, s.yaw, s.height, s.width, 0.0, 1.0, 0u);
-        let cur = blade_vertex(v, payload.band, blade, s.ground_y, s.collapse_t, s.wind_now);
-        let prev = blade_vertex(v, payload.band, blade, s.ground_y, s.collapse_t, s.wind_prev);
-        let world = vec4<f32>(cur.xyz, 1.0);
-        mesh_out.vertices[t].position = mesh_view.clip_from_world * world;
+        let tuft = payload.band == 1u;
+        let cy = cos(s.yaw);
+        let sy = sin(s.yaw);
+        // The task stage computes the tip wind (see `SurvivorBlade`), so
+        // the previous-frame position is the same template vertex placed
+        // with the previous wind.
+        let local = meadow_template_vertex(v, tuft, blade);
+        let world = vec4<f32>(
+            meadow_place_vertex(local, s.world_xz, s.ground_y, cy, sy, s.wind_now, s.collapse_t),
+            1.0,
+        );
+        let prev =
+            meadow_place_vertex(local, s.world_xz, s.ground_y, cy, sy, s.wind_prev, s.collapse_t);
+        let clip = mesh_view.clip_from_world * world;
+        mesh_out.vertices[t].position = clip;
         mesh_out.vertices[t].world_position = world;
-        mesh_out.vertices[t].prev_world_position = vec4<f32>(prev.xyz, 1.0);
-        mesh_out.vertices[t].y_norm = cur.w;
+        mesh_out.vertices[t].prev_world_position = vec4<f32>(prev, 1.0);
+        mesh_out.vertices[t].y_norm = local.w;
         mesh_out.vertices[t].albedo = meadow_unpack_albedo(s.albedo);
+        // Clip w is the view depth under a perspective projection.
+        mesh_out.vertices[t].blade_normal = meadow_blade_normal_varying(
+            v, tuft, blade, cy, sy, s.wind_now * s.collapse_t, clip.w);
     }
 
     let total_prims = count * n_prims;
@@ -596,8 +545,8 @@ struct MeadowShadowMeshOut {
 var<workgroup> shadow_mesh_out: MeadowShadowMeshOut;
 
 // Proxy-silhouette template: base-left, base-right, tip. Verts 0/1 are
-// the blade's base edge and vert 10 is the curled tip, so the triangle
-// keeps the blade's height, width, yaw, forward curl, and tip wind sway —
+// the blade's base edge and vert 10 is the tip, so the triangle
+// keeps the blade's height, width, yaw, lean, and tip wind sway —
 // it only loses the mid-blade bow of the 5-layer ribbon.
 const SHADOW_TEMPLATE_VERTS = array<u32, 3>(0u, 1u, 10u);
 
@@ -624,14 +573,22 @@ fn meadow_mesh_shadow(
     for (var t = lid; t < total_verts; t = t + 32u) {
         let s = payload.survivors[base + t / n_verts];
         let v = SHADOW_TEMPLATE_VERTS[t % n_verts];
-        // Width × 4/3 conserves occlusion area: the base-to-tip triangle
-        // covers 3/4 of the tapered ribbon's silhouette, and PCF-filtered
-        // grass shadows read proportionally fainter without it.
-        let blade =
-            BladeAttrs(s.world_xz, s.yaw, s.height, s.width * (4.0 / 3.0), 0.0, 1.0, 0u);
-        let cur = blade_vertex(v, 0u, blade, s.ground_y, s.collapse_t, s.wind_now);
-        shadow_mesh_out.vertices[t].position =
-            mesh_view.clip_from_world * vec4<f32>(cur.xyz, 1.0);
+        // `MEADOW_CHORD_WIDTH_SCALE` conserves occlusion area: the
+        // base-to-tip triangle is narrower than the tapered ribbon's
+        // silhouette, and PCF-filtered grass shadows read proportionally
+        // fainter without it.
+        let blade = BladeAttrs(
+            s.world_xz, s.yaw, s.height, s.width * MEADOW_CHORD_WIDTH_SCALE, 0.0, 1.0, 0u);
+        let world = meadow_place_vertex(
+            meadow_template_vertex(v, false, blade),
+            s.world_xz,
+            s.ground_y,
+            cos(s.yaw),
+            sin(s.yaw),
+            s.wind_now,
+            s.collapse_t,
+        );
+        shadow_mesh_out.vertices[t].position = mesh_view.clip_from_world * vec4<f32>(world, 1.0);
     }
 
     for (var t = lid; t < count; t = t + 32u) {

@@ -94,8 +94,8 @@ pub struct VariantParams {
     /// range or beyond — `VisibilityRange` then culls the patch
     /// entity itself in a small soft band), `z = rim_falloff_fraction`
     /// (smoothstep on the outer edge of the noisy patch radius),
-    /// `w = unused`. The shader's per-blade hash gate fades survival
-    /// probability linearly across `full..max_view`.
+    /// `w = unused`. The shader's LOD gate (a prefix of each patch's blade
+    /// indices) fades survival linearly across `full..max_view`.
     pub lod: Vec4,
     /// `x = blades_per_m²`, `y = patch_edge_noise_amp`,
     /// `z = shadow_full_dist` (shadow-caster density is full within this
@@ -115,7 +115,7 @@ pub struct VariantParams {
     /// because `view.world_position` is the projection origin of the
     /// current view — for shadow cascade passes that's the
     /// directional light, not the player, so reading it there causes
-    /// every blade to survive the hash gate out to the cascade limit
+    /// every blade to survive the LOD gate out to the cascade limit
     /// (~12× the visible blade count, dominating cascade depth time).
     /// A uniform decouples the LOD math from which view is rendering.
     pub viewer_world_xz: Vec4,

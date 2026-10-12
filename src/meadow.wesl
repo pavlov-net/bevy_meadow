@@ -9,7 +9,7 @@ import bevy_pbr::render::mesh_view_bindings::view;
 // per view whose `first_instance` is that view's base offset, so
 // `@builtin(instance_index)` indexes straight into `blades[]`. The VS
 // reads one record per blade instance, expands the 11 local verts (via
-// `local_blade_position`), and recomputes only the wind sway (cheap,
+// `meadow_template_vertex`), and recomputes only the wind sway (cheap,
 // time-varying). `vert_idx` = `position.y` (0..10), encoded by `mesh.rs`.
 //
 // Structs + binding-free helpers live in `meadow_shared.wesl`; the
@@ -46,9 +46,9 @@ import bevy_pbr::render::{
 };
 
 import bevy_meadow::meadow_shared::{
-    VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, tuft_local_position,
-    wind_sway, meadow_shading_normal, meadow_unpack_albedo, meadow_blade_base_color,
-    meadow_blade_emissive,
+    VariantParams, CompactedBladeRecord, BladeAttrs, meadow_template_vertex, meadow_place_vertex,
+    meadow_blade_normal_varying, wind_sway, meadow_shading_normal, meadow_unpack_albedo,
+    meadow_blade_base_color, meadow_blade_emissive,
 };
 
 // Wind time comes from bevy's globals uniform (`globals.time`, wrapped
@@ -125,53 +125,32 @@ fn vertex(in: Vertex) -> VertexOutput {
     // downstream conditional blocks (`rim_factor` is irrelevant here —
     // it's already folded into `rec.collapse_t`).
     let blade = BladeAttrs(rec.world_root_xz, rec.yaw, rec.height, rec.width, rec.clump_seed, 1.0, 0u);
-    let ground_y = rec.ground_y;
     let collapse_t = rec.collapse_t;
 
-    // Local blade space → world XZ. yaw rotates the (x, z) of the local
-    // frame; height-curl moves the tip forward in z. POSITION.x marks the
-    // LOD band (0 = blade, 1 = tuft) so the one shared VS expands the right
-    // geometry. The band is uniform across an indirect draw (blades and
-    // tufts are separate draws), so this branch is dynamically uniform —
-    // `if` evaluates only the taken arm, vs `select` paying the tuft
-    // transcendentals on every blade vertex (and vice-versa).
-    var local: vec3<f32>;
-    if (in.position.x > 0.5) {
-        local = tuft_local_position(vert_idx, blade);
-    } else {
-        local = local_blade_position(vert_idx, blade);
-    }
+    // Wind sway in world XZ at the tip, scaled up the blade —
+    // recomputed each frame (time-varying); cheap relative to the full
+    // derivation.
+    let wind_full = wind_displacement(blade.world_xz, 1.0, globals.time, blade.clump_seed);
     let cy = cos(blade.yaw);
     let sy = sin(blade.yaw);
-    let rotated_x = cy * local.x + sy * local.z;
-    let rotated_z = -sy * local.x + cy * local.z;
-    let blade_world_xz = blade.world_xz + vec2<f32>(rotated_x, rotated_z);
-    let blade_world_y = ground_y + local.y;
-    let y_norm = local.y / max(blade.height, 1e-3);
 
-    // Wind sway in world XZ on the upper portion of the blade —
-    // recomputed each frame (time-varying); cheap relative to the
-    // full derivation.
-    let wind = wind_displacement(blade.world_xz, 1.0, globals.time, blade.clump_seed) * y_norm;
-    let target_world_xz = blade_world_xz + wind;
-    let root_world_xz = blade.world_xz;
-
-    // Mix root → upright-blade-with-wind by collapse_t. At
-    // collapse_t = 0 the vertex sits at (root_xz, ground_y), so
-    // all 11 verts of this blade converge and triangles are
-    // degenerate.
-    let final_xz = mix(root_world_xz, target_world_xz, collapse_t);
-    let final_y = mix(ground_y, blade_world_y, collapse_t);
-    let final_pos = vec3<f32>(final_xz.x, final_y, final_xz.y);
-
-    let world_position4 = vec4<f32>(final_pos, 1.0);
-    out.position = position_world_to_clip(world_position4.xyz);
-    out.world_position = world_position4;
+    // POSITION.x marks the LOD band (0 = blade, 1 = tuft) so the one
+    // shared VS expands the right geometry. The band is uniform across an
+    // indirect draw (blades and tufts are separate draws), so the branches
+    // on it are dynamically uniform.
+    let tuft = in.position.x > 0.5;
+    let local = meadow_template_vertex(vert_idx, tuft, blade);
+    let world = meadow_place_vertex(local, blade.world_xz, rec.ground_y, cy, sy, wind_full, collapse_t);
+    out.position = position_world_to_clip(world);
+    out.world_position = vec4<f32>(world, 1.0);
+    // Clip w is the view depth under a perspective projection.
+    let blade_normal = meadow_blade_normal_varying(
+        vert_idx, tuft, blade, cy, sy, wind_full * collapse_t, out.position.w);
 
 @if(VERTEX_NORMALS && !PREPASS_PIPELINE)
-    out.world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    out.world_normal = blade_normal.xyz;
 @if(VERTEX_NORMALS && PREPASS_PIPELINE && NORMAL_PREPASS_OR_DEFERRED_PREPASS)
-    out.world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    out.world_normal = blade_normal.xyz;
 
 @if(VERTEX_TANGENTS && !PREPASS_PIPELINE)
     out.world_tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
@@ -183,16 +162,15 @@ fn vertex(in: Vertex) -> VertexOutput {
     // (`rec.prev_*`, == current root for static placement) and wind
     // (previous frame's time) so TAA can cancel the per-vertex sway delta.
     let prev_t = globals.time - globals.delta_time;
-    let prev_wind = wind_displacement(rec.prev_root_xz, 1.0, prev_t, blade.clump_seed) * y_norm;
-    let prev_blade_world_xz = rec.prev_root_xz + vec2<f32>(rotated_x, rotated_z);
-    let prev_target_xz = prev_blade_world_xz + prev_wind;
-    let prev_final_xz = mix(rec.prev_root_xz, prev_target_xz, collapse_t);
-    let prev_final_y = mix(rec.prev_ground_y, rec.prev_ground_y + local.y, collapse_t);
-    out.previous_world_position = vec4<f32>(prev_final_xz.x, prev_final_y, prev_final_xz.y, 1.0);
+    let prev_wind = wind_displacement(rec.prev_root_xz, 1.0, prev_t, blade.clump_seed);
+    let prev_world = meadow_place_vertex(
+        local, rec.prev_root_xz, rec.prev_ground_y, cy, sy, prev_wind, collapse_t);
+    out.previous_world_position = vec4<f32>(prev_world, 1.0);
 }
 
+// UV.x carries the weight of the blade's own normal in the shading normal.
 @if(VERTEX_UVS_A)
-    out.uv = vec2<f32>(0.0, y_norm);
+    out.uv = vec2<f32>(blade_normal.w, local.w);
 
 @if(VERTEX_UVS_B)
     out.uv_b = blade.world_xz;
@@ -250,7 +228,7 @@ fn fragment(
 // Shared by the forward fragment and the deferred/normal prepass fragment.
 @if(!PREPASS_PIPELINE || (PREPASS_FRAGMENT && NORMAL_PREPASS_OR_DEFERRED_PREPASS))
 fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
-    (*pbr_input).world_normal = meadow_shading_normal((*pbr_input).V);
+    (*pbr_input).world_normal = meadow_shading_normal(in.world_normal, in.uv.x, (*pbr_input).V);
     (*pbr_input).N = (*pbr_input).world_normal;
     // Vertex colour times the white material base: the blade albedo.
     let albedo = (*pbr_input).material.base_color.rgb;

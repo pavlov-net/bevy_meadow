@@ -15,9 +15,10 @@
 
 import bevy_meadow::meadow_shared::{
     VariantParams, PaletteParams, MEADOW_MAX_PALETTES, CompactedBladeRecord, BladeAttrs,
-    local_blade_position, wind_sway, hash_u32, hash01_u32, hash01_pair, meadow_patch_palette,
-    meadow_max_height_scale, meadow_patch_noise, meadow_blade_height_scale, meadow_blade_albedo,
-    meadow_pack_albedo,
+    MEADOW_CHORD_WIDTH_SCALE, MEADOW_SHADOW_MAX_DIST, wind_sway, hash_u32, hash01_u32, hash01_pair,
+    meadow_patch_palette, meadow_max_height_scale, meadow_patch_noise, meadow_blade_height_scale,
+    meadow_blade_albedo, meadow_pack_albedo, meadow_gate_count, meadow_band_threshold,
+    meadow_template_vertex, meadow_place_vertex,
 };
 
 // ---------- compute-only structs ----------
@@ -29,10 +30,6 @@ const MEADOW_VIEW_FLAG_SHADOW: u32 = 1u;
 // LOD bands the kernel routes survivors into; MUST equal
 // `mesh.rs::MEADOW_MAX_BANDS`. Band 0 = near blade, band 1 = far tuft.
 const MEADOW_MAX_BANDS: u32 = 2u;
-
-// Decorrelates a blade slot's tuft-band survival hash from its near-band
-// survival hash, so the far band isn't a strict subset of the near band.
-const TUFT_SALT: u32 = 0x5C3Bu;
 
 struct PatchData {
     centre_xz_radius_seed: vec4<f32>,
@@ -273,11 +270,9 @@ fn cull_and_compact(
         return;
     }
 
-    let lod_full = variant_params.lod.x;
     let lod_max = vc.params.y;
     let tuft_start = variant_params.tuft.x;
     let dist = length(variant_params.viewer_world_xz.xy - centre_xz);
-    let p_seed = bitcast<u32>(p.centre_xz_radius_seed.w);
 
     // Depth along the MAIN camera's forward axis, from the broadcast
     // view-depth plane `viewer_forward = (forward.xyz, -dot(forward, eye))`:
@@ -328,100 +323,69 @@ fn cull_and_compact(
     }
     let cursor_idx = view_slot * MEADOW_MAX_BANDS + band;
 
-    // Near-band blade survival tapers across [full_distance, tuft_start];
-    // far-band tuft survival ramps tuft.y -> tuft.z across
-    // [tuft_start, max_view], with a height fade over the last stretch so the
-    // band dissolves into the ground.
-    let near_t = clamp((dist - lod_full) / max(tuft_start - lod_full, 1e-3), 0.0, 1.0);
-    let near_threshold = 1.0 - near_t;
-    let tuft_ramp_t = clamp((dist - tuft_start) / max(lod_max - tuft_start, 1e-3), 0.0, 1.0);
-    let tuft_density = mix(variant_params.tuft.y, variant_params.tuft.z, tuft_ramp_t);
+    // Far-band tufts fade height over the last stretch so the band
+    // dissolves into the ground.
     let height_fade_start = variant_params.tuft.w;
     let tuft_height_scale =
         clamp((lod_max - dist) / max(lod_max - height_fade_start, 1e-3), 0.0, 1.0);
-    let shadow_full_dist = variant_params.density.z;
-    let shadow_far_density = variant_params.density.w;
 
-    // Strip-mine the patch's blades in lockstep 256-wide batches. Lockstep
-    // (rather than `b = lid; b += 256`) keeps every thread on the same
-    // iteration count — `num_batches` is uniform across the workgroup since
-    // `blade_count` is — so the `workgroupBarrier()`s below sit in uniform
-    // control flow. Each thread derives at most one survivor per batch and
-    // holds it in `rec` across the aggregation barriers.
-    let num_batches = (blade_count + 255u) / 256u;
+    let threshold = meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max);
+    let survivors = meadow_gate_count(threshold, blade_count);
+
+    // Strip-mine the surviving prefix in lockstep 256-wide batches.
+    // Lockstep (rather than `b = lid; b += 256`) keeps every thread on the
+    // same iteration count — `num_batches` is uniform across the workgroup
+    // since `survivors` is — so the `workgroupBarrier()`s below sit in
+    // uniform control flow. Each thread derives at most one survivor per
+    // batch and holds it in `rec` across the aggregation barriers.
+    let num_batches = (survivors + 255u) / 256u;
     for (var batch = 0u; batch < num_batches; batch = batch + 1u) {
         let b = batch * 256u + lid;
 
         var survived = false;
         var rec: CompactedBladeRecord;
-        // The final batch runs past `blade_count`; those lanes simply don't
+        // The final batch runs past `survivors`; those lanes simply don't
         // survive but still reach the barriers below.
-        if (b < blade_count) {
-            var survived_gate = false;
-            if (band == 0u) {
-                if (is_shadow) {
-                    // Distance-ramped shadow density: full within
-                    // shadow_full_dist, thinning to shadow_far_density by the
-                    // cascade's far clip. Uses the same camera view-depth as
-                    // the cascade clip so the thinning is stable under camera
-                    // orbit. Hash-distributed → a uniform spatial subset.
-                    let ramp_t = clamp(
-                        (view_depth - shadow_full_dist) / max(lod_max - shadow_full_dist, 1e-3),
-                        0.0,
-                        1.0,
-                    );
-                    let shadow_density = mix(1.0, shadow_far_density, ramp_t);
-                    survived_gate = hash01_pair(p_seed, b) <= shadow_density;
-                } else {
-                    // Per-blade LOD hash gate (player-distance, view-independent).
-                    survived_gate = hash01_u32(p_seed ^ b) <= near_threshold;
-                }
-            } else {
-                // Far tuft band (main view only): sparse, decorrelated from
-                // the near gate via TUFT_SALT.
-                survived_gate = hash01_pair(p_seed, b ^ TUFT_SALT) <= tuft_density;
+        if (b < survivors) {
+            let blade = derive_blade(b, p);
+            // Per-blade shadow cascade clip (view-depth): a wide patch can
+            // span several cascades, so assign each blade to the cascade
+            // whose slice contains it — matching the receiver beneath it.
+            var cast_ok = true;
+            if (is_shadow) {
+                let bvd = dot(
+                    vf.xyz,
+                    vec3<f32>(blade.world_xz.x, centre_y, blade.world_xz.y),
+                ) + vf.w;
+                cast_ok = bvd >= vc.params2.z && bvd <= lod_max;
             }
-            if (survived_gate) {
-                let blade = derive_blade(b, p);
-                // Per-blade shadow cascade clip (view-depth): a wide patch can
-                // span several cascades, so assign each blade to the cascade
-                // whose slice contains it — matching the receiver beneath it.
-                var cast_ok = true;
-                if (is_shadow) {
-                    let bvd = dot(
-                        vf.xyz,
-                        vec3<f32>(blade.world_xz.x, centre_y, blade.world_xz.y),
-                    ) + vf.w;
-                    cast_ok = bvd >= vc.params2.z && bvd <= lod_max;
+            let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
+            if (cast_ok && collapse_t > 1e-4) {
+                let ground_y = sample_heightfield(blade.world_xz) + 0.02;
+                let noise = meadow_patch_noise(palette, blade.world_xz);
+                // Far-band tufts fade height to zero near `max_view` so the
+                // band dissolves into the ground instead of ending hard.
+                var h = blade.height * meadow_blade_height_scale(palette, noise, blade.seed);
+                if (band == 1u) {
+                    h = h * tuft_height_scale;
                 }
-                let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
-                if (cast_ok && collapse_t > 1e-4) {
-                    let ground_y = sample_heightfield(blade.world_xz) + 0.02;
-                    let noise = meadow_patch_noise(palette, blade.world_xz);
-                    // Far-band tufts fade height to zero near `max_view` so the
-                    // band dissolves into the ground instead of ending hard.
-                    var h = blade.height * meadow_blade_height_scale(palette, noise, blade.seed);
-                    if (band == 1u) {
-                        h = h * tuft_height_scale;
-                    }
-                    rec.world_root_xz = blade.world_xz;
-                    rec.ground_y = ground_y;
-                    rec.height = h;
-                    rec.width = blade.width;
-                    rec.yaw = blade.yaw;
-                    rec.clump_seed = blade.clump_seed;
-                    rec.collapse_t = collapse_t;
-                    // Static placement: previous-frame root == current. Motion
-                    // comes entirely from the wind delta, recomputed in the VS.
-                    rec.prev_root_xz = blade.world_xz;
-                    rec.prev_ground_y = ground_y;
-                    // Shadow views draw depth only; their records skip the colour.
-                    rec.albedo = 0u;
-                    if (!is_shadow) {
-                        rec.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
-                    }
-                    survived = true;
+                rec.world_root_xz = blade.world_xz;
+                rec.ground_y = ground_y;
+                rec.height = h;
+                rec.width = blade.width;
+                rec.yaw = blade.yaw;
+                rec.clump_seed = blade.clump_seed;
+                rec.collapse_t = collapse_t;
+                // Static placement: previous-frame root == current. Motion
+                // comes entirely from the wind delta, recomputed in the VS.
+                rec.prev_root_xz = blade.world_xz;
+                rec.prev_ground_y = ground_y;
+                // Shadow views draw depth only; their records skip the colour.
+                rec.albedo = 0u;
+                if (!is_shadow) {
+                    rec.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
                 }
+                survived = true;
             }
         }
 
@@ -467,8 +431,6 @@ fn cull_and_compact(
 // overlap a stable hash chooses one representation. No atomic compaction
 // changes triangle ownership while wind moves the geometry.
 
-// Radial shadow-caster extent for RT (metres). Matches `mesh.rs::SHADOW_MAX_DIST`.
-const RT_SHADOW_DIST: f32 = 50.0;
 // Fade caster density to zero before the hard range limit. This thinning
 // is NOT compensated by width, which would cancel the intended fade.
 const RT_SHADOW_FADE_START: f32 = 35.0;
@@ -509,21 +471,11 @@ fn rt_wind_tip(blade: BladeAttrs) -> vec2<f32> {
     );
 }
 
-// Far-band proxy template: the ribbon's base edge + curled tip (template
-// verts 0/1/10), one triangle. `width_boost` is the 4/3 area-parity factor
-// against the tapered ribbon. The distance fade thins casters and is not
-// compensated by width.
-fn rt_far_local(vi: u32, blade: BladeAttrs, width_boost: f32) -> vec3<f32> {
-    var local = local_blade_position(select(vi, 10u, vi == 2u), blade);
-    local.x = local.x * width_boost;
-    return local;
-}
-
-// Pack one proxy vertex, reproducing `meadow.wesl`'s
-// local->world+yaw+wind+collapse transform. `cy`/`sy`/`wind_tip` are
+// Pack one caster vertex: a template vertex (`meadow_template_vertex`)
+// placed like the raster paths place it. `cy`/`sy`/`wind_tip` are
 // per-blade values hoisted out of the per-vertex loop.
 fn rt_pack_vertex(
-    local: vec3<f32>,
+    local: vec4<f32>,
     blade: BladeAttrs,
     ground_y: f32,
     collapse_t: f32,
@@ -532,21 +484,14 @@ fn rt_pack_vertex(
     wind_tip: vec2<f32>,
     palette_u: f32,
 ) -> RtVertex {
-    let rotated_x = cy * local.x + sy * local.z;
-    let rotated_z = -sy * local.x + cy * local.z;
-    let blade_world_xz = blade.world_xz + vec2<f32>(rotated_x, rotated_z);
-    let blade_world_y = ground_y + local.y;
-    let y_norm = local.y / max(blade.height, 1e-3);
-    let target_world_xz = blade_world_xz + wind_tip * y_norm;
-    let final_xz = mix(blade.world_xz, target_world_xz, collapse_t);
-    let final_y = mix(ground_y, blade_world_y, collapse_t);
+    let world = meadow_place_vertex(local, blade.world_xz, ground_y, cy, sy, wind_tip, collapse_t);
     var v: RtVertex;
     // normal = (0,1,0), uv = (palette_u, y_norm), tangent = (1,0,0,1). The
     // caster material's base colour texture holds one texel per palette
     // entry, so `palette_u` (the entry's texel centre) gives each blade its
     // patch's mean colour.
-    v.a = vec4<f32>(final_xz.x, final_y, final_xz.y, 0.0);
-    v.b = vec4<f32>(1.0, 0.0, palette_u, y_norm);
+    v.a = vec4<f32>(world, 0.0);
+    v.b = vec4<f32>(1.0, 0.0, palette_u, local.w);
     v.tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
     return v;
 }
@@ -582,7 +527,7 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
         let h = hash01_pair(seed, key.y);
         // The same threshold selects exactly one representation in overlap.
         let chosen = select((h < transition), (h >= transition), near);
-        let fade = 1.0 - smoothstep(RT_SHADOW_FADE_START, RT_SHADOW_DIST, dist);
+        let fade = 1.0 - smoothstep(RT_SHADOW_FADE_START, MEADOW_SHADOW_MAX_DIST, dist);
         let fade_hash = hash01_pair(seed ^ 0xA511E9B3u, key.y);
         if (chosen && fade_hash < fade) {
             collapse = blade_visibility(blade.world_xz, key.x) * blade.rim_factor;
@@ -595,10 +540,18 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
     for (var vi = 0u; vi < count; vi += 1u) {
         var vertex = rt_empty_vertex();
         if (occupied) {
-            var local = local_blade_position(vi, blade);
+            // Far slots are one proxy triangle: the ribbon's base edge and
+            // tip (template verts 0/1/10), widened to the ribbon's
+            // silhouette area (`MEADOW_CHORD_WIDTH_SCALE`). Area parity
+            // only: the distance fade thins casters and no widening
+            // replaces them.
+            var template_vert = vi;
             if (!near) {
-                // Area parity only: no widening to replace missing casters.
-                local = rt_far_local(vi, blade, 4.0 / 3.0);
+                template_vert = select(vi, 10u, vi == 2u);
+            }
+            var local = meadow_template_vertex(template_vert, false, blade);
+            if (!near) {
+                local.x = local.x * MEADOW_CHORD_WIDTH_SCALE;
             }
             // Suppressed owners retain finite, collapsed vertices. History
             // cannot accidentally sample NaN positions during a fade.

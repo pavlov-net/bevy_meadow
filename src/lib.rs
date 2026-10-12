@@ -55,9 +55,9 @@ pub use material::{
     PatchData, PatchTrunkSlot, TrunkDisc, VariantParams,
 };
 pub use mesh::{
-    BLADE_INDICES_PER_BLADE, BLADE_VERTS_PER_BLADE, MAX_BLADES_PER_PATCH, MEADOW_MAX_BANDS,
-    MeadowMeshes, TUFT_INDICES_PER_BLADE, TUFT_VERTS_PER_BLADE, build_blade_template_mesh,
-    build_tuft_template_mesh,
+    BLADE_INDICES_PER_BLADE, BLADE_LENGTH_PER_HEIGHT, BLADE_VERTS_PER_BLADE, MAX_BLADES_PER_PATCH,
+    MEADOW_MAX_BANDS, MeadowMeshes, TUFT_INDICES_PER_BLADE, TUFT_VERTS_PER_BLADE,
+    build_blade_template_mesh, build_tuft_template_mesh,
 };
 pub use placement::{
     PatchOverride, PatchOverrideMode, PatchPlacement, PlacementParams, TreeDensityField,
@@ -66,8 +66,8 @@ pub use placement::{
 pub use plugin::{
     MEAN_BLADE_SHADE, MeadowHeightfield, MeadowLodCurve, MeadowPalette, MeadowPalettes,
     MeadowPatch, MeadowPlugin, MeadowVariant, MeadowVariantId, MeadowVariantRegistry, MeadowViewer,
-    MeadowWindState, PatchAudioTag, WindDirection, WindParams, palette_table, upload_placements,
-    upload_trunk_slots,
+    MeadowWindState, PatchAudioTag, TUFT_REFERENCE_BLADES_PER_M2, WindDirection, WindParams,
+    palette_table, upload_placements, upload_trunk_slots,
 };
 
 pub use plugin::{MeadowSolariGeometryNormals, MeadowWindFreeze};
