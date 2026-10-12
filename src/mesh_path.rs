@@ -258,7 +258,7 @@ pub struct MeadowMeshMvTarget {
 /// Identity fingerprint of a variant's mesh-path bind groups (same
 /// rationale as the compute path's `ComputeBindGroupFingerprint`), plus
 /// the view-slot count the per-slot groups were built for.
-type MeshBindGroupFingerprint = ([BufferId; 6], TextureViewId, u32);
+type MeshBindGroupFingerprint = ([BufferId; 7], TextureViewId, u32);
 
 /// Per variant, one meadow bind group per view slot (`[slot]`), differing
 /// only in which `MeadowMeshViewUniform` entry binding 6 points at.
@@ -342,8 +342,9 @@ pub fn build_meadow_mesh_path(render_app: &mut SubApp) {
 // ---------- RenderStartup: detection + static pipelines ----------
 
 /// Meadow bind group layout. All entries visible to TASK|MESH|FRAGMENT —
-/// the fragment only reads bindings 0 (palette) and 6 (MV matrices), but
-/// a superset visibility is valid and keeps this a single layout.
+/// the fragment only reads bindings 0 (variant params) and 6 (MV
+/// matrices), but a superset visibility is valid and keeps this a single
+/// layout.
 ///
 /// Binding 6 selects the view by BIND GROUP (one group per view slot,
 /// see [`prepare_meadow_mesh_bind_groups`]), not by dynamic offset. With
@@ -368,6 +369,7 @@ fn meadow_mesh_bgl_desc() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only::<MeadowViewCullData>(false), // 4 view_cull
                 storage_buffer_read_only_sized(false, None), // 5 task_slices
                 uniform_buffer::<MeadowMeshViewUniform>(false), // 6 mesh_view (per-slot group)
+                storage_buffer_read_only_sized(false, None), // 7 palettes
             ),
         ),
     )
@@ -1030,7 +1032,10 @@ fn prepare_meadow_mesh_bind_groups(
             continue;
         };
         let heightfield = gpu_images.get(ev.heightfield).unwrap_or(&fallback_image.d2);
-        let Some(params_buf) = params.by_variant.get(id).and_then(|b| b.buffer()) else {
+        let Some(gpu) = params.by_variant.get(id) else {
+            continue;
+        };
+        let Some(params_buf) = gpu.params.buffer() else {
             continue;
         };
         let Some(vb) = buffers.by_variant.get(id) else {
@@ -1048,6 +1053,7 @@ fn prepare_meadow_mesh_bind_groups(
                 view_cull.id(),
                 vb.task_slices.id(),
                 view_uniform_buffer.id(),
+                gpu.palettes.id(),
             ],
             heightfield.texture_view.id(),
             slot_count,
@@ -1075,6 +1081,7 @@ fn prepare_meadow_mesh_bind_groups(
                             offset: u64::from(view_uniforms.offsets[slot]),
                             size: Some(MeadowMeshViewUniform::min_size()),
                         },
+                        gpu.palettes.as_entire_binding(),
                     )),
                 )
             })
@@ -1763,6 +1770,7 @@ mod tests {
             "VERTEX_UVS".into(),
             "VERTEX_UVS_A".into(),
             "VERTEX_TANGENTS".into(),
+            "VERTEX_COLORS".into(),
         ];
         lib.compile(shader, &base);
         let mut deferred = base;
@@ -2153,11 +2161,13 @@ mod tests {
         assert!(!words.is_empty());
     }
 
-    /// The derivation helpers are duplicated between the compute kernel
-    /// and the mesh-shader module, and the wind helper between the raster
-    /// material and the mesh path (see the MIRROR comments in each). The
-    /// two paths must derive bit-identical blades — pin the shared
-    /// function bodies to each other so drift fails the build.
+    /// The binding-touching derivation helpers are duplicated between the
+    /// compute kernel and the mesh-shader module, and the wind helper
+    /// between the raster material and the mesh path (see the MIRROR
+    /// comments in each); the hashes and palette variance are shared from
+    /// `meadow_shared.wesl`. The two paths must derive bit-identical blades
+    /// — pin the duplicated function bodies to each other so drift fails
+    /// the build.
     #[test]
     fn mirrored_helpers_match_compute_kernel() {
         let compute = include_str!("meadow_compute.wesl");
@@ -2196,9 +2206,6 @@ mod tests {
         }
 
         for f in [
-            "hash_u32",
-            "hash01_u32",
-            "hash01_pair",
             "derive_blade",
             "blade_visibility",
             "sample_heightfield",

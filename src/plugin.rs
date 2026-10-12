@@ -1,8 +1,8 @@
 //! `MeadowPlugin` — registers the `MeadowMaterial` plugin, the
 //! variant registry, the shared LOD meshes resource (blade + tuft
 //! templates), and the broadcast systems that push wind direction /
-//! season blend / heightfield atlas into every variant's material on
-//! resource change.
+//! viewer / heightfield atlas into every variant's material on resource
+//! change.
 
 use std::collections::HashMap;
 
@@ -20,8 +20,8 @@ use crate::render::MeadowRenderDriver;
 use bevy::render::storage::ShaderBuffer;
 
 use crate::material::{
-    MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PatchData, PatchTrunkSlot, TrunkDisc,
-    VariantParams,
+    MAX_MEADOW_PALETTES, MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PaletteParams,
+    PatchData, PatchTrunkSlot, TrunkDisc, VariantParams,
 };
 use crate::mesh::{MeadowMeshes, build_blade_template_mesh, build_tuft_template_mesh};
 use crate::placement::PatchOverride;
@@ -42,7 +42,12 @@ pub struct MeadowVariant {
     pub rim_falloff_fraction: f32,
     pub biome_weight_threshold: f32,
     pub wind: WindParams,
-    pub palette: SeasonalPalette,
+    /// The palette table at registration, 1..=[`MAX_MEADOW_PALETTES`]
+    /// entries. Each patch selects one by
+    /// [`PatchPlacement::palette`](crate::PatchPlacement); the consumer
+    /// decides what the entries mean and rewrites the table in
+    /// [`MeadowPalettes`].
+    pub palettes: Vec<MeadowPalette>,
     pub lod: MeadowLodCurve,
     pub overrides: Vec<PatchOverride>,
     pub seed: u64,
@@ -64,7 +69,7 @@ impl Default for MeadowVariant {
             rim_falloff_fraction: 0.25,
             biome_weight_threshold: 0.6,
             wind: WindParams::default(),
-            palette: SeasonalPalette::default(),
+            palettes: vec![MeadowPalette::default()],
             lod: MeadowLodCurve::default(),
             overrides: Vec::new(),
             seed: 0x6D45_5F4D_4541_4400,
@@ -93,55 +98,165 @@ impl Default for WindParams {
     }
 }
 
-/// Four-corner seasonal albedo (linear). The shader blends two corners by
-/// [`MeadowSeasonState`], which `broadcast_season` writes into every
-/// variant's `VariantParams.season_blend`.
+/// Mean of the blade height shade, `mix(0.70, 1.00, y_norm)` in
+/// `meadow_shared.wesl::meadow_blade_base_color`, over the blade. A
+/// patch's mean shaded albedo is its entry's mean albedo times this.
+pub const MEAN_BLADE_SHADE: f32 = 0.85;
+
+/// Share of the dead coverage carried by dead patches when the entry has
+/// them; single dead blades carry the rest.
+const DEAD_PATCH_SPLIT: f32 = 0.5;
+
+/// Width of the soft dead-patch edge, in the uniform patch noise's
+/// `[0, 1]` range.
+const DEAD_PATCH_EDGE: f32 = 0.1;
+
+/// Largest height variance: keeps every blade at least 10 % of its height.
+const MAX_HEIGHT_VARIANCE: f32 = 0.9;
+
+/// One entry of a variant's palette table: the blade colours and the
+/// variance amounts for the patches that select it. Engine-generic: the
+/// consumer decides what an entry stands for and rewrites the table as its
+/// own state (calendar, climate) moves.
+///
+/// Blades vary around the entry with zero mean (`meadow_shared.wesl`), so
+/// a patch's coverage-weighted mean albedo is [`Self::mean_albedo`] and its
+/// mean blade height the variant's unvaried `height_range`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SeasonalPalette {
-    pub spring: Vec3,
-    pub summer: Vec3,
-    pub autumn: Vec3,
-    pub winter: Vec3,
+pub struct MeadowPalette {
+    /// Live blade albedo, linear.
+    pub live: Vec3,
+    /// Dry or dead blade albedo, linear.
+    pub dry: Vec3,
+    /// Expected share of dead blades in `[0, 1]`: half in small dead patches
+    /// (when `dead_patch_size > 0`), the rest as single dead blades.
+    pub dead_share: f32,
+    /// Per-blade hue and value jitter: a value scale of `1 ± color_jitter`
+    /// and a hue rotation of up to `color_jitter` radians.
+    pub color_jitter: f32,
+    /// Per-blade and per-patch height variance: blade heights scale by
+    /// `1 ± height_variance`, clamped to `[0, 0.9]`.
+    pub height_variance: f32,
+    /// World-space size of the dead-patch noise in metres; 0 leaves only
+    /// single dead blades.
+    pub dead_patch_size: f32,
 }
 
-impl SeasonalPalette {
-    /// The corner for a [`MeadowSeasonState`] index: 0 spring, 1 summer,
-    /// 2 autumn, anything else winter (the shader's mapping).
-    pub fn corner(&self, idx: u32) -> Vec3 {
-        match idx {
-            0 => self.spring,
-            1 => self.summer,
-            2 => self.autumn,
-            _ => self.winter,
-        }
+impl MeadowPalette {
+    /// The coverage-weighted mean albedo: `mix(live, dry, dead_share)`.
+    pub fn mean_albedo(&self) -> Vec3 {
+        self.live.lerp(self.dry, self.dead_share.clamp(0.0, 1.0))
     }
 
-    /// The blended albedo the shader's `season_palette_of` produces for
-    /// `season`.
-    pub fn at(&self, season: &MeadowSeasonState) -> Vec3 {
-        self.corner(season.from_idx)
-            .lerp(self.corner(season.to_idx), season.blend_t.clamp(0.0, 1.0))
+    /// The mean albedo under the blade height shade ([`MEAN_BLADE_SHADE`]):
+    /// the colour a patch averages to on screen.
+    pub fn shaded_mean_albedo(&self) -> Vec3 {
+        self.mean_albedo() * MEAN_BLADE_SHADE
     }
 
-    /// Every corner multiplied by `scale`.
-    pub fn scaled(&self, scale: f32) -> Self {
-        Self {
-            spring: self.spring * scale,
-            summer: self.summer * scale,
-            autumn: self.autumn * scale,
-            winter: self.winter * scale,
+    /// The entry as the shaders read it. Dead patches take
+    /// `DEAD_PATCH_SPLIT` of the dead share and single blades the
+    /// rest, at the thresholds that make the expected dead weight equal
+    /// `dead_share`; the patch edge is no wider than twice the patch share,
+    /// so its soft ramp stays inside the noise range.
+    pub fn params(&self) -> PaletteParams {
+        let share = self.dead_share.clamp(0.0, 1.0);
+        let (frequency, patch_share) = if self.dead_patch_size > 0.0 {
+            (self.dead_patch_size.recip(), share * DEAD_PATCH_SPLIT)
+        } else {
+            (0.0, 0.0)
+        };
+        // Expected weight: patch + (1 - patch) * blade = share.
+        let blade_share = (share - patch_share) / (1.0 - patch_share).max(1e-4);
+        let edge = DEAD_PATCH_EDGE.min(2.0 * patch_share).max(1e-4);
+        // Without patches the threshold sits past the noise range, so no
+        // root is in a patch.
+        let threshold = if patch_share > 0.0 {
+            1.0 - patch_share
+        } else {
+            2.0
+        };
+        PaletteParams {
+            live_jitter: self.live.extend(self.color_jitter.max(0.0)),
+            dry_blade_share: self.dry.extend(blade_share),
+            variance: Vec4::new(
+                self.height_variance.clamp(0.0, MAX_HEIGHT_VARIANCE),
+                frequency,
+                threshold,
+                edge.recip(),
+            ),
         }
     }
 }
 
-impl Default for SeasonalPalette {
+impl Default for MeadowPalette {
+    /// A uniform summer green: no dead blades, no jitter, no height variance.
     fn default() -> Self {
+        let live = Vec3::new(0.18, 0.32, 0.11);
         Self {
-            spring: Vec3::new(0.16, 0.30, 0.09),
-            summer: Vec3::new(0.18, 0.32, 0.11),
-            autumn: Vec3::new(0.36, 0.28, 0.10),
-            winter: Vec3::new(0.55, 0.55, 0.55),
+            live,
+            dry: live,
+            dead_share: 0.0,
+            color_jitter: 0.0,
+            height_variance: 0.0,
+            dead_patch_size: 0.0,
         }
+    }
+}
+
+/// Panics unless a palette table of `len` entries fits the shader table.
+fn assert_table_len(len: usize) {
+    assert!(
+        (1..=MAX_MEADOW_PALETTES).contains(&len),
+        "a meadow palette table holds 1..={MAX_MEADOW_PALETTES} entries, got {len}"
+    );
+}
+
+/// The shader table for `palettes`: entry `i` at slot `i`, the last entry
+/// repeated through the remaining slots so any index the CPU clamps into
+/// the table reads a written entry.
+///
+/// # Panics
+///
+/// If `palettes` is empty or longer than [`MAX_MEADOW_PALETTES`].
+pub fn palette_table(palettes: &[MeadowPalette]) -> [PaletteParams; MAX_MEADOW_PALETTES] {
+    assert_table_len(palettes.len());
+    let last = palettes[palettes.len() - 1];
+    std::array::from_fn(|i| palettes.get(i).unwrap_or(&last).params())
+}
+
+/// The current palette table of every variant whose consumer rewrites it;
+/// a variant without an entry keeps the table it registered with
+/// ([`MeadowVariant::palettes`]). Separate from [`MeadowVariantRegistry`]
+/// so a table write (a calendar hour, a look slider) leaves the
+/// registry's dependants — patch lists, broadcasts, render drivers — idle;
+/// only the variant's palette buffer and its Solari caster colours update.
+#[derive(Resource, Default)]
+pub struct MeadowPalettes {
+    tables: HashMap<MeadowVariantId, Vec<MeadowPalette>>,
+}
+
+impl MeadowPalettes {
+    /// Replace `id`'s table.
+    ///
+    /// # Panics
+    ///
+    /// If `palettes` is empty or longer than [`MAX_MEADOW_PALETTES`].
+    pub fn set(&mut self, id: MeadowVariantId, palettes: &[MeadowPalette]) {
+        assert_table_len(palettes.len());
+        self.tables.insert(id, palettes.to_vec());
+    }
+
+    /// `id`'s current table: the last one [`Self::set`], else `variant`'s
+    /// registered table.
+    pub fn current<'a>(
+        &'a self,
+        id: MeadowVariantId,
+        variant: &'a MeadowVariant,
+    ) -> &'a [MeadowPalette] {
+        self.tables
+            .get(&id)
+            .map_or(&variant.palettes, Vec::as_slice)
     }
 }
 
@@ -223,12 +338,18 @@ impl MeadowVariantRegistry {
     /// Register a new variant. Allocates the per-variant
     /// `MeadowMaterial` and its `patches` / `trunk_slots` storage
     /// buffers.
+    ///
+    /// # Panics
+    ///
+    /// If `variant.palettes` is empty or longer than
+    /// [`MAX_MEADOW_PALETTES`].
     pub fn register(
         &mut self,
         variant: MeadowVariant,
         meadow_materials: &mut Assets<MeadowMaterial>,
         shader_buffers: &mut Assets<ShaderBuffer>,
     ) -> MeadowVariantId {
+        assert_table_len(variant.palettes.len());
         let id = MeadowVariantId(self.next_id);
         self.next_id += 1;
 
@@ -269,42 +390,6 @@ impl MeadowVariantRegistry {
         id
     }
 
-    /// Replace a registered variant's seasonal palette and push it into the
-    /// variant's material. Returns `false` for an unknown id. The material
-    /// is written only when the palette differs, so an unchanged palette
-    /// does not re-extract it.
-    pub fn set_palette(
-        &mut self,
-        id: MeadowVariantId,
-        palette: SeasonalPalette,
-        meadow_materials: &mut Assets<MeadowMaterial>,
-    ) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        entry.variant.palette = palette;
-        let params = palette_params(&palette);
-        if let Some(mut mat) = meadow_materials.get_mut(&entry.material) {
-            let current = &mat.extension.variant_params;
-            if [
-                current.palette_spring,
-                current.palette_summer,
-                current.palette_autumn,
-                current.palette_winter,
-            ] != params
-            {
-                let p = &mut mat.extension.variant_params;
-                [
-                    p.palette_spring,
-                    p.palette_summer,
-                    p.palette_autumn,
-                    p.palette_winter,
-                ] = params;
-            }
-        }
-        true
-    }
-
     pub fn get(&self, id: MeadowVariantId) -> Option<&RegisteredVariant> {
         self.entries.get(&id)
     }
@@ -318,24 +403,7 @@ impl MeadowVariantRegistry {
     }
 }
 
-/// `VariantParams.palette_{spring,summer,autumn,winter}` for `palette`.
-fn palette_params(palette: &SeasonalPalette) -> [Vec4; 4] {
-    [
-        palette.spring,
-        palette.summer,
-        palette.autumn,
-        palette.winter,
-    ]
-    .map(|c| c.extend(0.0))
-}
-
 fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
-    let [
-        palette_spring,
-        palette_summer,
-        palette_autumn,
-        palette_winter,
-    ] = palette_params(&variant.palette);
     // `wind_direction` / `wind_state` come from `VariantParams::default()`
     // so the freshly-registered variant has sane values before the
     // broadcast systems run for the first time.
@@ -343,11 +411,6 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
         height_range: Vec4::new(variant.height_range.0, variant.height_range.1, 0.0, 0.0),
         width_range: Vec4::new(variant.width_range.0, variant.width_range.1, 0.0, 0.0),
         wind: Vec4::new(variant.wind.amplitude, variant.wind.period, 0.0, 0.0),
-        palette_spring,
-        palette_summer,
-        palette_autumn,
-        palette_winter,
-        season_blend: Vec4::new(0.0, 1.0, 0.0, 0.0),
         // `x = full_distance`, `y = max_view_distance`,
         // `z = rim_falloff_fraction`, `w = unused`. The shader's
         // per-blade hash gate uses these to taper density linearly
@@ -498,33 +561,6 @@ pub struct MeadowPatch {
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct PatchAudioTag(pub Option<&'static str>);
 
-/// World-level seasonal blend state. The consumer (which owns its
-/// own `WorldClock` / season concept) writes to this resource; the
-/// meadow plugin's `broadcast_season` system reads it on change
-/// and writes the blend into every variant's
-/// `VariantParams.season_blend`.
-///
-/// `from_idx` / `to_idx`: 0 = spring, 1 = summer, 2 = autumn, 3 =
-/// winter. `blend_t` ∈ [0, 1] from the `from` corner toward `to`.
-#[derive(Resource, Debug, Clone, Copy)]
-pub struct MeadowSeasonState {
-    pub from_idx: u32,
-    pub to_idx: u32,
-    pub blend_t: f32,
-}
-
-impl Default for MeadowSeasonState {
-    fn default() -> Self {
-        // Summer-locked default — pleasant baseline if no consumer
-        // is feeding seasonal state in.
-        Self {
-            from_idx: 1,
-            to_idx: 1,
-            blend_t: 0.0,
-        }
-    }
-}
-
 /// Plug everything in.
 pub struct MeadowPlugin;
 
@@ -546,6 +582,7 @@ impl Plugin for MeadowPlugin {
         app.add_plugins(crate::render::MeadowRenderPlugin);
 
         app.init_resource::<MeadowVariantRegistry>();
+        app.init_resource::<MeadowPalettes>();
         app.init_resource::<WindDirection>();
         app.init_resource::<MeadowWindFreeze>();
         app.init_resource::<MeadowSolariGeometryNormals>();
@@ -555,7 +592,6 @@ impl Plugin for MeadowPlugin {
                 .before(bevy::asset::AssetEventSystems),
         );
         app.init_resource::<MeadowWindState>();
-        app.init_resource::<MeadowSeasonState>();
         app.init_resource::<MeadowHeightfield>();
         app.init_resource::<MeadowViewer>();
 
@@ -571,7 +607,6 @@ impl Plugin for MeadowPlugin {
                     .run_if(resource_changed::<WindDirection>.or_eager(registered)),
                 broadcast_wind_state
                     .run_if(resource_changed::<MeadowWindState>.or_eager(registered)),
-                broadcast_season.run_if(resource_changed::<MeadowSeasonState>.or_eager(registered)),
                 broadcast_heightfield
                     .run_if(resource_changed::<MeadowHeightfield>.or_eager(registered)),
                 broadcast_viewer.run_if(resource_changed::<MeadowViewer>.or_eager(registered)),
@@ -636,32 +671,6 @@ fn spawn_meadow_render_drivers(
             NoFrustumCulling,
             NoAutomaticBatching,
         ));
-    }
-}
-
-/// Push `MeadowSeasonState` into every registered variant's
-/// material. Runs only on `Changed<MeadowSeasonState>` — the
-/// consumer's clock-bridge system writes the resource at most
-/// once per virtual hour.
-fn broadcast_season(
-    season: Res<MeadowSeasonState>,
-    registry: Res<MeadowVariantRegistry>,
-    mut materials: ResMut<Assets<MeadowMaterial>>,
-) {
-    let blend = Vec4::new(
-        season.from_idx as f32,
-        season.to_idx as f32,
-        season.blend_t.clamp(0.0, 1.0),
-        0.0,
-    );
-    for (_, entry) in registry.iter() {
-        // Compare before writing — a same-value `get_mut` deref still
-        // fires `AssetEvent::Modified` and forces a needless re-extract.
-        if let Some(mut mat) = materials.get_mut(&entry.material)
-            && mat.extension.variant_params.season_blend != blend
-        {
-            mat.extension.variant_params.season_blend = blend;
-        }
     }
 }
 
@@ -759,6 +768,15 @@ fn broadcast_heightfield(
     }
 }
 
+/// `PatchData` flag bits carrying a patch's palette index (bits 8..15),
+/// read back by `meadow_patch_palette` in `meadow_shared.wesl`.
+const PALETTE_FLAG_SHIFT: u32 = 8;
+
+/// The flags word for a patch selecting `palette`, clamped into the table.
+fn palette_flags(palette: u32) -> u32 {
+    palette.min(MAX_MEADOW_PALETTES as u32 - 1) << PALETTE_FLAG_SHIFT
+}
+
 /// Helper: write a placement list into a variant's `patches` storage
 /// buffer. Called from the consumer's `enter_world` after
 /// `place_patches` returns. The consumer is expected to spawn
@@ -790,7 +808,7 @@ pub fn upload_placements(
         // it back. This dance is needed because `PatchData` carries
         // four floats per row.
         let seed_f = f32::from_bits(p.seed);
-        let flags = 0u32;
+        let flags = palette_flags(p.palette);
         rows.push(PatchData {
             centre_xz_radius_seed: Vec4::new(p.centre.x, p.centre.y, p.radius, seed_f),
             blade_count_noise_canopy_flags: Vec4::new(
@@ -933,5 +951,169 @@ fn broadcast_solari_geometry_normals(
         {
             mat.extension.variant_params.width_range.z = marker;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::render::render_resource::ShaderType;
+
+    use super::*;
+
+    /// The Rust layouts match the WGSL mirrors in `meadow_shared.wesl`, and
+    /// both derivation kernels bind a table of `MAX_MEADOW_PALETTES`.
+    #[test]
+    fn layouts_match_the_shaders() {
+        assert_eq!(PaletteParams::min_size().get(), 48);
+        assert_eq!(size_of::<PaletteParams>(), 48);
+        assert_eq!(VariantParams::min_size().get(), 11 * 16);
+        let shared = include_str!("meadow_shared.wesl");
+        assert!(
+            shared.contains(&format!(
+                "const MEADOW_MAX_PALETTES: u32 = {MAX_MEADOW_PALETTES}u;"
+            )),
+            "MEADOW_MAX_PALETTES drifted from MAX_MEADOW_PALETTES"
+        );
+        let table = format!("array<PaletteParams, {MAX_MEADOW_PALETTES}>");
+        for (name, source) in [
+            ("meadow_compute.wesl", include_str!("meadow_compute.wesl")),
+            (
+                "meadow_mesh_bindings.wesl",
+                include_str!("meadow_mesh_bindings.wesl"),
+            ),
+        ] {
+            assert!(source.contains(&table), "{name}'s table length drifted");
+        }
+    }
+
+    #[test]
+    fn palette_entry_packs_into_its_lanes() {
+        let palette = MeadowPalette {
+            live: Vec3::new(0.06, 0.11, 0.03),
+            dry: Vec3::new(0.21, 0.17, 0.09),
+            dead_share: 0.25,
+            color_jitter: 0.08,
+            height_variance: 1.5,
+            dead_patch_size: 4.0,
+        };
+        let params = palette.params();
+        assert_eq!(params.live_jitter, Vec4::new(0.06, 0.11, 0.03, 0.08));
+        assert_eq!(params.dry_blade_share.truncate(), palette.dry);
+        // Height variance clamps; the noise frequency is 1 / patch size.
+        assert_eq!(params.variance.x, 0.9);
+        assert_eq!(params.variance.y, 0.25);
+        // Half the share in patches (threshold 1 - 0.125, edge 0.1), the
+        // rest in single blades: the expected dead weight is the share.
+        assert!((params.variance.z - 0.875).abs() < 1e-6);
+        assert!((params.variance.w - 10.0).abs() < 1e-4);
+        let blade_share = params.dry_blade_share.w;
+        assert!((0.125 + 0.875 * blade_share - 0.25).abs() < 1e-6);
+    }
+
+    /// The bytes the palette buffer uploads hold each lane in WGSL field
+    /// order, `r, g, b` first: the shader reads a channel-swapped or
+    /// shuffled table as a wrong colour, not an error.
+    #[test]
+    fn palette_bytes_follow_the_wgsl_lane_order() {
+        let palette = MeadowPalette {
+            live: Vec3::new(0.19, 0.155, 0.085),
+            dry: Vec3::new(0.15, 0.128, 0.08),
+            dead_share: 0.0,
+            color_jitter: 0.04,
+            height_variance: 0.1,
+            dead_patch_size: 0.0,
+        };
+        let table = palette_table(&[palette]);
+        let lanes: &[f32] = bytemuck::cast_slice(&table[..1]);
+        assert_eq!(
+            lanes[..8],
+            [0.19, 0.155, 0.085, 0.04, 0.15, 0.128, 0.08, 0.0]
+        );
+        assert_eq!(lanes[8], 0.1);
+        assert_eq!(size_of_val(&table), 48 * MAX_MEADOW_PALETTES);
+    }
+
+    /// Without patches every dead blade is single and no root crosses the
+    /// patch threshold.
+    #[test]
+    fn palette_without_patches_kills_single_blades_only() {
+        let params = MeadowPalette {
+            dead_share: 0.3,
+            dead_patch_size: 0.0,
+            ..MeadowPalette::default()
+        }
+        .params();
+        assert_eq!(params.variance.y, 0.0);
+        assert!(params.variance.z > 1.0);
+        assert!((params.dry_blade_share.w - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mean_albedo_weights_dry_by_the_dead_share() {
+        let palette = MeadowPalette {
+            live: Vec3::new(0.1, 0.2, 0.0),
+            dry: Vec3::new(0.3, 0.2, 0.2),
+            dead_share: 0.25,
+            ..MeadowPalette::default()
+        };
+        assert!(
+            palette
+                .mean_albedo()
+                .abs_diff_eq(Vec3::new(0.15, 0.2, 0.05), 1e-6)
+        );
+        assert!(
+            palette
+                .shaded_mean_albedo()
+                .abs_diff_eq(palette.mean_albedo() * MEAN_BLADE_SHADE, 1e-6)
+        );
+    }
+
+    /// Slots past the table repeat its last entry, so an index the CPU
+    /// clamps into the table never reads an unwritten entry.
+    #[test]
+    fn palette_table_repeats_the_last_entry() {
+        let a = MeadowPalette::default();
+        let b = MeadowPalette {
+            dead_share: 0.5,
+            ..a
+        };
+        let table = palette_table(&[a, b]);
+        assert_eq!(table[0], a.params());
+        assert!(table[1..].iter().all(|p| *p == b.params()));
+    }
+
+    #[test]
+    #[should_panic(expected = "1..=64 entries")]
+    fn palette_table_rejects_an_empty_table() {
+        palette_table(&[]);
+    }
+
+    /// A variant reads its registered table until the consumer sets one.
+    #[test]
+    fn current_palettes_fall_back_to_the_registered_table() {
+        let variant = MeadowVariant::default();
+        let id = MeadowVariantId(3);
+        let mut palettes = MeadowPalettes::default();
+        assert_eq!(palettes.current(id, &variant), variant.palettes.as_slice());
+        let dry = MeadowPalette {
+            dead_share: 1.0,
+            ..MeadowPalette::default()
+        };
+        palettes.set(id, &[dry, dry]);
+        assert_eq!(palettes.current(id, &variant), [dry, dry].as_slice());
+        assert_eq!(
+            palettes.current(MeadowVariantId(4), &variant),
+            variant.palettes.as_slice()
+        );
+    }
+
+    /// The palette index sits in bits 8..15, clear of the audio bit, and is
+    /// clamped into the table.
+    #[test]
+    fn palette_index_packs_into_the_flag_bits() {
+        assert_eq!(palette_flags(0), 0);
+        assert_eq!(palette_flags(5), 5 << 8);
+        assert_eq!(palette_flags(1000), (MAX_MEADOW_PALETTES as u32 - 1) << 8);
+        assert_eq!(palette_flags(MAX_MEADOW_PALETTES as u32 - 1) & 1, 0);
     }
 }

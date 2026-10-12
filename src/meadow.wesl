@@ -47,7 +47,8 @@ import bevy_pbr::render::{
 
 import bevy_meadow::meadow_shared::{
     VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, tuft_local_position,
-    wind_sway, season_palette_of, meadow_shading_normal,
+    wind_sway, meadow_shading_normal, meadow_unpack_albedo, meadow_blade_base_color,
+    meadow_blade_emissive,
 };
 
 // Wind time comes from bevy's globals uniform (`globals.time`, wrapped
@@ -68,7 +69,7 @@ import bevy_pbr::render::mesh_view_bindings::globals;
 
 // ---------- Bindings ----------
 
-// Per-variant params (wind + season). `patches`/`trunk_slots`/
+// Per-variant params (wind, LOD). `patches`/`trunk_slots`/
 // `heightfield` (material bindings 101/102/105) are still declared by
 // the `MeadowExt` `AsBindGroup` so the GPU buffers exist for the
 // compute pass to read — but this raster shader no longer references
@@ -101,16 +102,6 @@ fn wind_displacement(world_xz: vec2<f32>, blade_y_norm: f32, t: f32, clump: f32)
     );
 }
 
-fn season_palette() -> vec3<f32> {
-    return season_palette_of(
-        variant_params.season_blend,
-        variant_params.palette_spring,
-        variant_params.palette_summer,
-        variant_params.palette_autumn,
-        variant_params.palette_winter,
-    );
-}
-
 // ---------- Vertex shader ----------
 
 @vertex
@@ -133,7 +124,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     // Reconstruct a `BladeAttrs` for the local geometry + the
     // downstream conditional blocks (`rim_factor` is irrelevant here —
     // it's already folded into `rec.collapse_t`).
-    let blade = BladeAttrs(rec.world_root_xz, rec.yaw, rec.height, rec.width, rec.clump_seed, 1.0);
+    let blade = BladeAttrs(rec.world_root_xz, rec.yaw, rec.height, rec.width, rec.clump_seed, 1.0, 0u);
     let ground_y = rec.ground_y;
     let collapse_t = rec.collapse_t;
 
@@ -206,10 +197,12 @@ fn vertex(in: Vertex) -> VertexOutput {
 @if(VERTEX_UVS_B)
     out.uv_b = blade.world_xz;
 
-@if(VERTEX_COLORS) {
-    let lum = 0.85 + 0.30 * blade.clump_seed;
-    out.color = vec4<f32>(lum, lum, lum, 1.0);
-}
+// The blade albedo, resolved once per blade by the compute kernel. The
+// template mesh carries a white COLOR attribute so the permutations that
+// shade have this varying; `pbr_input_from_standard_material` takes it as
+// the base colour. Depth, normal and motion-vector prepasses never read it.
+@if(VERTEX_COLORS && (!PREPASS_PIPELINE || DEFERRED_PREPASS))
+    out.color = vec4<f32>(meadow_unpack_albedo(rec.albedo), 1.0);
 
 @if(VERTEX_OUTPUT_INSTANCE_INDEX)
     out.instance_index = in.instance_index;
@@ -254,16 +247,15 @@ fn fragment(
     return out;
 }
 
-@if(!PREPASS_PIPELINE)
+// Shared by the forward fragment and the deferred/normal prepass fragment.
+@if(!PREPASS_PIPELINE || (PREPASS_FRAGMENT && NORMAL_PREPASS_OR_DEFERRED_PREPASS))
 fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
     (*pbr_input).world_normal = meadow_shading_normal((*pbr_input).V);
     (*pbr_input).N = (*pbr_input).world_normal;
-    let blade_lum = (*pbr_input).material.base_color.rgb;
-    let palette = season_palette();
-    let shade = mix(0.70, 1.00, in.uv.y);
-    (*pbr_input).material.base_color = vec4<f32>(palette * shade * blade_lum, 1.0);
-    let tip_glow = smoothstep(0.7, 1.0, in.uv.y) * 0.06;
-    (*pbr_input).material.emissive = vec4<f32>(palette * tip_glow, 1.0);
+    // Vertex colour times the white material base: the blade albedo.
+    let albedo = (*pbr_input).material.base_color.rgb;
+    (*pbr_input).material.base_color = vec4<f32>(meadow_blade_base_color(albedo, in.uv.y), 1.0);
+    (*pbr_input).material.emissive = vec4<f32>(meadow_blade_emissive(albedo, in.uv.y), 1.0);
     // Patch over the garbage `pbr_input.flags` that
     // `pbr_input_from_vertex_output` reads from `mesh[in.instance_index]`.
     // `instance_index` is the per-(view, band) base + survivor ordinal,
@@ -273,7 +265,9 @@ fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
     // `MESH_FLAGS_SHADOW_RECEIVER_BIT` set, causing `apply_pbr_lighting`
     // to skip `fetch_directional_shadow` (gated on that bit in
     // `pbr_functions.wesl`), leaving blades fully lit. Force the bit
-    // on so grass receives tree / terrain shadows.
+    // on so grass receives tree / terrain shadows. `deferred_output` packs
+    // the bit into the G-buffer (`deferred/types.wesl`), and the deferred
+    // lighting pass unpacks it before sampling shadows.
     (*pbr_input).flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;
 }
 
@@ -308,20 +302,4 @@ fn fragment(
     var stub: FragmentOutput;
     return stub;
 }
-}
-
-@if(PREPASS_PIPELINE && PREPASS_FRAGMENT && NORMAL_PREPASS_OR_DEFERRED_PREPASS)
-fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
-    (*pbr_input).world_normal = meadow_shading_normal((*pbr_input).V);
-    (*pbr_input).N = (*pbr_input).world_normal;
-    let blade_lum = (*pbr_input).material.base_color.rgb;
-    let palette = season_palette();
-    let shade = mix(0.70, 1.00, in.uv.y);
-    (*pbr_input).material.base_color = vec4<f32>(palette * shade * blade_lum, 1.0);
-    let tip_glow = smoothstep(0.7, 1.0, in.uv.y) * 0.06;
-    (*pbr_input).material.emissive = vec4<f32>(palette * tip_glow, 1.0);
-    // Same shadow-receiver patch as the forward path — `deferred_output`
-    // packs the bit into the GBuffer (`deferred/types.wesl`), and
-    // the deferred lighting pass unpacks it before sampling shadows.
-    (*pbr_input).flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;
 }

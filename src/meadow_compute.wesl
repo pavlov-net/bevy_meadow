@@ -14,10 +14,13 @@
 // blades in steps of 256.
 
 import bevy_meadow::meadow_shared::{
-    VariantParams, CompactedBladeRecord, BladeAttrs, local_blade_position, wind_sway,
+    VariantParams, PaletteParams, MEADOW_MAX_PALETTES, CompactedBladeRecord, BladeAttrs,
+    local_blade_position, wind_sway, hash_u32, hash01_u32, hash01_pair, meadow_patch_palette,
+    meadow_max_height_scale, meadow_patch_noise, meadow_blade_height_scale, meadow_blade_albedo,
+    meadow_pack_albedo,
 };
 
-// ---------- compute-only structs + helpers ----------
+// ---------- compute-only structs ----------
 // These live here, not in `meadow_shared`, because only this kernel
 // uses them.
 
@@ -77,25 +80,6 @@ struct MeadowViewCullData {
     views: array<MeadowViewCull, 6>,
 }
 
-fn hash_u32(v: u32) -> u32 {
-    var x = v;
-    x = x ^ (x >> 16u);
-    x = x * 0x7feb352du;
-    x = x ^ (x >> 15u);
-    x = x * 0x846ca68bu;
-    x = x ^ (x >> 16u);
-    return x;
-}
-
-fn hash01_u32(v: u32) -> f32 {
-    return f32(hash_u32(v) & 0x00FFFFFFu) / f32(0x01000000u);
-}
-
-fn hash01_pair(a: u32, b: u32) -> f32 {
-    let h = hash_u32(a ^ (b * 0x9E3779B9u));
-    return f32(h & 0x00FFFFFFu) / f32(0x01000000u);
-}
-
 // Distance-ramped shadow-caster density: full within
 // `variant_params.density.z` (shadow_full_dist) of the player, ramping to
 // `variant_params.density.w` (shadow_far_density) by the cascade's far
@@ -114,6 +98,8 @@ fn hash01_pair(a: u32, b: u32) -> f32 {
 @group(0) @binding(6) var<storage, read_write> out_blades: array<CompactedBladeRecord>;
 @group(0) @binding(7) var<storage, read_write> cursors: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read_write> indirect: array<DrawIndexedIndirectArgs>;
+// The variant's palette table; each patch indexes it by its flags.
+@group(0) @binding(14) var<storage, read> palettes: array<PaletteParams, 64>;
 
 // ---------- workgroup-aggregated compaction scratch ----------
 // One global `atomicAdd` on `cursors[view]` per surviving blade was the
@@ -174,7 +160,7 @@ fn derive_blade(blade_idx: u32, p: PatchData) -> BladeAttrs {
         rim_factor = 0.0;
     }
 
-    return BladeAttrs(centre + sample, yaw, height, width, clump_seed, rim_factor);
+    return BladeAttrs(centre + sample, yaw, height, width, clump_seed, rim_factor, blade_seed);
 }
 
 fn blade_visibility(root_xz: vec2<f32>, patch_idx: u32) -> f32 {
@@ -279,7 +265,8 @@ fn cull_and_compact(
     // Patch-level frustum reject (uniform across the workgroup).
     let centre_xz = p.centre_xz_radius_seed.xy;
     let centre_y = sample_heightfield(centre_xz);
-    let max_h = variant_params.height_range.y;
+    let palette = palettes[meadow_patch_palette(p.blade_count_noise_canopy_flags.w)];
+    let max_h = variant_params.height_range.y * meadow_max_height_scale(palette);
     let edge_noise = p.blade_count_noise_canopy_flags.y;
     let cull_radius = p.centre_xz_radius_seed.z * (1.0 + edge_noise) + max_h * 2.0;
     if (patch_sphere_culled(vec3<f32>(centre_xz.x, centre_y, centre_xz.y), cull_radius, vc, is_shadow)) {
@@ -410,9 +397,10 @@ fn cull_and_compact(
                 let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
                 if (cast_ok && collapse_t > 1e-4) {
                     let ground_y = sample_heightfield(blade.world_xz) + 0.02;
+                    let noise = meadow_patch_noise(palette, blade.world_xz);
                     // Far-band tufts fade height to zero near `max_view` so the
                     // band dissolves into the ground instead of ending hard.
-                    var h = blade.height;
+                    var h = blade.height * meadow_blade_height_scale(palette, noise, blade.seed);
                     if (band == 1u) {
                         h = h * tuft_height_scale;
                     }
@@ -427,7 +415,11 @@ fn cull_and_compact(
                     // comes entirely from the wind delta, recomputed in the VS.
                     rec.prev_root_xz = blade.world_xz;
                     rec.prev_ground_y = ground_y;
-                    rec.pad = 0.0;
+                    // Shadow views draw depth only; their records skip the colour.
+                    rec.albedo = 0u;
+                    if (!is_shadow) {
+                        rec.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
+                    }
                     survived = true;
                 }
             }
@@ -538,6 +530,7 @@ fn rt_pack_vertex(
     cy: f32,
     sy: f32,
     wind_tip: vec2<f32>,
+    palette_u: f32,
 ) -> RtVertex {
     let rotated_x = cy * local.x + sy * local.z;
     let rotated_z = -sy * local.x + cy * local.z;
@@ -548,9 +541,12 @@ fn rt_pack_vertex(
     let final_xz = mix(blade.world_xz, target_world_xz, collapse_t);
     let final_y = mix(ground_y, blade_world_y, collapse_t);
     var v: RtVertex;
-    // normal = (0,1,0), uv = (0, y_norm), tangent = (1,0,0,1) — matches meadow.wesl.
+    // normal = (0,1,0), uv = (palette_u, y_norm), tangent = (1,0,0,1). The
+    // caster material's base colour texture holds one texel per palette
+    // entry, so `palette_u` (the entry's texel centre) gives each blade its
+    // patch's mean colour.
     v.a = vec4<f32>(final_xz.x, final_y, final_xz.y, 0.0);
-    v.b = vec4<f32>(1.0, 0.0, 0.0, y_norm);
+    v.b = vec4<f32>(1.0, 0.0, palette_u, y_norm);
     v.tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
     return v;
 }
@@ -570,10 +566,16 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
     var blade: BladeAttrs;
     var ground_y = 0.0;
     var collapse = 0.0;
+    var palette_u = 0.0;
     let occupied = key.x != 0xFFFFFFFFu;
     if (occupied) {
         let p = patches[key.x];
         blade = derive_blade(key.y, p);
+        let palette_index = meadow_patch_palette(p.blade_count_noise_canopy_flags.w);
+        let palette = palettes[palette_index];
+        blade.height = blade.height
+            * meadow_blade_height_scale(palette, meadow_patch_noise(palette, blade.world_xz), blade.seed);
+        palette_u = (f32(palette_index) + 0.5) / f32(MEADOW_MAX_PALETTES);
         let dist = length(rt_params.zw - blade.world_xz);
         let transition = smoothstep(rt_params.x, max(rt_params.y, rt_params.x + 0.01), dist);
         let seed = bitcast<u32>(p.centre_xz_radius_seed.w);
@@ -600,7 +602,7 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
             }
             // Suppressed owners retain finite, collapsed vertices. History
             // cannot accidentally sample NaN positions during a fade.
-            vertex = rt_pack_vertex(local, blade, ground_y, collapse, cy, sy, wind_tip);
+            vertex = rt_pack_vertex(local, blade, ground_y, collapse, cy, sy, wind_tip, palette_u);
         }
         if (near) { rt_verts_near[slot * count + vi] = vertex; }
         else { rt_verts_far[slot * count + vi] = vertex; }

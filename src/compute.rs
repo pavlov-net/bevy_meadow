@@ -51,12 +51,15 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderStartup, RenderSystem
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::material::{MeadowMaterial, VariantParams};
+use crate::material::{MAX_MEADOW_PALETTES, MeadowMaterial, PaletteParams, VariantParams};
 use crate::mesh::{
     BLADE_RECORD_SIZE, INDIRECT_ARGS_SIZE, MEADOW_MAX_BANDS, MEADOW_MAX_VIEWS, MESH_TASK_BLADES,
     SHADOW_MAX_DIST,
 };
-use crate::plugin::{MeadowPatch, MeadowVariantId, MeadowVariantRegistry, MeadowViewer};
+use crate::plugin::{
+    MeadowPalettes, MeadowPatch, MeadowVariantId, MeadowVariantRegistry, MeadowViewer,
+    palette_table,
+};
 use crate::render::{MeadowRenderDriver, RenderMeadowMeshIds};
 use crate::rt_selection::{INACTIVE as RT_VACANT_SLOT, RT_NEAR_DISTANCE, RtSelection};
 
@@ -494,6 +497,8 @@ pub struct ExtractedVariant {
     pub trunk_slots: AssetId<bevy::render::storage::ShaderBuffer>,
     pub heightfield: AssetId<Image>,
     pub variant_params: VariantParams,
+    /// The variant's palette table. Replaced only when its contents change.
+    pub palettes: PaletteTable,
     /// Replaced only when its contents change.
     pub active_patches: Arc<Vec<u32>>,
     /// Mesh-path task work list: `(patch_index, slice_base)` per
@@ -541,14 +546,14 @@ pub struct MeadowComputePipeline {
 }
 
 /// Identity fingerprint of the resources a variant's compute bind group
-/// binds: the 8 storage/uniform buffers (vp uniform, patches, trunk_slots,
-/// view_cull, active_patches, blades, cursors, indirect) plus the
+/// binds: the 9 storage/uniform buffers (vp uniform, patches, trunk_slots,
+/// view_cull, active_patches, blades, cursors, indirect, palettes) plus the
 /// heightfield texture view. A bind group references resources by handle,
 /// not contents, so `queue.write_buffer` doesn't invalidate it — only a
 /// realloc/grow of one of our buffers, a heightfield fallback→resident
 /// flip, or a trunk-slots re-upload changes an id here. Rebuild only when
 /// this differs from the cached value.
-type ComputeBindGroupFingerprint = ([BufferId; 8], TextureViewId);
+type ComputeBindGroupFingerprint = ([BufferId; 9], TextureViewId);
 
 #[derive(Resource, Default)]
 pub struct MeadowComputeBindGroups {
@@ -561,11 +566,27 @@ pub struct MeadowComputeBindGroups {
 #[derive(Resource)]
 pub struct MeadowDrawBindGroupLayout(pub BindGroupLayoutDescriptor);
 
+/// A variant's shader palette table, shared between frames until it
+/// changes.
+pub type PaletteTable = Arc<[PaletteParams; MAX_MEADOW_PALETTES]>;
+
 /// Per-variant `VariantParams` uniform, extracted off the material so
-/// compute can read it at compute group-0 binding 0.
+/// compute can read it at compute group-0 binding 0, and the variant's
+/// palette table, bound beside it by the kernels that derive blades.
 #[derive(Resource, Default)]
 pub struct MeadowVariantParamsBuffers {
-    pub by_variant: HashMap<MeadowVariantId, UniformBuffer<VariantParams>>,
+    pub by_variant: HashMap<MeadowVariantId, VariantParamsGpu>,
+}
+
+/// One variant's [`MeadowVariantParamsBuffers`] entry.
+pub struct VariantParamsGpu {
+    pub params: UniformBuffer<VariantParams>,
+    /// `array<PaletteParams, MAX_MEADOW_PALETTES>`, rewritten only when the
+    /// extracted table changes.
+    pub palettes: Buffer,
+    /// Table last written into `palettes`. Holding the `Arc` keeps its
+    /// pointer from being reused.
+    pub uploaded_palettes: Option<PaletteTable>,
 }
 
 // ---------- plugin wiring ----------
@@ -622,20 +643,25 @@ fn compute_bind_group_layout() -> BindGroupLayoutDescriptor {
     // Compute group 0 — order + types match meadow_compute.wesl exactly.
     // The runtime-array storage buffers use `*_sized(.., None)` since the
     // element type is a WGSL struct, not a Rust `ShaderType`.
+    // Binding 14 (palettes) sits past the RT expansion's 9..=13.
     BindGroupLayoutDescriptor::new(
         "meadow_compute_layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::COMPUTE,
             (
-                uniform_buffer::<VariantParams>(false), // 0 variant_params
-                storage_buffer_read_only_sized(false, None), // 1 patches
-                storage_buffer_read_only_sized(false, None), // 2 trunk_slots
-                texture_2d(TextureSampleType::Float { filterable: false }), // 3 heightfield
-                storage_buffer_read_only::<MeadowViewCullData>(false), // 4 view_cull
-                storage_buffer_read_only_sized(false, None), // 5 active_patches
-                storage_buffer_sized(false, None),      // 6 out_blades (rw)
-                storage_buffer_sized(false, None),      // 7 cursors (rw atomic)
-                storage_buffer_sized(false, None),      // 8 indirect (rw)
+                (0, uniform_buffer::<VariantParams>(false)),
+                (1, storage_buffer_read_only_sized(false, None)), // patches
+                (2, storage_buffer_read_only_sized(false, None)), // trunk_slots
+                (
+                    3,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ), // heightfield
+                (4, storage_buffer_read_only::<MeadowViewCullData>(false)), // view_cull
+                (5, storage_buffer_read_only_sized(false, None)), // active_patches
+                (6, storage_buffer_sized(false, None)),           // out_blades (rw)
+                (7, storage_buffer_sized(false, None)),           // cursors (rw atomic)
+                (8, storage_buffer_sized(false, None)),           // indirect (rw)
+                (14, storage_buffer_read_only_sized(false, None)), // palettes
             ),
         ),
     )
@@ -719,9 +745,11 @@ fn extract_meadow_variants(
         Res<crate::mesh_path::MeadowForceComputePath>,
     >,
     #[cfg(feature = "mesh-shaders")] mesh_path: Res<MeadowMeshPathActive>,
+    meadow_palettes: Extract<Res<MeadowPalettes>>,
     mut out: ResMut<MeadowExtractedVariants>,
     mut selections: Local<HashMap<MeadowVariantId, RtSelectionJob>>,
     mut lists: Local<MeadowPatchLists>,
+    mut palette_tables: Local<HashMap<MeadowVariantId, PaletteTable>>,
 ) {
     let patches_removed = !removed_patches.is_empty();
     removed_patches.clear();
@@ -827,8 +855,19 @@ fn extract_meadow_variants(
                 .get(id)
                 .is_some_and(|l| !l.active_patches.is_empty())
     });
+    // A table write replaces only the tables whose contents changed, so the
+    // render side re-uploads only those.
+    let palettes_changed = meadow_palettes.is_changed() || registry_changed;
+    palette_tables.retain(|id, _| registry.get(*id).is_some());
     // `estimates` was built from this same registry iteration order.
     for ((id, entry), est) in registry.iter().zip(&estimates) {
+        let current = palette_tables.get(id);
+        if palettes_changed || current.is_none() {
+            let table = palette_table(meadow_palettes.current(*id, &entry.variant));
+            if current.is_none_or(|current| **current != table) {
+                palette_tables.insert(*id, Arc::new(table));
+            }
+        }
         let Some(material) = materials.get(&entry.material) else {
             continue;
         };
@@ -863,6 +902,7 @@ fn extract_meadow_variants(
                 trunk_slots: material.extension.trunk_slots.id(),
                 heightfield: material.extension.heightfield.id(),
                 variant_params: material.extension.variant_params,
+                palettes: Arc::clone(&palette_tables[id]),
                 active_patches: Arc::clone(&variant_lists.active_patches),
                 task_slices: Arc::clone(&variant_lists.task_slices),
                 est_main_near: est.main_near.ceil() as u32,
@@ -1064,7 +1104,8 @@ pub(crate) fn build_meadow_view_slots(
 }
 
 /// Copy each variant's `variant_params` into its compute uniform buffer,
-/// stamping the wind-time fields (`wind.zw`) in on the way.
+/// stamping the wind-time fields (`wind.zw`) in on the way, and write its
+/// palette table when the extracted table changed.
 fn prepare_meadow_variant_params(
     extracted: Res<MeadowExtractedVariants>,
     slots: Res<MeadowViewSlots>,
@@ -1092,12 +1133,36 @@ fn prepare_meadow_variant_params(
     let now = time.elapsed_secs_wrapped();
     let prev = now - time.delta_secs();
     for (id, ev) in extracted.by_variant.iter() {
-        let buf = params.by_variant.entry(*id).or_default();
+        let gpu = params
+            .by_variant
+            .entry(*id)
+            .or_insert_with(|| VariantParamsGpu {
+                params: UniformBuffer::default(),
+                palettes: render_device.create_buffer(&BufferDescriptor {
+                    label: Some("meadow_palettes"),
+                    size: size_of::<[PaletteParams; MAX_MEADOW_PALETTES]>() as u64,
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                uploaded_palettes: None,
+            });
         let mut variant_params = ev.variant_params;
         variant_params.wind.z = now;
         variant_params.wind.w = prev;
-        buf.set(variant_params);
-        buf.write_buffer(&render_device, &render_queue);
+        gpu.params.set(variant_params);
+        gpu.params.write_buffer(&render_device, &render_queue);
+        if !gpu
+            .uploaded_palettes
+            .as_ref()
+            .is_some_and(|uploaded| Arc::ptr_eq(uploaded, &ev.palettes))
+        {
+            render_queue.write_buffer(
+                &gpu.palettes,
+                0,
+                bytemuck::cast_slice(ev.palettes.as_slice()),
+            );
+            gpu.uploaded_palettes = Some(Arc::clone(&ev.palettes));
+        }
     }
 }
 
@@ -1445,7 +1510,10 @@ fn prepare_meadow_compute_bind_groups(
         // ground_y = 0), matching the prior `FallbackImage` path the
         // `AsBindGroup` derive gave the raster shader.
         let heightfield = gpu_images.get(ev.heightfield).unwrap_or(&fallback_image.d2);
-        let Some(params_buf) = params.by_variant.get(id).and_then(|b| b.buffer()) else {
+        let Some(gpu) = params.by_variant.get(id) else {
+            continue;
+        };
+        let Some(params_buf) = gpu.params.buffer() else {
             continue;
         };
         let Some(vb) = buffers.by_variant.get(id) else {
@@ -1467,6 +1535,7 @@ fn prepare_meadow_compute_bind_groups(
                 vb.blades.id(),
                 vb.cursors.id(),
                 vb.indirect.id(),
+                gpu.palettes.id(),
             ],
             heightfield.texture_view.id(),
         );
@@ -1480,16 +1549,17 @@ fn prepare_meadow_compute_bind_groups(
         let bg = render_device.create_bind_group(
             Some("meadow_compute_bind_group"),
             &layout,
-            &BindGroupEntries::sequential((
-                params_buf.as_entire_binding(),
-                patches.buffer.as_entire_binding(),
-                trunk_slots.buffer.as_entire_binding(),
-                &heightfield.texture_view,
-                view_cull.as_entire_binding(),
-                vb.active_patches.as_entire_binding(),
-                vb.blades.as_entire_binding(),
-                vb.cursors.as_entire_binding(),
-                vb.indirect.as_entire_binding(),
+            &BindGroupEntries::with_indices((
+                (0, params_buf.as_entire_binding()),
+                (1, patches.buffer.as_entire_binding()),
+                (2, trunk_slots.buffer.as_entire_binding()),
+                (3, &heightfield.texture_view),
+                (4, view_cull.as_entire_binding()),
+                (5, vb.active_patches.as_entire_binding()),
+                (6, vb.blades.as_entire_binding()),
+                (7, vb.cursors.as_entire_binding()),
+                (8, vb.indirect.as_entire_binding()),
+                (14, gpu.palettes.as_entire_binding()),
             )),
         );
         bind_groups.by_variant.insert(*id, (bg, fingerprint));
@@ -1692,8 +1762,8 @@ pub struct RtVariantBuffers {
 }
 
 /// Identity of every externally-owned resource the expand bind group binds:
-/// (params uniform, patches, trunk_slots, heightfield view).
-type RtExpandKey = (BufferId, BufferId, BufferId, TextureViewId);
+/// (params uniform, patches, trunk_slots, palettes; heightfield view).
+type RtExpandKey = ([BufferId; 4], TextureViewId);
 
 /// Frames a variant may stay inactive — no live patches, or missing from
 /// the extract entirely — before its RT buffers are freed (and
@@ -1749,8 +1819,8 @@ fn init_meadow_rt_pipeline(
     pipeline_cache: &PipelineCache,
 ) -> MeadowRtExpandPipeline {
     // Explicit binding indices — a SUBSET of meadow_compute.wesl's group 0
-    // (the read-only inputs) plus RT bindings at 9..=13. Raster-only
-    // bindings 4..=8 are omitted.
+    // (the read-only inputs and the palette table) plus RT bindings at
+    // 9..=13. Raster-only bindings 4..=8 are omitted.
     let expand_layout = BindGroupLayoutDescriptor::new(
         "meadow_rt_expand_layout",
         &BindGroupLayoutEntries::with_indices(
@@ -1768,6 +1838,7 @@ fn init_meadow_rt_pipeline(
                 (11, storage_buffer_sized(false, None)),          // rt_verts_near
                 (12, storage_buffer_read_only_sized(false, None)), // stable far slots
                 (13, storage_buffer_sized(false, None)),          // rt_verts_far
+                (14, storage_buffer_read_only_sized(false, None)), // palettes
             ),
         ),
     );
@@ -2098,7 +2169,7 @@ fn dispatch_meadow_rt_expand(
             patches,
             trunk_slots,
             params_buf,
-            ..
+            palettes,
         }) = inputs
         {
             for (band, slots, generation, reset) in [
@@ -2138,9 +2209,12 @@ fn dispatch_meadow_rt_expand(
             );
             let heightfield = gpu_images.get(ev.heightfield).unwrap_or(&fallback_image.d2);
             let key = (
-                params_buf.id(),
-                patches.buffer.id(),
-                trunk_slots.buffer.id(),
+                [
+                    params_buf.id(),
+                    patches.buffer.id(),
+                    trunk_slots.buffer.id(),
+                    palettes.id(),
+                ],
                 heightfield.texture_view.id(),
             );
             if rtv
@@ -2161,6 +2235,7 @@ fn dispatch_meadow_rt_expand(
                         (11, rtv.near.vertices.as_entire_binding()),
                         (12, rtv.far.slots.as_entire_binding()),
                         (13, rtv.far.vertices.as_entire_binding()),
+                        (14, palettes.as_entire_binding()),
                     )),
                 );
                 rtv.expand_bind_group = Some((key, bind_group));
@@ -2228,6 +2303,7 @@ struct ExpandInputs<'a> {
     patches: &'a GpuShaderBuffer,
     trunk_slots: &'a GpuShaderBuffer,
     params_buf: &'a Buffer,
+    palettes: &'a Buffer,
 }
 
 fn gather_expand_inputs<'a>(
@@ -2246,10 +2322,12 @@ fn gather_expand_inputs<'a>(
     {
         return None;
     }
+    let gpu = params.by_variant.get(id)?;
     Some(ExpandInputs {
         patches: shader_buffers.get(ev.patches)?,
         trunk_slots: shader_buffers.get(ev.trunk_slots)?,
-        params_buf: params.by_variant.get(id).and_then(|b| b.buffer())?,
+        params_buf: gpu.params.buffer()?,
+        palettes: &gpu.palettes,
         ev,
     })
 }
@@ -2319,6 +2397,7 @@ mod tests {
             seed,
             edge_noise_amp: 0.2,
             canopy_density_at_centre: 0.0,
+            palette: 0,
         };
         let both: LivePlacements = Arc::new(vec![(0, placement(2.0, 12)), (1, placement(6.0, 13))]);
         let mut job = RtSelectionJob::default();

@@ -41,6 +41,10 @@ pub struct PatchPlacement {
     pub seed: u32,
     pub edge_noise_amp: f32,
     pub canopy_density_at_centre: f32,
+    /// Index of the variant palette-table entry this patch's blades take
+    /// their colour and variance from. `place_patches` leaves it 0; the
+    /// consumer assigns it.
+    pub palette: u32,
 }
 
 impl PatchPlacement {
@@ -233,6 +237,7 @@ pub fn place_patches(
             seed: derive_patch_seed(params.variant_seed, placements.len()),
             edge_noise_amp: params.patch_edge_noise_amp,
             canopy_density_at_centre: canopy,
+            palette: 0,
         });
     }
 
@@ -300,6 +305,7 @@ pub fn place_patches(
             seed: derive_patch_seed(params.variant_seed, placements.len()),
             edge_noise_amp: params.patch_edge_noise_amp,
             canopy_density_at_centre: canopy,
+            palette: 0,
         });
     }
 

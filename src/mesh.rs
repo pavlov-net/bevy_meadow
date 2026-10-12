@@ -17,7 +17,7 @@
 //! region directly. The vertex shader recovers `vert_idx` from
 //! `POSITION.y` and the band from `POSITION.x` (0 = blade, 1 = tuft),
 //! then expands the local geometry. Both meshes carry an identical
-//! vertex-buffer layout (POSITION/NORMAL/UV/TANGENT) so the single
+//! vertex-buffer layout (POSITION/NORMAL/UV/TANGENT/COLOR) so the single
 //! specialized pipeline draws either without respecialization.
 
 use bevy::asset::RenderAssetUsages;
@@ -103,7 +103,7 @@ pub const MESH_TASK_BLADES: u32 = 128;
 pub const MESH_TASK_DISPATCH_STRIDE: u32 = 32_768;
 
 /// Mesh-shader path: bytes per `SurvivorBlade` in the task payload
-/// (12 × f32). Must match the struct in `meadow_mesh.wesl`; sizes the
+/// (12 × 4 B). Must match the struct in `meadow_mesh.wesl`; sizes the
 /// runtime `max_task_payload_size` support check.
 #[cfg(feature = "mesh-shaders")]
 pub const MESH_SURVIVOR_BLADE_BYTES: u32 = 48;
@@ -170,7 +170,8 @@ pub struct MeadowMeshes {
 /// overwrites the world normal explicitly anyway.
 ///
 /// Cost: 11 × 12 B POSITION + 11 × 12 B NORMAL + 11 × 8 B UV +
-/// 27 × 4 B indices ≈ 460 B per process. Same mesh handle is reused
+/// 11 × 16 B TANGENT + 11 × 16 B COLOR + 27 × 4 B indices ≈ 810 B per
+/// process. Same mesh handle is reused
 /// by every variant.
 pub fn build_blade_template_mesh() -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(BLADE_VERTS_PER_BLADE as usize);
@@ -195,8 +196,10 @@ pub fn build_blade_template_mesh() -> Mesh {
 /// `generate_tangents()`): the shader hardcodes the world normal/tangent
 /// and never reads mikktspace output, so a flat tangent is
 /// rendering-invisible — and it keeps every LOD mesh's vertex buffer
-/// byte-identical in layout (POSITION/NORMAL/UV/TANGENT) so the single
-/// specialized pipeline draws every band. Centralizes that invariant.
+/// byte-identical in layout (POSITION/NORMAL/UV/TANGENT/COLOR) so the
+/// single specialized pipeline draws every band. Centralizes that
+/// invariant. The white COLOR is never read: it turns on `VERTEX_COLORS`,
+/// whose varying carries the per-blade albedo the vertex shader writes.
 fn build_template_mesh(
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
@@ -204,6 +207,7 @@ fn build_template_mesh(
     indices: Vec<u32>,
 ) -> Mesh {
     let tangents = vec![[1.0, 0.0, 0.0, 1.0]; positions.len()];
+    let colors = vec![[1.0_f32, 1.0, 1.0, 1.0]; positions.len()];
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -213,6 +217,7 @@ fn build_template_mesh(
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, tangents)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
 }
 
 /// Build the shared far-LOD tuft template mesh: 7 mini-blade arms
@@ -226,7 +231,8 @@ fn build_template_mesh(
 /// corners 0/1 the base. The fan's baked per-arm yaw means it reads as a
 /// clump from any azimuth and straight down, with no camera-facing
 /// rotation (hence no billboard popping). Layout matches the blade mesh
-/// exactly (POSITION/NORMAL/UV/TANGENT) so the same pipeline draws it.
+/// exactly (POSITION/NORMAL/UV/TANGENT/COLOR) so the same pipeline draws
+/// it.
 pub fn build_tuft_template_mesh() -> Mesh {
     let n = TUFT_VERTS_PER_BLADE as usize;
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n);
@@ -259,6 +265,7 @@ mod tests {
             assert!(mesh.attribute(Mesh::ATTRIBUTE_NORMAL).is_some());
             assert!(mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_some());
             assert!(mesh.attribute(Mesh::ATTRIBUTE_TANGENT).is_some());
+            assert!(mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
         }
     }
 

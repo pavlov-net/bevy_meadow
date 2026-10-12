@@ -22,12 +22,14 @@
 //   budget) throttle workgroup launch and starve the SMs. All 32 lanes
 //   expand vertices cooperatively (lane ↔ vertex, not lane ↔ blade).
 //
-// Imports `BladeAttrs` / `local_blade_position` / `tuft_local_position`
-// from the shared library, and the group-3 palette/view bindings, the
-// mesh → fragment varyings, and the palette + motion-vector helpers
-// shared with the PBR fragments from `meadow_mesh_bindings.wesl`, so none
-// of them can drift between stages. Compiled by bevy's pipeline cache
-// like every other WESL shader (`mesh_path.rs` queues the pipelines).
+// Imports `BladeAttrs`, the blade geometry and the per-blade palette
+// variance from the shared library, and the group-3 bindings, the mesh →
+// fragment varyings, and the motion-vector helper shared with the PBR
+// fragments from `meadow_mesh_bindings.wesl`, so none of them can drift
+// between stages. The task stage resolves each blade's colour once and
+// the mesh stage hands it to the fragment as a varying. Compiled by
+// bevy's pipeline cache like every other WESL shader (`mesh_path.rs`
+// queues the pipelines).
 //
 // Dispatch: one task workgroup per CPU-built `(patch_idx, slice_base)`
 // pair covering exactly the active patches' real blade counts
@@ -47,9 +49,13 @@
 // depth-only shadow pipeline fills slots 0-2 with empty bind groups so
 // the one module serves both layouts.
 
-import bevy_meadow::meadow_shared::{BladeAttrs, local_blade_position, tuft_local_position, wind_sway};
+import bevy_meadow::meadow_shared::{
+    BladeAttrs, local_blade_position, tuft_local_position, wind_sway, hash_u32, hash01_u32,
+    hash01_pair, meadow_patch_palette, meadow_max_height_scale, meadow_patch_noise,
+    meadow_blade_height_scale, meadow_blade_albedo, meadow_pack_albedo, meadow_unpack_albedo,
+};
 import bevy_meadow::meadow_mesh_bindings::{
-    variant_params, patches, trunk_slots, heightfield, view_cull, task_slices, mesh_view,
+    variant_params, patches, trunk_slots, heightfield, view_cull, task_slices, mesh_view, palettes,
     PatchData, MeadowViewCull, MeadowVertexOut,
 };
 
@@ -87,27 +93,6 @@ const MESH_SHADOW_OUT_PRIMS: u32 = 21u; // MESH_WG_SHADOW_BLADES × 1
 
 const MEADOW_VIEW_FLAG_SHADOW: u32 = 1u;
 const TUFT_SALT: u32 = 0x5C3Bu;
-
-// ---------- hash helpers (MIRROR: meadow_compute.wesl) ----------
-
-fn hash_u32(v: u32) -> u32 {
-    var x = v;
-    x = x ^ (x >> 16u);
-    x = x * 0x7feb352du;
-    x = x ^ (x >> 15u);
-    x = x * 0x846ca68bu;
-    x = x ^ (x >> 16u);
-    return x;
-}
-
-fn hash01_u32(v: u32) -> f32 {
-    return f32(hash_u32(v) & 0x00FFFFFFu) / f32(0x01000000u);
-}
-
-fn hash01_pair(a: u32, b: u32) -> f32 {
-    let h = hash_u32(a ^ (b * 0x9E3779B9u));
-    return f32(h & 0x00FFFFFFu) / f32(0x01000000u);
-}
 
 // ---------- derivation helpers (MIRROR: meadow_compute.wesl) ----------
 
@@ -157,7 +142,7 @@ fn derive_blade(blade_idx: u32, p: PatchData) -> BladeAttrs {
         rim_factor = 0.0;
     }
 
-    return BladeAttrs(centre + sample, yaw, height, width, clump_seed, rim_factor);
+    return BladeAttrs(centre + sample, yaw, height, width, clump_seed, rim_factor, blade_seed);
 }
 
 fn blade_visibility(root_xz: vec2<f32>, patch_idx: u32) -> f32 {
@@ -248,7 +233,9 @@ struct SurvivorBlade {
     yaw: f32,
     height: f32,
     width: f32,
-    clump_seed: f32,
+    // `meadow_pack_albedo` of the blade colour; 0 for shadow views, which
+    // draw depth only.
+    albedo: u32,
     ground_y: f32,
     collapse_t: f32,
     // Full-amplitude (y_norm = 1) wind displacement at the current /
@@ -309,7 +296,8 @@ fn meadow_task(
     // Patch-level frustum reject — same math as the compute kernel.
     let centre_xz = p.centre_xz_radius_seed.xy;
     let centre_y = sample_heightfield(centre_xz);
-    let max_h = variant_params.height_range.y;
+    let palette = palettes[meadow_patch_palette(p.blade_count_noise_canopy_flags.w)];
+    let max_h = variant_params.height_range.y * meadow_max_height_scale(palette);
     let edge_noise = p.blade_count_noise_canopy_flags.y;
     let cull_radius = p.centre_xz_radius_seed.z * (1.0 + edge_noise) + max_h * 2.0;
     if (patch_sphere_culled(vec3<f32>(centre_xz.x, centre_y, centre_xz.y), cull_radius, vc, is_shadow)) {
@@ -403,6 +391,7 @@ fn meadow_task(
             let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
             if (cast_ok && collapse_t > 1e-4) {
                 let ground_y = sample_heightfield(blade.world_xz) + 0.02;
+                let noise = meadow_patch_noise(palette, blade.world_xz);
                 var wind_now = wind_displacement(
                     blade.world_xz, 1.0, variant_params.wind.z, blade.clump_seed);
                 var wind_prev = wind_displacement(
@@ -424,9 +413,13 @@ fn meadow_task(
                 }
                 out.world_xz = blade.world_xz;
                 out.yaw = blade.yaw;
-                out.height = blade.height * tuft_height_scale;
+                out.height = blade.height * meadow_blade_height_scale(palette, noise, blade.seed)
+                    * tuft_height_scale;
                 out.width = blade.width;
-                out.clump_seed = blade.clump_seed;
+                out.albedo = 0u;
+                if (!is_shadow) {
+                    out.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
+                }
                 out.ground_y = ground_y;
                 out.collapse_t = collapse_t;
                 out.wind_now = wind_now;
@@ -557,14 +550,15 @@ fn meadow_mesh(
     for (var t = lid; t < total_verts; t = t + 32u) {
         let s = payload.survivors[base + t / n_verts];
         let v = t % n_verts;
-        let blade = BladeAttrs(s.world_xz, s.yaw, s.height, s.width, s.clump_seed, 1.0);
+        let blade = BladeAttrs(s.world_xz, s.yaw, s.height, s.width, 0.0, 1.0, 0u);
         let cur = blade_vertex(v, payload.band, blade, s.ground_y, s.collapse_t, s.wind_now);
         let prev = blade_vertex(v, payload.band, blade, s.ground_y, s.collapse_t, s.wind_prev);
         let world = vec4<f32>(cur.xyz, 1.0);
         mesh_out.vertices[t].position = mesh_view.clip_from_world * world;
         mesh_out.vertices[t].world_position = world;
         mesh_out.vertices[t].prev_world_position = vec4<f32>(prev.xyz, 1.0);
-        mesh_out.vertices[t].misc = vec2<f32>(cur.w, 0.85 + 0.30 * s.clump_seed);
+        mesh_out.vertices[t].y_norm = cur.w;
+        mesh_out.vertices[t].albedo = meadow_unpack_albedo(s.albedo);
     }
 
     let total_prims = count * n_prims;
@@ -634,7 +628,7 @@ fn meadow_mesh_shadow(
         // covers 3/4 of the tapered ribbon's silhouette, and PCF-filtered
         // grass shadows read proportionally fainter without it.
         let blade =
-            BladeAttrs(s.world_xz, s.yaw, s.height, s.width * (4.0 / 3.0), s.clump_seed, 1.0);
+            BladeAttrs(s.world_xz, s.yaw, s.height, s.width * (4.0 / 3.0), 0.0, 1.0, 0u);
         let cur = blade_vertex(v, 0u, blade, s.ground_y, s.collapse_t, s.wind_now);
         shadow_mesh_out.vertices[t].position =
             mesh_view.clip_from_world * vec4<f32>(cur.xyz, 1.0);

@@ -383,6 +383,7 @@ mod tests {
             seed,
             edge_noise_amp: 0.2,
             canopy_density_at_centre: 0.0,
+            palette: 0,
         }
     }
     #[test]
@@ -481,6 +482,7 @@ mod tests {
             seed: 741,
             edge_noise_amp: 0.0,
             canopy_density_at_centre: 0.0,
+            palette: 0,
         };
         let mut s = RtSelection::default();
         s.update(&[(0, p)], Vec2::ZERO, 8_000, 20_000);

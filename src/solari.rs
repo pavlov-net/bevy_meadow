@@ -20,9 +20,10 @@
 
 use std::borrow::Cow;
 
-use bevy::asset::embedded_asset;
+use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::core_pipeline::Core3d;
 use bevy::core_pipeline::prepass::ViewPrepassTextures;
+use bevy::image::ImageSampler;
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::render::diagnostic::RecordDiagnostics;
@@ -33,8 +34,9 @@ use bevy::render::render_resource::binding_types::{
 };
 use bevy::render::render_resource::{
     BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, CachedComputePipelineId,
-    CachedPipelineState, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-    ShaderStages, ShaderType, StorageTextureAccess, TextureSampleType, UniformBuffer,
+    CachedPipelineState, ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, PipelineCache,
+    ShaderStages, ShaderType, StorageTextureAccess, TextureDimension, TextureFormat,
+    TextureSampleType, UniformBuffer,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ViewUniform, ViewUniformOffset, ViewUniforms};
@@ -50,8 +52,9 @@ use bevy_solari::scene::{
 use crate::compute::{
     MeadowRaytracingConfig, MeadowRtBuffers, MeadowRtDiagnostics, MeadowRtExpanded,
 };
+use crate::material::MAX_MEADOW_PALETTES;
 use crate::plugin::{
-    MeadowPatch, MeadowSeasonState, MeadowVariantId, MeadowVariantRegistry, SeasonalPalette,
+    MeadowPalette, MeadowPalettes, MeadowPatch, MeadowVariantId, MeadowVariantRegistry,
 };
 
 /// [`RaytracingInstanceTag`] of near-band casters, the only geometry that
@@ -147,25 +150,25 @@ struct MeadowRtProxy {
     band: MeadowRtBand,
 }
 
-/// Mean of the raster blade's height shade, `mix(0.70, 1.00, uv.y)` in
-/// `meadow.wesl`, over the blade.
-const MEAN_BLADE_SHADE: f32 = 0.85;
-
 /// Keep one proxy entity per (live variant, band) while the casters are
 /// enabled. Proxies carry [`RaytracingGeometry`] and a per-variant
-/// `StandardMaterial` whose albedo is the variant's current seasonal palette
-/// times the mean blade shade, so Solari bounces light off the casters at the
-/// raster blades' colour.
+/// `StandardMaterial` whose base colour texture holds one texel per palette
+/// entry: the entry's coverage-weighted mean colour times the mean blade
+/// shade. Each caster vertex's `uv.x` is its patch's texel centre
+/// (`meadow_compute.wesl::rt_write_slot`), so Solari bounces light off
+/// every blade at its own patch's mean colour.
 fn manage_meadow_rt_proxies(
     mut commands: Commands,
     config: Option<Res<MeadowRaytracingConfig>>,
     registry: Option<Res<MeadowVariantRegistry>>,
-    season: Res<MeadowSeasonState>,
+    palettes: Res<MeadowPalettes>,
     diagnostics: Option<Res<MeadowRtDiagnostics>>,
     patches: Query<&MeadowPatch>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     proxies: Query<(Entity, &MeadowRtProxy)>,
-    mut variant_materials: Local<HashMap<MeadowVariantId, Handle<StandardMaterial>>>,
+    mut caster_textures: Local<HashMap<MeadowVariantId, Handle<Image>>>,
+    mut proxy_materials: Local<HashMap<MeadowVariantId, Handle<StandardMaterial>>>,
 ) {
     let enabled = config.is_some_and(|c| c.enabled);
     if !enabled && proxies.is_empty() {
@@ -197,38 +200,42 @@ fn manage_meadow_rt_proxies(
             commands.entity(entity).despawn();
         }
     }
-    // A handful of variants: compare every frame so a material also catches
-    // up after the casters were off across a palette or season change.
-    if let Some(registry) = registry.as_deref() {
-        for (id, handle) in variant_materials.iter() {
+    let registry_changed = registry.as_ref().is_some_and(DetectChanges::is_changed);
+    let Some(registry) = registry.as_deref() else {
+        return;
+    };
+    // Rewrite a caster texture only when its palette table changed; the
+    // texels compare first so an unchanged table writes nothing, and a
+    // modified image is all Solari re-uploads (the material stays as is).
+    if palettes.is_changed() || registry_changed {
+        for (id, handle) in caster_textures.iter() {
             let Some(entry) = registry.get(*id) else {
                 continue;
             };
-            let albedo = proxy_albedo(&entry.variant.palette, &season);
-            // Compare first: `get_mut` alone marks the asset modified, and a
-            // modified material makes Solari re-convert every material. The
-            // season blend moves every frame, so only a perceptible change
-            // rewrites the albedo.
-            if materials
+            let texels = caster_texels(palettes.current(*id, &entry.variant));
+            if images
                 .get(handle)
-                .is_some_and(|m| albedo_differs(m.base_color, albedo))
-                && let Some(mut m) = materials.get_mut(handle)
+                .is_some_and(|image| image.data.as_deref() != Some(texels.as_slice()))
+                && let Some(mut image) = images.get_mut(handle)
             {
-                m.base_color = albedo;
+                image.data = Some(texels);
             }
         }
     }
     for (variant, band) in want {
-        let palette = registry
-            .as_deref()
-            .and_then(|r| r.get(variant))
-            .map(|entry| entry.variant.palette)
-            .unwrap_or_default();
-        let mat = variant_materials
+        let Some(entry) = registry.get(variant) else {
+            continue;
+        };
+        let mat = proxy_materials
             .entry(variant)
             .or_insert_with(|| {
+                let texture = images.add(caster_texture(caster_texels(
+                    palettes.current(variant, &entry.variant),
+                )));
+                caster_textures.insert(variant, texture.clone());
                 materials.add(StandardMaterial {
-                    base_color: proxy_albedo(&palette, &season),
+                    base_color: Color::WHITE,
+                    base_color_texture: Some(texture),
                     perceptual_roughness: 1.0,
                     metallic: 0.0,
                     emissive: LinearRgba::BLACK,
@@ -246,27 +253,36 @@ fn manage_meadow_rt_proxies(
     }
 }
 
-/// Largest per-channel linear albedo difference the casters ignore: below an
-/// 8-bit sRGB step for the dark grass albedos the palettes hold.
-const PROXY_ALBEDO_EPSILON: f32 = 1.0 / 1024.0;
-
-/// Whether `current` and `target` differ by more than
-/// [`PROXY_ALBEDO_EPSILON`] in any linear channel.
-fn albedo_differs(current: Color, target: Color) -> bool {
-    let a = current.to_linear();
-    let b = target.to_linear();
-    (a.red - b.red).abs() > PROXY_ALBEDO_EPSILON
-        || (a.green - b.green).abs() > PROXY_ALBEDO_EPSILON
-        || (a.blue - b.blue).abs() > PROXY_ALBEDO_EPSILON
+/// One sRGB texel per palette slot: the entry's shaded mean albedo
+/// ([`MeadowPalette::shaded_mean_albedo`]), the last entry repeated through
+/// the slots past the table, like the shader table.
+fn caster_texels(palettes: &[MeadowPalette]) -> Vec<u8> {
+    let last = palettes.last().copied().unwrap_or_default();
+    (0..MAX_MEADOW_PALETTES)
+        .flat_map(|i| {
+            let c = palettes.get(i).unwrap_or(&last).shaded_mean_albedo();
+            Color::linear_rgb(c.x, c.y, c.z).to_srgba().to_u8_array()
+        })
+        .collect()
 }
 
-/// Linear albedo of a variant's casters: the palette at `season` times the
-/// mean blade shade.
-fn proxy_albedo(palette: &SeasonalPalette, season: &MeadowSeasonState) -> Color {
-    let c = palette.at(season) * MEAN_BLADE_SHADE;
-    Color::linear_rgb(c.x, c.y, c.z)
+/// The `MAX_MEADOW_PALETTES × 1` caster colour texture. Nearest filtering
+/// keeps each texel-centre lookup to its own entry.
+fn caster_texture(texels: Vec<u8>) -> Image {
+    let mut image = Image::new(
+        Extent3d {
+            width: MAX_MEADOW_PALETTES as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        texels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    image
 }
-
 /// Render world: bind each proxy's band buffers so Solari rebuilds its BLAS
 /// from them every frame. Checked every frame by buffer identity, so a proxy
 /// re-binds when meadow recreates a variant's buffers. The topology generation

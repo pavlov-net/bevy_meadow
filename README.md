@@ -18,8 +18,10 @@ resources.
 - **Two-band LOD.** Individual blades up close; sparse fanned tufts in the
   distance that fade out with range. No billboard popping (tuft geometry is
   baked, never camera-facing).
-- **Seasons.** A four-corner palette (spring/summer/autumn/winter) blended live
-  from a world season state.
+- **Palettes and variance.** A per-variant table of palette entries the
+  consumer writes (season, climate, whatever drives it); each patch picks an
+  entry. Blades vary around it with zero mean: hue and value jitter, single
+  dead blades and small dead patches, and per-blade and per-patch height.
 - **Wind.** A shared gust direction (agrees with other foliage) plus dynamics
   -- speed, gustiness, and traveling gust crests -- scaled per variant.
 - **Terrain-following.** Blades sample a world heightfield atlas so grass sits
@@ -129,7 +131,7 @@ change out to every registered variant.** Most resources broadcast only on
 change; `MeadowViewer` is read every frame.
 
 ```rust
-use bevy_meadow::{MeadowViewer, WindDirection, MeadowWindState, MeadowSeasonState};
+use bevy_meadow::{MeadowViewer, WindDirection, MeadowWindState};
 
 // Required every frame: the LOD/density pivot and shadow-cascade reference.
 // Without it, LOD has no camera to measure distance from.
@@ -153,9 +155,6 @@ The other driver resources:
 
 - **`WindDirection(Vec2)`** and **`MeadowWindState`** (speed, gustiness, crest
   wavenumber) -- world wind, shared so meadow and tree foliage gust together.
-- **`MeadowSeasonState`** (`from_idx`, `to_idx`, `blend_t`) -- blends between
-  two of the variant's four seasonal palette corners. Drive it from your own
-  clock.
 - **`MeadowHeightfield`** (`atlas`, `world_min`, `world_max`) -- an `R32Float`
   world-XZ -> ground-Y atlas, set on world enter. Until you set one, blades sit
   at Y=0.
@@ -171,7 +170,12 @@ a dense temperate meadow; override fields as needed. The groups:
   `canopy_soft_threshold` (shrink), plus `biome_weight_threshold` for seams.
 - **Wind** (`WindParams`) -- per-variant `amplitude` and `period`; direction and
   dynamics come from the shared resources.
-- **Palette** (`SeasonalPalette`) -- the four seasonal albedo corners.
+- **Palettes** (`palettes: Vec<MeadowPalette>`) -- the table each patch
+  indexes with `PatchPlacement::palette`. An entry holds the live and dry
+  albedo, the dead share, colour jitter, height variance and dead-patch size.
+  Rewrite it in the `MeadowPalettes` resource as your season or climate
+  moves; that leaves the registry unchanged, and Solari casters take each
+  patch's entry mean colour from a per-variant texture.
 - **LOD** (`MeadowLodCurve`) -- see below.
 - `seed`, `audio_tag`, and authored `overrides`.
 

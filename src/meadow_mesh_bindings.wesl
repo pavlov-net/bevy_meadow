@@ -4,11 +4,11 @@
 // the PBR fragments (`meadow_mesh_pbr_fragment.wesl`,
 // `meadow_mesh_deferred_fragment.wesl`), and their common PbrInput
 // assembly (`meadow_mesh_pbr_common.wesl`) import from here, so every
-// binding, the mesh → fragment varyings, the per-view matrices, and the
-// palette have exactly one definition. WESL imports are item-level, so a
-// fragment that only reads the palette pulls in nothing else.
+// binding, the mesh → fragment varyings and the per-view matrices have
+// exactly one definition. WESL imports are item-level, so a fragment that
+// only reads the varyings pulls in nothing else.
 
-import bevy_meadow::meadow_shared::{VariantParams, season_palette_of};
+import bevy_meadow::meadow_shared::{VariantParams, PaletteParams};
 
 // ---------- structs (MIRROR: meadow_compute.wesl) ----------
 // Any change to these structs or to the derivation helpers in
@@ -78,6 +78,8 @@ struct MeadowMeshView {
 @group(3) @binding(4) var<storage, read> view_cull: MeadowViewCullData;
 @group(3) @binding(5) var<storage, read> task_slices: MeadowTaskSlices;
 @group(3) @binding(6) var<uniform> mesh_view: MeadowMeshView;
+// The variant's palette table; each patch indexes it by its flags.
+@group(3) @binding(7) var<storage, read> palettes: array<PaletteParams, 64>;
 
 // ---------- shared stage interface ----------
 
@@ -88,20 +90,10 @@ struct MeadowVertexOut {
     // Previous-frame world position (prev wind time; static root), for
     // per-fragment motion vectors written to the meadow-owned MV target.
     @location(1) prev_world_position: vec4<f32>,
-    // x = y_norm (shade/tip ramp), y = clump luminance.
-    @location(2) misc: vec2<f32>,
-}
-
-// Same blend as `meadow.wesl::season_palette`, over this group's
-// `variant_params`.
-fn season_palette() -> vec3<f32> {
-    return season_palette_of(
-        variant_params.season_blend,
-        variant_params.palette_spring,
-        variant_params.palette_summer,
-        variant_params.palette_autumn,
-        variant_params.palette_winter,
-    );
+    // Height up the blade in [0, 1] (shade/tip ramp).
+    @location(2) y_norm: f32,
+    // Linear blade albedo (`meadow_blade_albedo`), constant per blade.
+    @location(3) @interpolate(flat) albedo: vec3<f32>,
 }
 
 // Jitter-free current/previous NDC delta — same UV-delta convention as

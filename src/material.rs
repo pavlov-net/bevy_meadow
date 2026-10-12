@@ -34,10 +34,35 @@ pub const MAX_TRUNK_DISCS_PER_PATCH: usize = 16;
 
 pub type MeadowMaterial = ExtendedMaterial<StandardMaterial, MeadowExt>;
 
+/// Capacity of a variant's palette table: 64 entries × 48 B in its own
+/// 3 KiB storage buffer, bound only by the kernels that derive blades.
+/// MUST equal `MEADOW_MAX_PALETTES` in `meadow_shared.wesl`; a patch's
+/// palette index travels in 8 bits of its flags lane, so this stays at or
+/// below 256.
+pub const MAX_MEADOW_PALETTES: usize = 64;
+
+/// One palette-table entry as the shaders read it (`PaletteParams` in
+/// `meadow_shared.wesl`, 3 × vec4 = 48 B). Packed by
+/// [`MeadowPalette::params`](crate::MeadowPalette::params) with the
+/// amounts clamped and the per-blade thresholds precomputed.
+#[repr(C)]
+#[derive(ShaderType, Debug, Clone, Copy, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PaletteParams {
+    /// `rgb` = live blade albedo (linear), `w` = per-blade colour jitter.
+    pub live_jitter: Vec4,
+    /// `rgb` = dry blade albedo (linear), `w` = single-dead-blade
+    /// threshold on the blade's random.
+    pub dry_blade_share: Vec4,
+    /// `x` = height variance, `y` = dead-patch noise frequency (`1 /
+    /// dead_patch_size`, 0 = no patches), `z` = patch-noise threshold,
+    /// `w` = 1 / width of the soft patch edge.
+    pub variance: Vec4,
+}
+
 /// Per-variant scalar parameters. Bound at uniform slot 100. All the
-/// per-frame churn (wind direction, season palette lerp) lands here
-/// and only here, so per-frame uploads of a variant material are a
-/// single small uniform write rather than a full bind-group rebuild.
+/// per-frame churn (wind direction, viewer) lands here and only here, so
+/// per-frame uploads of a variant material are a single uniform write
+/// rather than a full bind-group rebuild.
 #[derive(ShaderType, Debug, Clone, Copy)]
 pub struct VariantParams {
     /// Min/max blade height in metres, packed `(min, max, _, _)`.
@@ -64,17 +89,6 @@ pub struct VariantParams {
     /// Broadcast from the `MeadowWindState` resource; see that type's
     /// doc for per-field semantics.
     pub wind_state: Vec4,
-    /// Spring / summer / autumn / winter base albedos (linear),
-    /// each packed as `(r, g, b, _)`. The shader lerps between
-    /// adjacent corners via `season_blend`.
-    pub palette_spring: Vec4,
-    pub palette_summer: Vec4,
-    pub palette_autumn: Vec4,
-    pub palette_winter: Vec4,
-    /// `xy = (current_index_a, current_index_b)`, `z =
-    /// blend_t in [0, 1]` between them. Written by the season
-    /// system on `Changed<WorldClock>`.
-    pub season_blend: Vec4,
     /// `x = full_distance` (every blade survives at this range or
     /// closer), `y = max_view_distance` (no blade survives at this
     /// range or beyond — `VisibilityRange` then culls the patch
@@ -132,11 +146,6 @@ impl Default for VariantParams {
             wind: Vec4::new(0.18, 4.5, 0.0, 0.0),
             wind_direction: Vec4::new(1.0, 0.0, 0.0, 0.0),
             wind_state: Vec4::new(1.0, 0.6, 0.6, 0.0),
-            palette_spring: Vec4::new(0.16, 0.30, 0.09, 0.0),
-            palette_summer: Vec4::new(0.18, 0.32, 0.11, 0.0),
-            palette_autumn: Vec4::new(0.36, 0.28, 0.10, 0.0),
-            palette_winter: Vec4::new(0.55, 0.55, 0.55, 0.0),
-            season_blend: Vec4::new(0.0, 1.0, 0.0, 0.0),
             lod: Vec4::new(40.0, 110.0, 0.25, 0.0),
             density: Vec4::new(150.0, 0.18, 18.0, 0.25),
             // Default to a 1×1 metre extent at the origin — degenerate
@@ -166,7 +175,8 @@ pub struct PatchData {
     /// `xy = world centre`, `z = radius (metres)`, `w = seed (f32 from u32 bits)`.
     pub centre_xz_radius_seed: Vec4,
     /// `x = blade_count (f32)`, `y = edge_noise_amp`,
-    /// `z = canopy_density_at_centre`, `w = flags (bit 0 = audio_enabled)`.
+    /// `z = canopy_density_at_centre`, `w = flags` (u32 bits: bit 0 =
+    /// audio_enabled, bits 8..15 = palette index).
     pub blade_count_noise_canopy_flags: Vec4,
 }
 

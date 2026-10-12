@@ -1,19 +1,38 @@
-// Meadow shared shader library (importable as `bevy_meadow::meadow_shared`).
-//
-// Only the structs/helpers used by BOTH the compute kernel
-// (`meadow_compute.wesl`) and the raster passthrough shader
-// (`meadow.wesl`) live here. Compute-only types (PatchData,
-// PatchTrunkSlot, the view-cull + indirect structs, the hash helpers)
-// live in `meadow_compute.wesl` directly. This file is also spliced
-// verbatim into the mesh-shader module source
-// (`mesh_path.rs::assemble_geom_source`), so it must stay plain WGSL —
-// no imports or `@if` directives.
+// Meadow shared shader library, imported as `bevy_meadow::meadow_shared`
+// by the compute kernel (`meadow_compute.wesl`), the raster passthrough
+// shader (`meadow.wesl`), the mesh-shader path (`meadow_mesh*.wesl`) and the
+// Solari receiver pass. It holds the buffer structs, the blade geometry and
+// wind helpers, the hashes and per-blade palette variance both derivation
+// paths share (so they derive bit-identical blades), the blade shading
+// ramp, and the G-buffer helpers. Binding-free: each caller binds its
+// buffers at its own slots and passes the values in.
 //
 // Struct layouts here are the contract with the Rust side
-// (`material.rs::VariantParams`, `compute.rs`); std430 offsets are
-// load-bearing.
+// (`material.rs::VariantParams`, `material.rs::PaletteParams`,
+// `compute.rs`); std430 offsets are load-bearing.
 
-// Mirror of `material.rs::VariantParams` (16 × vec4 = 256 B). Bound at
+// Capacity of a variant's palette table (`array<PaletteParams, 64>` in its
+// own storage buffer). MUST equal `material.rs::MAX_MEADOW_PALETTES`.
+const MEADOW_MAX_PALETTES: u32 = 64u;
+
+// Mirror of `material.rs::PaletteParams` (3 × vec4 = 48 B): one entry of a
+// variant's palette table, which each patch indexes by bits 8..15 of its
+// flags (`meadow_patch_palette`). The CPU packs it with the amounts
+// clamped and the dead-blade thresholds precomputed
+// (`plugin.rs::MeadowPalette::params`).
+struct PaletteParams {
+    // rgb = live blade albedo (linear), w = per-blade colour jitter.
+    live_jitter: vec4<f32>,
+    // rgb = dry blade albedo (linear), w = single-dead-blade threshold: a
+    // blade whose random falls under it is dead.
+    dry_blade_share: vec4<f32>,
+    // x = height variance, y = dead-patch noise frequency (1 / patch size in
+    // metres, 0 = no patches), z = patch-noise threshold, w = 1 / width of
+    // the soft patch edge.
+    variance: vec4<f32>,
+}
+
+// Mirror of `material.rs::VariantParams` (11 × vec4 = 176 B). Bound at
 // `@binding(100)` in raster (material group) and `@binding(0)` in
 // compute.
 struct VariantParams {
@@ -22,11 +41,6 @@ struct VariantParams {
     wind: vec4<f32>,
     wind_direction: vec4<f32>,
     wind_state: vec4<f32>,
-    palette_spring: vec4<f32>,
-    palette_summer: vec4<f32>,
-    palette_autumn: vec4<f32>,
-    palette_winter: vec4<f32>,
-    season_blend: vec4<f32>,
     lod: vec4<f32>,
     density: vec4<f32>,
     heightfield_extents: vec4<f32>,
@@ -43,8 +57,9 @@ struct BladeAttrs {
     width: f32,
     clump_seed: f32,
     rim_factor: f32,
+    // Per-blade hash seed the palette variance (`meadow_blade_*`) draws from.
+    seed: u32,
 }
-
 // Compute → raster, 48 B std430. The compute kernel derives + culls +
 // compacts these once per frame; the passthrough VS reads one per
 // blade instance and expands the 11 local verts. Only wind is
@@ -59,7 +74,7 @@ struct CompactedBladeRecord {
     collapse_t: f32,            // @28  visibility*rim*alive, frozen for the frame
     prev_root_xz: vec2<f32>,    // @32  previous-frame root XZ (motion vector)
     prev_ground_y: f32,         // @40
-    pad: f32,                   // @44 -> 48
+    albedo: u32,                // @44 -> 48  `meadow_pack_albedo`; 0 in shadow views
 }
 
 // Local-blade vertex computation. `vert_idx ∈ [0, 11)`; layer = idx
@@ -149,34 +164,136 @@ fn wind_sway(
     return dir * sway;
 }
 
-// Seasonal palette blend: `season_blend.xy` index the from/to palettes
-// (0 spring, 1 summer, 2 autumn, 3 winter), `.z` is the blend factor.
-// Takes the `VariantParams` fields explicitly (like `wind_sway`) so the
-// raster material and the mesh path each bind `variant_params` at their
-// own group slot and share this one body.
-fn season_palette_of(
-    season_blend: vec4<f32>,
-    palette_spring: vec4<f32>,
-    palette_summer: vec4<f32>,
-    palette_autumn: vec4<f32>,
-    palette_winter: vec4<f32>,
-) -> vec3<f32> {
-    let a_idx = u32(season_blend.x);
-    let b_idx = u32(season_blend.y);
-    let t = season_blend.z;
-    var a = palette_summer.rgb;
-    var b = palette_summer.rgb;
-    if (a_idx == 0u) { a = palette_spring.rgb; }
-    else if (a_idx == 1u) { a = palette_summer.rgb; }
-    else if (a_idx == 2u) { a = palette_autumn.rgb; }
-    else { a = palette_winter.rgb; }
-    if (b_idx == 0u) { b = palette_spring.rgb; }
-    else if (b_idx == 1u) { b = palette_summer.rgb; }
-    else if (b_idx == 2u) { b = palette_autumn.rgb; }
-    else { b = palette_winter.rgb; }
-    return mix(a, b, clamp(t, 0.0, 1.0));
+// ---------- hashes ----------
+// The one hash family of both derivation paths and the variance below.
+
+fn hash_u32(v: u32) -> u32 {
+    var x = v;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    x = x ^ (x >> 16u);
+    return x;
 }
 
+fn hash01_u32(v: u32) -> f32 {
+    return f32(hash_u32(v) & 0x00FFFFFFu) / f32(0x01000000u);
+}
+
+fn hash01_pair(a: u32, b: u32) -> f32 {
+    let h = hash_u32(a ^ (b * 0x9E3779B9u));
+    return f32(h & 0x00FFFFFFu) / f32(0x01000000u);
+}
+
+// ---------- per-blade palette variance ----------
+//
+// Every blade takes its patch's palette entry and varies around it with
+// zero mean, so the coverage-weighted mean colour of a patch is
+// `mix(live, dry, dead_share)` and its mean height the unvaried one:
+// - dead weight: a blade is dead where low-frequency world-space noise at
+//   its root crosses the patch threshold (small dead patches) or where its
+//   own random falls under the single-blade threshold. The CPU splits the
+//   dead share between the two so the expected weight equals it.
+// - height: `1 + variance * (blade + patch) / 2`, both terms in [-1, 1]
+//   from the same two sources, so dead blades and dead patches run short.
+// - colour: a hue rotation about the grey axis and a value scale, each
+//   `jitter * [-1, 1]`.
+// Height applies to every surviving blade; the dead weight and colour only
+// where a view shades the blade.
+
+// Hue rotation in radians at a colour jitter of 1.
+const MEADOW_HUE_JITTER_RAD: f32 = 1.0;
+
+// Palette index packed into bits 8..15 of `PatchData`'s flags lane
+// (`plugin.rs::upload_placements`, which clamps it into the padded table).
+fn meadow_patch_palette(flags: f32) -> u32 {
+    return (bitcast<u32>(flags) >> 8u) & 0xFFu;
+}
+
+// Factor bounding a blade's height above the variant's `height_range.y`.
+fn meadow_max_height_scale(palette: PaletteParams) -> f32 {
+    return 1.0 + palette.variance.x;
+}
+
+// Quintic value noise remapped to a uniform [0, 1] distribution. The raw
+// noise has mean 0.5 and a bell-shaped spread; the odd polynomial in
+// `n - 0.5` is a least-squares fit of its CDF (max error 0.0015), so a
+// threshold at `1 - a` covers a share `a` of the ground.
+fn meadow_uniform_noise(p: vec2<f32>) -> f32 {
+    // Rotated off the lattice axes so patches don't line up with the world grid.
+    let q = vec2<f32>(0.8 * p.x - 0.6 * p.y, 0.6 * p.x + 0.8 * p.y);
+    let cell = vec2<i32>(floor(q));
+    let f = q - floor(q);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let x0 = bitcast<u32>(cell.x);
+    let z0 = bitcast<u32>(cell.y);
+    let a = hash01_pair(x0, z0);
+    let b = hash01_pair(x0 + 1u, z0);
+    let c = hash01_pair(x0, z0 + 1u);
+    let d = hash01_pair(x0 + 1u, z0 + 1u);
+    let n = mix(mix(a, b, u.x), mix(c, d, u.x), u.y) - 0.5;
+    let n2 = n * n;
+    return clamp(0.5 + n * (1.49767 + n2 * (-2.16135 + n2 * 0.73196)), 0.0, 1.0);
+}
+
+// Dead-patch noise at a blade root, shared by its height and colour: the
+// uniform noise, or 0.5 (no patch) when the entry has no patches.
+fn meadow_patch_noise(palette: PaletteParams, root_xz: vec2<f32>) -> f32 {
+    if (palette.variance.y <= 0.0) {
+        return 0.5;
+    }
+    return meadow_uniform_noise(root_xz * palette.variance.y);
+}
+
+// A blade's height scale from its patch noise and seed.
+fn meadow_blade_height_scale(palette: PaletteParams, noise: f32, seed: u32) -> f32 {
+    let blade_random = hash01_u32(seed + 19u);
+    return 1.0 + palette.variance.x * 0.5 * ((2.0 * blade_random - 1.0) + (1.0 - 2.0 * noise));
+}
+
+// A blade's linear albedo from its patch noise and seed.
+fn meadow_blade_albedo(palette: PaletteParams, noise: f32, seed: u32) -> vec3<f32> {
+    // The soft patch ramp's expected value over the uniform noise is the
+    // patch share exactly (its edge stays inside [0, 1]).
+    let patch_dead = clamp((noise - palette.variance.z) * palette.variance.w + 0.5, 0.0, 1.0);
+    let blade_dead = select(0.0, 1.0, hash01_u32(seed + 19u) < palette.dry_blade_share.w);
+    let base = mix(palette.live_jitter.rgb, palette.dry_blade_share.rgb, max(patch_dead, blade_dead));
+    let jitter = palette.live_jitter.w;
+    // Rodrigues rotation about the grey axis: keeps the channel mean and
+    // turns the chroma by `angle`.
+    let angle = jitter * (2.0 * hash01_u32(seed + 23u) - 1.0) * MEADOW_HUE_JITTER_RAD;
+    let k = vec3<f32>(0.57735027);
+    let cos_a = cos(angle);
+    let rotated = base * cos_a + cross(k, base) * sin(angle) + k * dot(k, base) * (1.0 - cos_a);
+    let value = 1.0 + jitter * (2.0 * hash01_u32(seed + 29u) - 1.0);
+    return max(rotated * value, vec3<f32>(0.0));
+}
+
+// 8-bit gamma-2 (square-root) encoded albedo: close to sRGB's precision on
+// dark albedos for a `sqrt` and a square.
+fn meadow_pack_albedo(albedo: vec3<f32>) -> u32 {
+    return pack4x8unorm(vec4<f32>(sqrt(clamp(albedo, vec3<f32>(0.0), vec3<f32>(1.0))), 1.0));
+}
+
+fn meadow_unpack_albedo(packed: u32) -> vec3<f32> {
+    let s = unpack4x8unorm(packed).rgb;
+    return s * s;
+}
+
+// ---------- blade shading ----------
+
+// Blade albedo shaded up the blade, darker at the root:
+// `mix(0.70, 1.00, y_norm)`, whose mean over the blade is
+// `plugin.rs::MEAN_BLADE_SHADE`.
+fn meadow_blade_base_color(albedo: vec3<f32>, y_norm: f32) -> vec3<f32> {
+    return albedo * mix(0.70, 1.00, y_norm);
+}
+
+// Faint glow on the top of the blade.
+fn meadow_blade_emissive(albedo: vec3<f32>, y_norm: f32) -> vec3<f32> {
+    return albedo * smoothstep(0.7, 1.0, y_norm) * 0.06;
+}
 // Meadow's smoothed upright normal keeps dense grass lighting coherent, but
 // a hillside can put the camera below that normal's hemisphere. Solari's
 // BRDF rejects NdotV <= 0, making those blades black at camera elevation.

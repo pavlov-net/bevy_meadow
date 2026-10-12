@@ -19,6 +19,9 @@
 //!   tree positions)`.
 //! - `MeadowPatch` — required-components struct; one per placed
 //!   patch.
+//! - `MeadowPalette` — one entry of a variant's palette table; each patch
+//!   selects an entry, and its blades vary around it. `MeadowPalettes`
+//!   holds the consumer-written current tables.
 //! - `WindDirection` — world-level resource broadcast to every
 //!   variant's material on change.
 //! - `MeadowWindState` — world-level resource carrying wind dynamics
@@ -48,8 +51,8 @@ pub use compute::{
     MeadowRtVariantStats, RtBandBuffers, RtVariantBuffers,
 };
 pub use material::{
-    MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PatchData, PatchTrunkSlot, TrunkDisc,
-    VariantParams,
+    MAX_MEADOW_PALETTES, MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PaletteParams,
+    PatchData, PatchTrunkSlot, TrunkDisc, VariantParams,
 };
 pub use mesh::{
     BLADE_INDICES_PER_BLADE, BLADE_VERTS_PER_BLADE, MAX_BLADES_PER_PATCH, MEADOW_MAX_BANDS,
@@ -61,9 +64,10 @@ pub use placement::{
     place_patches,
 };
 pub use plugin::{
-    MeadowHeightfield, MeadowLodCurve, MeadowPatch, MeadowPlugin, MeadowSeasonState, MeadowVariant,
-    MeadowVariantId, MeadowVariantRegistry, MeadowViewer, MeadowWindState, PatchAudioTag,
-    SeasonalPalette, WindDirection, WindParams, upload_placements, upload_trunk_slots,
+    MEAN_BLADE_SHADE, MeadowHeightfield, MeadowLodCurve, MeadowPalette, MeadowPalettes,
+    MeadowPatch, MeadowPlugin, MeadowVariant, MeadowVariantId, MeadowVariantRegistry, MeadowViewer,
+    MeadowWindState, PatchAudioTag, WindDirection, WindParams, palette_table, upload_placements,
+    upload_trunk_slots,
 };
 
 pub use plugin::{MeadowSolariGeometryNormals, MeadowWindFreeze};
