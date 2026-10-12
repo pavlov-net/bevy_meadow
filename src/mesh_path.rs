@@ -1324,10 +1324,10 @@ pub fn meadow_mesh_deferred_pass(
     };
 
     // Same attachment arrangement as bevy's deferred prepass ([normal?,
-    // motion?, gbuffer, lighting-id], `None` holes preserved) — the
-    // pipeline's target list was mirrored from the same def set. All
-    // `get_attachment()` calls load here: bevy's prepass performed the
-    // frame's clears earlier in the chain.
+    // motion?, gbuffer, lighting-id, specular-tint?], `None` holes
+    // preserved) — the pipeline's target list was mirrored from the same
+    // def set. All `get_attachment()` calls load here: bevy's prepass
+    // performed the frame's clears earlier in the chain.
     let (Some(deferred_texture), Some(lighting_pass_id)) = (
         &prepass_textures.deferred,
         &prepass_textures.deferred_lighting_pass_id,
@@ -1350,12 +1350,15 @@ pub fn meadow_mesh_deferred_pass(
     } else {
         None
     };
-    let color_attachments = [
+    let mut color_attachments = vec![
         normal_attachment,
         motion_attachment,
         Some(deferred_texture.get_attachment()),
         Some(lighting_pass_id.get_attachment()),
     ];
+    if let Some(specular_tint) = &prepass_textures.deferred_specular_tint {
+        color_attachments.push(Some(specular_tint.get_attachment()));
+    }
     let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
 
     let diagnostics = ctx.diagnostic_recorder();
