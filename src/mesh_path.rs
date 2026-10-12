@@ -2033,7 +2033,7 @@ mod tests {
         );
 
         // bevy_pbr's deferred flags share the G-buffer A byte with meadow's
-        // bits 27 and 28 (flag bits 3 and 4).
+        // bits 30 and 31 (flag bits 6 and 7).
         let types = std::fs::read_to_string(root.join("crates/bevy_pbr/src/deferred/types.wesl"))
             .expect("readable deferred types");
         for line in types.lines().filter(|l| l.starts_with("const DEFERRED_")) {
@@ -2047,7 +2047,7 @@ mod tests {
                 continue;
             };
             assert!(
-                shift != 3 && shift != 4,
+                shift != 6 && shift != 7,
                 "bevy_pbr deferred flag collides with a meadow G-buffer bit: {line}"
             );
         }

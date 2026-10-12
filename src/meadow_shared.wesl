@@ -315,20 +315,20 @@ fn meadow_shading_normal(view_direction: vec3<f32>) -> vec3<f32> {
         + v * margin;
 }
 
-// G-buffer A bit 27 marks a meadow pixel as a thin two-sided receiver. The
+// G-buffer A bit 31 marks a meadow pixel as a thin two-sided receiver. The
 // contract is private to meadow: both raster paths write it and meadow's
 // Solari receiver pass (`meadow_receivers.wesl`) is its only reader. bevy_pbr's
-// deferred flags occupy bits 24..26 and the packed normal bits 0..23; neither
-// is altered.
-const MEADOW_GBUFFER_THIN_RECEIVER_BIT: u32 = 1u << 27u;
+// deferred flags grow up from bit 24 and the packed normal holds bits 0..23;
+// meadow takes the flag byte's top two bits and alters neither.
+const MEADOW_GBUFFER_THIN_RECEIVER_BIT: u32 = 1u << 31u;
 
-// G-buffer A bit 28 marks a geometric-normal payload in B, read only by
-// meadow's Solari receiver pass and meaningful only together with bit 27. B
-// bits 0..15 keep reflectance/metallic; bits 16..23 and 24..31 carry the
+// G-buffer A bit 30 marks a geometric-normal payload in B, read only by
+// meadow's Solari receiver pass and meaningful only together with bit 31. B
+// bits 0..15 keep IOR, specular and metallic; bits 16..23 and 24..31 carry the
 // octahedral triangle normal as two unorm8 values. The payload overwrites the
 // AO and clearcoat bytes that deferred lighting reads, so the caller gates it
 // with `width_range.z`.
-const MEADOW_GBUFFER_GEOMETRIC_NORMAL_BIT: u32 = 1u << 28u;
+const MEADOW_GBUFFER_GEOMETRIC_NORMAL_BIT: u32 = 1u << 30u;
 
 // Reconstruct each invocation's OWN rasterized position in view space.
 // Differentiating absolute world-position varyings loses precision far from
@@ -363,7 +363,7 @@ fn meadow_pack_geometric_normal(
     let magnitude = abs(triangle_normal);
     let scale = max(magnitude.x, max(magnitude.y, magnitude.z));
     // Avoid normalizing a collapsed, non-finite, or numerically tiny
-    // derivative cross product. Absence of bit 28 invokes consumer fallback.
+    // derivative cross product. Absence of bit 30 invokes consumer fallback.
     if (!enabled || !(scale > 1e-20) || !all(magnitude < vec3<f32>(1e30))) {
         return result;
     }
@@ -378,7 +378,7 @@ fn meadow_pack_geometric_normal(
 }
 
 // Octahedral coordinates in [0,1]² of the packed payload, in the convention of
-// `bevy_render::utils::octahedral_decode`. Valid only when A bit 28 is set.
+// `bevy_render::utils::octahedral_decode`. Valid only when A bit 30 is set.
 fn meadow_unpack_geometric_normal_oct(gbuffer_b: u32) -> vec2<f32> {
     return vec2<f32>(f32((gbuffer_b >> 16u) & 255u), f32(gbuffer_b >> 24u)) / 255.0;
 }

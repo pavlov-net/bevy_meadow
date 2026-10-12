@@ -22,7 +22,7 @@ import bevy_pbr::render::mesh_view_bindings::view;
 import bevy_meadow::meadow_shared::{MEADOW_GBUFFER_THIN_RECEIVER_BIT, meadow_pack_geometric_normal, meadow_triangle_normal};
 
 import bevy_pbr::deferred::functions::deferred_gbuffer_from_pbr_input;
-import bevy_pbr::deferred::types::pack_specular_tint;
+import bevy_pbr::deferred::types::pack_specular_tint_transmission;
 import bevy_pbr::prepass::io::FragmentOutput;
 import bevy_meadow::meadow_mesh_bindings::{MeadowVertexOut, meadow_motion_vector, variant_params};
 import bevy_meadow::meadow_mesh_pbr_common::meadow_blade_pbr_input;
@@ -44,7 +44,10 @@ fn fragment_deferred(
     out.deferred = meadow_pack_geometric_normal(out.deferred, triangle_normal, variant_params.width_range.z > 0.5);
     out.deferred_lighting_pass_id = pbr_input.material.deferred_lighting_pass_id;
 @if(DEFERRED_SPECULAR_TINT)
-    out.deferred_specular_tint = pack_specular_tint(pbr_input.material.specular_tint);
+    out.deferred_specular_tint = pack_specular_tint_transmission(
+        pbr_input.material.specular_tint,
+        pbr_input.material.diffuse_transmission,
+    );
 @if(NORMAL_PREPASS)
     out.normal = vec4<f32>(pbr_input.N * 0.5 + vec3<f32>(0.5), 1.0);
 @if(MOTION_VECTOR_PREPASS)
