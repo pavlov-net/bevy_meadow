@@ -147,6 +147,6 @@ fn update_meadow_viewer(
     };
     let eye = transform.translation();
     let forward = transform.forward();
-    viewer.eye_xz = eye.xz();
+    viewer.eye = eye;
     viewer.depth_plane = Vec4::new(forward.x, forward.y, forward.z, -forward.dot(eye));
 }

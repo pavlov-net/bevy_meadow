@@ -28,6 +28,10 @@ resources.
   on the ground, not a flat plane.
 - **Tree-aware placement.** Patches bias toward clearings and away from canopy,
   with authored force/suppress overrides. Grass parts around tree trunks.
+- **Cover fields.** Square tile patches grow from a world cover map you
+  supply: per-blade survival against the cover density (with tunable
+  clumping), height scale and palette entry, so a field of tiles follows the
+  map with no tile pattern.
 - **Streaming-correct.** Grass is generated only over loaded chunks; buffers
   don't thrash as chunks cross in and out.
 - **PBR for free.** Built on `ExtendedMaterial<StandardMaterial, _>`, so blades
@@ -141,7 +145,7 @@ fn drive_meadow_viewer(
 ) {
     let eye = camera.translation();
     let fwd = camera.forward().as_vec3();
-    viewer.eye_xz = eye.xz();
+    viewer.eye = eye;
     // (forward.xyz, -dot(forward, eye)) -- the camera view-depth plane.
     viewer.depth_plane = fwd.extend(-fwd.dot(eye));
 }
@@ -155,9 +159,12 @@ The other driver resources:
 
 - **`WindDirection(Vec2)`** and **`MeadowWindState`** (speed, gustiness, crest
   wavenumber) -- world wind, shared so meadow and tree foliage gust together.
-- **`MeadowHeightfield`** (`atlas`, `world_min`, `world_max`) -- an `R32Float`
-  world-XZ -> ground-Y atlas, set on world enter. Until you set one, blades sit
-  at Y=0.
+- **`MeadowHeightfield`** (`atlas`, `world_min`, `world_max`, `grid`) -- an
+  `R32Float` world-XZ -> ground-Y atlas. Set it from a `MeadowGrid<f32>` with
+  `set_grid`, which keeps the grid for raytracing caster selection (3D blade
+  distances). Until you set one, blades sit at Y=0.
+- **`MeadowCoverField`** (`atlas`, `grid`, `survival`) -- the cover map tile
+  patches grow from; see [Tile patches and the cover field](#tile-patches-and-the-cover-field).
 
 ## Authoring a variant
 
@@ -205,11 +212,58 @@ perimeter points).
 a set piece) and claims its footprint against procedural placement; `Suppress`
 carves a hole (a cave mouth, a plaza).
 
-### Trees and audio
+### Tile patches and the cover field
 
-Where trees stand in grass, upload per-patch **trunk discs** with
-`upload_trunk_slots`; the shader fades blades inside each disc so grass doesn't
-poke through a trunk. Each patch holds up to `MAX_TRUNK_DISCS_PER_PATCH` discs.
+A `PatchPlacement` is a noisy disc by default. `PatchPlacement::tile` makes a
+world-aligned square tile instead (`PatchShape::Tile`): blades fill it
+uniformly to its edge, so a lattice of tiles covers ground without overlap.
+Tile blades read the world-level `MeadowCoverField`, a grid of `CoverTexel`s
+(`density` in `[0, 1]`, `height_scale`, and a continuous `palette` index)
+sampled bilinearly per blade:
+
+- **Survival.** A blade survives where the density beats its threshold, which
+  mixes the blade's own random with spatially correlated noise by
+  `CoverSurvival::clumpiness` (feature size `noise_scale_m`). The mix is mapped
+  back to a uniform threshold, so the expected cover equals the density at any
+  clumpiness: 0 dithers evenly blade by blade, 1 cuts hard-edged clumps,
+  between gives soft clumps.
+- **Height.** Blade height scales by `height_scale`.
+- **Palette.** Each blade takes one of the two palette entries around the
+  texel's `palette` index, the upper with probability `fract(index)`, so
+  colour follows a continuous field. A negative index keeps the patch's entry.
+- **LOD.** Besides the per-patch prefix gate (taken at the tile's nearest
+  point), each blade gates again at its own 3D distance from the eye, so large
+  tiles don't step and high cameras don't get full density.
+
+Size a tile's `blade_count` for its densest cover (`cover_ceiling`: area x
+`blades_per_m2` x ceiling); survival divides the density by the ceiling, so
+sparse tiles cost proportionally less. Without a cover field, tiles grow at
+full cover with their own palette entry. `examples/cover_field.rs` builds one.
+
+### Clearings and audio
+
+Where trees, shrubs or rocks stand in grass, upload per-patch **clearing
+discs** (`TrunkDisc::new(centre, radius, fade)`) with `upload_trunk_slots`, or
+whole rows with `upload_trunk_rows`. A disc clears grass from its core and lets
+it back in across its fade band, so grass parts around a trunk instead of
+poking through it. On tile patches the disc scales the cover density, so the
+band thins through the same survival noise as the cover; on disc patches blades
+collapse toward their root. A disc can also cap grass height by direction
+and distance from its centre, such as under a shrub's skirt: upload the
+variant's **clearing profiles** (`MeadowClearingProfile`: a polar grid of
+`rings` x `sectors` heights out to `radius`) once with
+`upload_clearing_profiles`, which returns their ids (stale after the next
+upload), and lay one about a disc with
+`with_profile(id, origin_y, x_axis, radius_scale, height_scale)`: its samples
+are heights above `origin_y`, so blades on sloping ground cap against their
+own ground. Grass takes the bilinear blend of the four samples about it, rises
+to its own height one ring step past the outer ring, and in a cell whose
+samples are all within `FLAT_HEIGHT_CAP` of its ground is cleared rather than
+kept as invisible blades. A profile widens the disc: bin discs into patches by
+`outer_radius()`.
+`with_edge_noise(amount)` and `with_profile_noise(amount)` wobble the
+clearing's and the profile's outlines by up to that share of their distance so
+neither reads as a circle. Each patch holds up to `MAX_TRUNK_DISCS_PER_PATCH` discs.
 
 A variant can set an `audio_tag`; it rides onto each patch as `PatchAudioTag`,
 so your audio system can swap footstep and ambience when the player enters the
@@ -261,6 +315,14 @@ shadow-casting one). Each of its cascades clips grass to its own radial depth
 slice, so a blade casts into roughly one cascade rather than all of them, and
 `SHADOW_MAX_DIST` bounds the union. A second shadow-casting directional light
 gets no grass shadows.
+
+Under a raytracer (`solari` feature), a CPU pass selects the caster blades:
+the nearest blades as exact ribbons, then a thinning band of one-triangle
+proxies out to `SHADOW_MAX_DIST`, by 3D distance when the heightfield carries
+its grid. It mirrors the kernels' roots and survival (rims, clearing cores,
+tile cover), so dead blades take no slot, and walks only as many blades as the
+budget can keep. Casters keep their slots while their patch index lives, so
+keep a patch's index stable while it is resident.
 
 ### Runtime assumptions
 

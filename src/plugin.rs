@@ -5,6 +5,7 @@
 //! change.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::{NoFrustumCulling, VisibilityRange};
@@ -19,12 +20,13 @@ use crate::render::MeadowRenderDriver;
 
 use bevy::render::storage::ShaderBuffer;
 
+use crate::field::{MeadowCoverField, MeadowGrid};
 use crate::material::{
-    MAX_MEADOW_PALETTES, MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PaletteParams,
-    PatchData, PatchTrunkSlot, TrunkDisc, VariantParams,
+    ClearingProfileId, ClearingProfiles, MAX_MEADOW_PALETTES, MeadowClearingProfile, MeadowExt,
+    MeadowMaterial, PaletteParams, PatchData, PatchTrunkSlot, TrunkDisc, VariantParams,
 };
 use crate::mesh::{MeadowMeshes, build_blade_template_mesh, build_tuft_template_mesh};
-use crate::placement::PatchOverride;
+use crate::placement::{PatchOverride, PatchShape};
 
 /// Per-variant scalar tuning. Defaults target a dense temperate-forest
 /// meadow; other biomes override what they care about.
@@ -124,11 +126,12 @@ pub const MEAN_BLADE_SHADE: f32 = 0.85;
 /// them; single dead blades carry the rest.
 const DEAD_PATCH_SPLIT: f32 = 0.5;
 
-/// Width of the soft dead-patch edge, in the uniform patch noise's
-/// `[0, 1]` range.
+/// Widest soft dead-patch edge, in the uniform patch noise's `[0, 1]`
+/// range; the shaders narrow it to twice the patch share or its complement.
 const DEAD_PATCH_EDGE: f32 = 0.1;
 
 /// Largest height variance: keeps every blade at least 10 % of its height.
+/// MUST equal `MEADOW_MAX_HEIGHT_VARIANCE` in `meadow_shared.wesl`.
 const MAX_HEIGHT_VARIANCE: f32 = 0.9;
 
 /// One entry of a variant's palette table: the blade colours and the
@@ -145,8 +148,9 @@ pub struct MeadowPalette {
     pub live: Vec3,
     /// Dry or dead blade albedo, linear.
     pub dry: Vec3,
-    /// Expected share of dead blades in `[0, 1]`: half in small dead patches
-    /// (when `dead_patch_size > 0`), the rest as single dead blades.
+    /// Expected share of dead blades in `[0, 1]`: half in dead patches (when
+    /// `dead_patch_size > 0`), the rest as single dead blades. The cover
+    /// field's ground dryness scales the patch half ([`CoverTexel`](crate::CoverTexel)).
     pub dead_share: f32,
     /// Per-blade hue and value jitter: a value scale of `1 ± color_jitter`
     /// and a hue rotation of up to `color_jitter` radians.
@@ -154,13 +158,14 @@ pub struct MeadowPalette {
     /// Per-blade and per-patch height variance: blade heights scale by
     /// `1 ± height_variance`, clamped to `[0, 0.9]`.
     pub height_variance: f32,
-    /// World-space size of the dead-patch noise in metres; 0 leaves only
+    /// Size in metres of the dead-patch noise's base octave; 0 leaves only
     /// single dead blades.
     pub dead_patch_size: f32,
 }
 
 impl MeadowPalette {
-    /// The coverage-weighted mean albedo: `mix(live, dry, dead_share)`.
+    /// The coverage-weighted mean albedo on ground of neutral dryness:
+    /// `mix(live, dry, dead_share)`.
     pub fn mean_albedo(&self) -> Vec3 {
         self.live.lerp(self.dry, self.dead_share.clamp(0.0, 1.0))
     }
@@ -172,10 +177,10 @@ impl MeadowPalette {
     }
 
     /// The entry as the shaders read it. Dead patches take
-    /// `DEAD_PATCH_SPLIT` of the dead share and single blades the
-    /// rest, at the thresholds that make the expected dead weight equal
-    /// `dead_share`; the patch edge is no wider than twice the patch share,
-    /// so its soft ramp stays inside the noise range.
+    /// `DEAD_PATCH_SPLIT` of the dead share and single blades the rest, at
+    /// the threshold that makes the expected dead weight equal `dead_share`
+    /// on ground of neutral dryness; the shaders scale the patch share by
+    /// the ground's dryness (`meadow_patch_dead`).
     pub fn params(&self) -> PaletteParams {
         let share = self.dead_share.clamp(0.0, 1.0);
         let (frequency, patch_share) = if self.dead_patch_size > 0.0 {
@@ -185,22 +190,14 @@ impl MeadowPalette {
         };
         // Expected weight: patch + (1 - patch) * blade = share.
         let blade_share = (share - patch_share) / (1.0 - patch_share).max(1e-4);
-        let edge = DEAD_PATCH_EDGE.min(2.0 * patch_share).max(1e-4);
-        // Without patches the threshold sits past the noise range, so no
-        // root is in a patch.
-        let threshold = if patch_share > 0.0 {
-            1.0 - patch_share
-        } else {
-            2.0
-        };
         PaletteParams {
             live_jitter: self.live.extend(self.color_jitter.max(0.0)),
             dry_blade_share: self.dry.extend(blade_share),
             variance: Vec4::new(
                 self.height_variance.clamp(0.0, MAX_HEIGHT_VARIANCE),
                 frequency,
-                threshold,
-                edge.recip(),
+                patch_share,
+                DEAD_PATCH_EDGE,
             ),
         }
     }
@@ -354,6 +351,15 @@ pub struct RegisteredVariant {
     /// entities; the GPU side reads the same data via the
     /// `patches` storage buffer.
     pub placements: Vec<crate::placement::PatchPlacement>,
+    /// CPU copy of the `trunk_slots` rows, one per placement, written by
+    /// `upload_trunk_slots` / `upload_trunk_rows`.
+    pub trunk_slots: Arc<Vec<PatchTrunkSlot>>,
+    /// The clearing-profile table the discs reference, written by
+    /// `upload_clearing_profiles`, and the texture the kernels read it from
+    /// (the default image, too narrow to hold a profile, until the first
+    /// upload).
+    pub clearing_profiles: Arc<ClearingProfiles>,
+    pub clearing_profile_image: Handle<Image>,
 }
 
 impl MeadowVariantRegistry {
@@ -407,6 +413,9 @@ impl MeadowVariantRegistry {
                 variant,
                 material: material_handle,
                 placements: Vec::new(),
+                trunk_slots: Arc::default(),
+                clearing_profiles: Arc::default(),
+                clearing_profile_image: Handle::default(),
             },
         );
         id
@@ -480,11 +489,28 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
 /// handle so the broadcast is a no-op until the consumer sets a
 /// real atlas; the fallback `FallbackImage` (a 1×1 zeros texture)
 /// keeps the variant's bind group well-formed in the meantime.
+///
+/// [`Self::set_grid`] builds the atlas from a [`MeadowGrid`] and keeps the
+/// grid for raytracing caster selection, which then measures blade
+/// distances in 3D; without a grid it measures them in the plane of the
+/// eye.
 #[derive(Resource, Debug, Clone, Default)]
 pub struct MeadowHeightfield {
     pub atlas: Handle<Image>,
     pub world_min: Vec2,
     pub world_max: Vec2,
+    /// The CPU copy of `atlas`, when set through [`Self::set_grid`].
+    pub grid: Option<Arc<MeadowGrid<f32>>>,
+}
+
+impl MeadowHeightfield {
+    /// Replace the heightfield with `grid`, uploading it as a new atlas.
+    pub fn set_grid(&mut self, grid: MeadowGrid<f32>, images: &mut Assets<Image>) {
+        self.atlas = images.add(grid.to_image());
+        self.world_min = grid.world_min;
+        self.world_max = grid.world_max;
+        self.grid = Some(Arc::new(grid));
+    }
 }
 
 /// World-level camera viewpoint for meadow LOD. Consumers write this each
@@ -492,13 +518,15 @@ pub struct MeadowHeightfield {
 /// fields into every variant's `VariantParams` (see those fields'
 /// docstrings for the shader-side rationale).
 ///
-/// `eye_xz` is the camera position — the omnidirectional LOD/density pivot.
-/// `depth_plane` is the camera view-depth plane `(forward.xyz,
-/// -dot(forward, eye))`, used for shadow cascade assignment so casters land
-/// in the same cascade the receiver samples.
+/// `eye` is the camera position — the omnidirectional LOD/density pivot.
+/// Disc patches gate LOD by its planar distance; tile blades and
+/// raytracing casters by its 3D distance. `depth_plane` is the camera
+/// view-depth plane `(forward.xyz, -dot(forward, eye))`, used for shadow
+/// cascade assignment so casters land in the same cascade the receiver
+/// samples.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
 pub struct MeadowViewer {
-    pub eye_xz: Vec2,
+    pub eye: Vec3,
     pub depth_plane: Vec4,
 }
 
@@ -616,6 +644,7 @@ impl Plugin for MeadowPlugin {
         );
         app.init_resource::<MeadowWindState>();
         app.init_resource::<MeadowHeightfield>();
+        app.init_resource::<MeadowCoverField>();
         app.init_resource::<MeadowViewer>();
 
         app.add_systems(Startup, setup_meadow_meshes);
@@ -752,7 +781,7 @@ fn broadcast_viewer(
     registry: Res<MeadowVariantRegistry>,
     mut materials: ResMut<Assets<MeadowMaterial>>,
 ) {
-    let eye = Vec4::new(viewer.eye_xz.x, viewer.eye_xz.y, 0.0, 0.0);
+    let eye = Vec4::new(viewer.eye.x, viewer.eye.z, viewer.eye.y, 0.0);
     let fwd = viewer.depth_plane;
     for (_, entry) in registry.iter() {
         if let Some(mut mat) = materials.get_mut(&entry.material)
@@ -795,9 +824,37 @@ fn broadcast_heightfield(
 /// read back by `meadow_patch_palette` in `meadow_shared.wesl`.
 const PALETTE_FLAG_SHIFT: u32 = 8;
 
+/// `PatchData` flag bit marking a tile patch, read back by
+/// `meadow_patch_is_tile` in `meadow_shared.wesl`.
+const TILE_FLAG: u32 = 1 << 1;
+
 /// The flags word for a patch selecting `palette`, clamped into the table.
 fn palette_flags(palette: u32) -> u32 {
     palette.min(MAX_MEADOW_PALETTES as u32 - 1) << PALETTE_FLAG_SHIFT
+}
+
+/// A placement's `PatchData` row: a tile carries its cover ceiling in the
+/// edge-noise lane and the tile flag.
+fn patch_row(p: &crate::placement::PatchPlacement) -> PatchData {
+    // Pack seed (u32) into f32-bits so the shader can `bitcast<u32>` it
+    // back: `PatchData` carries four floats per row.
+    let seed_f = f32::from_bits(p.seed);
+    let (lane_y, flags) = match p.shape {
+        PatchShape::Disc => (p.edge_noise_amp, palette_flags(p.palette)),
+        PatchShape::Tile { cover_ceiling } => (
+            cover_ceiling.clamp(1e-4, 1.0),
+            palette_flags(p.palette) | TILE_FLAG,
+        ),
+    };
+    PatchData {
+        centre_xz_radius_seed: Vec4::new(p.centre.x, p.centre.y, p.radius, seed_f),
+        blade_count_noise_canopy_flags: Vec4::new(
+            p.blade_count as f32,
+            lane_y,
+            p.canopy_density_at_centre,
+            f32::from_bits(flags),
+        ),
+    }
 }
 
 /// Helper: write a placement list into a variant's `patches` storage
@@ -825,23 +882,7 @@ pub fn upload_placements(
     let Some(mat) = materials.get(&entry.material) else {
         return;
     };
-    let mut rows: Vec<PatchData> = Vec::with_capacity(placements.len());
-    for p in placements {
-        // Pack seed (u32) into f32-bits so the shader can `bitcast<u32>`
-        // it back. This dance is needed because `PatchData` carries
-        // four floats per row.
-        let seed_f = f32::from_bits(p.seed);
-        let flags = palette_flags(p.palette);
-        rows.push(PatchData {
-            centre_xz_radius_seed: Vec4::new(p.centre.x, p.centre.y, p.radius, seed_f),
-            blade_count_noise_canopy_flags: Vec4::new(
-                p.blade_count as f32,
-                p.edge_noise_amp,
-                p.canopy_density_at_centre,
-                f32::from_bits(flags),
-            ),
-        });
-    }
+    let mut rows: Vec<PatchData> = placements.iter().map(patch_row).collect();
     if rows.is_empty() {
         rows.push(PatchData::default());
     }
@@ -858,18 +899,15 @@ pub fn upload_placements(
 ///
 /// `slots` is sparse — only patches with at least one trunk disc are
 /// included. Patches not in the list get a default (count=0) slot.
-/// The output buffer is sized to `max(patch_idx) + 1` rows.
+/// The output buffer holds one row per placement.
 pub fn upload_trunk_slots(
     variant_id: MeadowVariantId,
     slots: &[(u32, Vec<TrunkDisc>)],
-    registry: &MeadowVariantRegistry,
+    registry: &mut MeadowVariantRegistry,
     materials: &Assets<MeadowMaterial>,
     shader_buffers: &mut Assets<ShaderBuffer>,
 ) {
     let Some(entry) = registry.get(variant_id) else {
-        return;
-    };
-    let Some(mat) = materials.get(&entry.material) else {
         return;
     };
     // Size the output to match `entry.placements.len()` so the
@@ -877,25 +915,63 @@ pub fn upload_trunk_slots(
     // placed patch — even patches not in `slots` (i.e. patches
     // with no nearby trunks) need a row, default-filled with
     // `count = 0`.
-    let row_count = entry.placements.len().max(1);
-    let mut rows: Vec<PatchTrunkSlot> = vec![PatchTrunkSlot::default(); row_count];
+    let mut rows = vec![PatchTrunkSlot::default(); entry.placements.len()];
     for (patch_idx, discs) in slots {
-        let i = *patch_idx as usize;
-        if i >= rows.len() {
-            continue;
-        }
-        let count = discs.len().min(MAX_TRUNK_DISCS_PER_PATCH);
-        let slot = &mut rows[i];
-        slot.count = count as u32;
-        for (j, d) in discs.iter().take(count).enumerate() {
-            slot.discs[j] = *d;
+        if let Some(slot) = rows.get_mut(*patch_idx as usize) {
+            *slot = PatchTrunkSlot::from_discs(discs);
         }
     }
-    let Some(mut buf) = shader_buffers.get_mut(&mat.extension.trunk_slots) else {
+    upload_trunk_rows(variant_id, rows, registry, materials, shader_buffers);
+}
+
+/// Helper: replace a variant's whole `trunk_slots` buffer with `rows`, one
+/// per placement (row `i` holds patch `i`'s discs). For consumers that keep
+/// the rows themselves and rewrite a few at a time.
+pub fn upload_trunk_rows(
+    variant_id: MeadowVariantId,
+    rows: Vec<PatchTrunkSlot>,
+    registry: &mut MeadowVariantRegistry,
+    materials: &Assets<MeadowMaterial>,
+    shader_buffers: &mut Assets<ShaderBuffer>,
+) {
+    let Some(entry) = registry.get_mut(variant_id) else {
         return;
     };
-    buf.clear();
-    buf.extend_from_slice(&rows);
+    let rows = if rows.is_empty() {
+        vec![PatchTrunkSlot::default()]
+    } else {
+        rows
+    };
+    if let Some(mat) = materials.get(&entry.material)
+        && let Some(mut buf) = shader_buffers.get_mut(&mat.extension.trunk_slots)
+    {
+        buf.clear();
+        buf.extend_from_slice(&rows);
+    }
+    entry.trunk_slots = Arc::new(rows);
+}
+
+/// Helper: replace a variant's clearing-profile table with `profiles`,
+/// returning their ids in order for [`TrunkDisc::with_profile`]. Ids from
+/// an earlier upload are stale; rebuild the discs that hold them. Empty
+/// without the variant.
+///
+/// # Panics
+///
+/// As [`ClearingProfiles::new`].
+pub fn upload_clearing_profiles(
+    variant_id: MeadowVariantId,
+    profiles: &[MeadowClearingProfile],
+    registry: &mut MeadowVariantRegistry,
+    images: &mut Assets<Image>,
+) -> Vec<ClearingProfileId> {
+    let Some(entry) = registry.get_mut(variant_id) else {
+        return Vec::new();
+    };
+    let (table, ids) = ClearingProfiles::new(profiles);
+    entry.clearing_profile_image = images.add(table.to_image());
+    entry.clearing_profiles = Arc::new(table);
+    ids
 }
 
 /// Diagnostic freeze shared by visible geometry, motion vectors, and RT casters.
@@ -989,7 +1065,7 @@ mod tests {
     fn layouts_match_the_shaders() {
         assert_eq!(PaletteParams::min_size().get(), 48);
         assert_eq!(size_of::<PaletteParams>(), 48);
-        assert_eq!(VariantParams::min_size().get(), 11 * 16);
+        assert_eq!(VariantParams::min_size().get(), 13 * 16);
         let shared = include_str!("meadow_shared.wesl");
         assert!(
             shared.contains(&format!(
@@ -1025,12 +1101,197 @@ mod tests {
         // Height variance clamps; the noise frequency is 1 / patch size.
         assert_eq!(params.variance.x, 0.9);
         assert_eq!(params.variance.y, 0.25);
-        // Half the share in patches (threshold 1 - 0.125, edge 0.1), the
-        // rest in single blades: the expected dead weight is the share.
-        assert!((params.variance.z - 0.875).abs() < 1e-6);
-        assert!((params.variance.w - 10.0).abs() < 1e-4);
+        // Half the share in patches (edge up to 0.1), the rest in single
+        // blades: the expected dead weight is the share.
+        assert_eq!(params.variance.z, 0.125);
+        assert_eq!(params.variance.w, DEAD_PATCH_EDGE);
         let blade_share = params.dry_blade_share.w;
         assert!((0.125 + 0.875 * blade_share - 0.25).abs() < 1e-6);
+    }
+
+    /// `meadow_patch_share`.
+    fn patch_share(params: &PaletteParams, dryness: f32) -> f32 {
+        (params.variance.z * 2.0 * dryness).clamp(0.0, 1.0)
+    }
+
+    /// `meadow_patch_dead`.
+    fn patch_dead(params: &PaletteParams, noise: f32, share: f32) -> f32 {
+        let edge = params
+            .variance
+            .w
+            .min(2.0 * share.min(1.0 - share))
+            .max(1e-4);
+        if share > 0.0 {
+            ((noise - (1.0 - share)) / edge + 0.5).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// `meadow_patch_noise`.
+    fn patch_noise(params: &PaletteParams, root: Vec2, dryness: f32) -> f32 {
+        if params.variance.y > 0.0 && patch_share(params, dryness) > 0.0 {
+            crate::field::patch_noise(root * params.variance.y)
+        } else {
+            0.5
+        }
+    }
+
+    /// `meadow_dryness_height`.
+    fn dryness_height(dryness: f32) -> f32 {
+        let d = dryness.clamp(0.0, 1.0) - crate::CoverTexel::NEUTRAL_DRYNESS;
+        1.0 - d * if d > 0.0 { 0.4 } else { 0.2 }
+    }
+
+    /// `meadow_blade_height_scale`.
+    fn height_scale(params: &PaletteParams, root: Vec2, dryness: f32, seed: u32) -> f32 {
+        let blade_term = 2.0 * crate::field::hash01_u32(seed.wrapping_add(19)) - 1.0;
+        let share = patch_share(params, dryness);
+        let chance = patch_dead(params, patch_noise(params, root, dryness), share);
+        let patch_term = (share - chance) / share.max(1.0 - share);
+        dryness_height(dryness) * (1.0 + params.variance.x * 0.5 * (blade_term + patch_term))
+    }
+
+    /// Whether `meadow_blade_albedo` kills the blade with seed `seed` at
+    /// `root`.
+    fn blade_is_dead(params: &PaletteParams, root: Vec2, dryness: f32, seed: u32) -> bool {
+        use crate::field::hash01_u32;
+        let chance = patch_dead(
+            params,
+            patch_noise(params, root, dryness),
+            patch_share(params, dryness),
+        );
+        hash01_u32(seed.wrapping_add(43)) < chance
+            || hash01_u32(seed.wrapping_add(19)) < params.dry_blade_share.w
+    }
+
+    /// `n` blades' seeds and roots, spread over 20 km.
+    fn blades(n: u32) -> impl Iterator<Item = (u32, Vec2)> {
+        use crate::field::{hash_u32, hash01_u32};
+        (0..n).map(|i| {
+            let seed = hash_u32(i ^ 0x2545_f491);
+            let unit = Vec2::new(hash01_u32(seed), hash01_u32(seed.wrapping_add(1)));
+            (seed, (unit - 0.5) * 20_000.0)
+        })
+    }
+
+    /// The coverage-weighted mean dead share over many blades is the dead
+    /// share on neutral ground, so a meadow's mean albedo is
+    /// `mix(live, dry, dead_share)`; elsewhere the patch share scales by
+    /// `2 * dryness` and single blades keep theirs.
+    #[test]
+    fn mean_dead_weight_follows_the_share_and_the_dryness() {
+        let n = 400_000u32;
+        for (dead_share, size) in [
+            (0.04, 6.0),
+            (0.06, 6.0),
+            (0.2, 8.0),
+            (0.35, 6.0),
+            (0.7, 4.0),
+        ] {
+            let params = MeadowPalette {
+                dead_share,
+                dead_patch_size: size,
+                ..MeadowPalette::default()
+            }
+            .params();
+            let blade = params.dry_blade_share.w;
+            for dryness in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let dead = blades(n)
+                    .filter(|&(seed, root)| blade_is_dead(&params, root, dryness, seed))
+                    .count();
+                let mean = dead as f32 / n as f32;
+                let scaled = patch_share(&params, dryness);
+                let expected = scaled + (1.0 - scaled) * blade;
+                assert!(
+                    (mean - expected).abs() < 0.002 + 0.01 * expected,
+                    "share {dead_share}, dryness {dryness}: mean {mean}, expected {expected}"
+                );
+                if dryness == crate::CoverTexel::NEUTRAL_DRYNESS {
+                    assert!((expected - dead_share).abs() < 1e-6);
+                }
+            }
+        }
+    }
+
+    /// Blade heights average the dryness factor: the unvaried height on
+    /// neutral ground, 10 % taller on the wettest and 20 % shorter on the
+    /// driest. Dead-patch blades run short where the ground has patches;
+    /// ground without them has no patch term.
+    #[test]
+    fn mean_height_follows_the_dryness() {
+        let n = 200_000u32;
+        let params = MeadowPalette {
+            dead_share: 0.2,
+            height_variance: 0.3,
+            dead_patch_size: 6.0,
+            ..MeadowPalette::default()
+        }
+        .params();
+        for (dryness, factor) in [
+            (0.0, 1.1),
+            (0.25, 1.05),
+            (0.5, 1.0),
+            (0.75, 0.9),
+            (1.0, 0.8),
+        ] {
+            assert!((dryness_height(dryness) - factor).abs() < 1e-6);
+            let share = patch_share(&params, dryness);
+            let (mut sum, mut dead_sum, mut dead_count) = (0.0f64, 0.0f64, 0u32);
+            for (seed, root) in blades(n) {
+                let h = height_scale(&params, root, dryness, seed);
+                sum += f64::from(h);
+                if patch_dead(&params, patch_noise(&params, root, dryness), share) >= 1.0 {
+                    dead_sum += f64::from(h);
+                    dead_count += 1;
+                }
+            }
+            let mean = (sum / f64::from(n)) as f32;
+            assert!(
+                (mean - factor).abs() < 0.003,
+                "dryness {dryness}: mean height {mean}, expected {factor}"
+            );
+            if dead_count > 0 {
+                let dead_mean = (dead_sum / f64::from(dead_count)) as f32;
+                assert!(
+                    dead_mean < 0.9 * mean,
+                    "dryness {dryness}: patch blades average {dead_mean}"
+                );
+            }
+        }
+        // Without a patch share only the blade term varies the height.
+        for (seed, root) in blades(1000) {
+            let blade_term = 2.0 * crate::field::hash01_u32(seed.wrapping_add(19)) - 1.0;
+            let expected = 1.1 * (1.0 + 0.15 * blade_term);
+            assert!((height_scale(&params, root, 0.0, seed) - expected).abs() < 1e-5);
+        }
+    }
+
+    /// The CPU twins carry the shader's dead-patch weight and height.
+    #[test]
+    fn patch_twins_match_the_shader() {
+        let shared = include_str!("meadow_shared.wesl");
+        for needle in [
+            "return clamp(palette.variance.z * 2.0 * dryness, 0.0, 1.0);",
+            "let edge = max(min(palette.variance.w, 2.0 * min(share, 1.0 - share)), 1e-4);",
+            "let ramp = clamp((noise - (1.0 - share)) / edge + 0.5, 0.0, 1.0);",
+            "return select(0.0, ramp, share > 0.0);",
+            "return meadow_patch_fbm(root_xz * palette.variance.y);",
+            "if (palette.variance.y <= 0.0 || meadow_patch_share(palette, dryness) <= 0.0) {",
+            "const MEADOW_MAX_DRYNESS_HEIGHT: f32 = 1.1;",
+            "let d = clamp(dryness, 0.0, 1.0) - MEADOW_NEUTRAL_DRYNESS;",
+            "return 1.0 - d * select(0.2, 0.4, d > 0.0);",
+            "let blade_term = 2.0 * hash01_u32(seed + 19u) - 1.0;",
+            "let patch_term = (share - meadow_patch_dead(palette, noise, share)) / max(share, 1.0 - share);",
+            "return meadow_dryness_height(dryness) * (1.0 + palette.variance.x * 0.5 * (blade_term + patch_term));",
+            "let patch_chance = meadow_patch_dead(palette, noise, meadow_patch_share(palette, dryness));",
+            "let dead = hash01_u32(seed + 43u) < patch_chance || hash01_u32(seed + 19u) < palette.dry_blade_share.w;",
+        ] {
+            assert!(
+                shared.contains(needle),
+                "`{needle}` missing from meadow_shared.wesl"
+            );
+        }
     }
 
     /// The bytes the palette buffer uploads hold each lane in WGSL field
@@ -1067,7 +1328,7 @@ mod tests {
         }
         .params();
         assert_eq!(params.variance.y, 0.0);
-        assert!(params.variance.z > 1.0);
+        assert_eq!(params.variance.z, 0.0);
         assert!((params.dry_blade_share.w - 0.3).abs() < 1e-6);
     }
 
@@ -1127,6 +1388,84 @@ mod tests {
         assert_eq!(
             palettes.current(MeadowVariantId(4), &variant),
             variant.palettes.as_slice()
+        );
+    }
+
+    /// A tile row carries the tile flag beside its palette bits and its
+    /// cover ceiling in the edge-noise lane; a disc row neither.
+    #[test]
+    fn tile_rows_pack_their_flag_and_ceiling() {
+        let tile =
+            crate::placement::PatchPlacement::tile(Vec2::new(4.0, -4.0), 4.0, 900, 7, 0.25, 3);
+        let row = patch_row(&tile);
+        let flags = row.blade_count_noise_canopy_flags.w.to_bits();
+        assert_eq!(flags, TILE_FLAG | (3 << PALETTE_FLAG_SHIFT));
+        assert_eq!(row.blade_count_noise_canopy_flags.y, 0.25);
+        assert_eq!(row.centre_xz_radius_seed.z, 4.0);
+        let disc = crate::placement::PatchPlacement {
+            shape: PatchShape::Disc,
+            edge_noise_amp: 0.1,
+            ..tile
+        };
+        let row = patch_row(&disc);
+        assert_eq!(
+            row.blade_count_noise_canopy_flags.w.to_bits() & TILE_FLAG,
+            0
+        );
+        assert_eq!(row.blade_count_noise_canopy_flags.y, 0.1);
+        assert!((tile.outer_radius() - 4.0 * std::f32::consts::SQRT_2).abs() < 1e-6);
+    }
+
+    /// A variant's clearing profiles get their own texture, reused by later
+    /// uploads, and leave the default image alone.
+    #[test]
+    fn clearing_profiles_upload_to_their_own_image() {
+        let mut images = Assets::<Image>::default();
+        let mut registry = MeadowVariantRegistry::default();
+        let id = registry.register(
+            MeadowVariant::default(),
+            &mut Assets::default(),
+            &mut Assets::default(),
+        );
+        let profile = MeadowClearingProfile {
+            radius: 1.0,
+            rings: 2,
+            sectors: 3,
+            heights: vec![0.5; 6],
+        };
+        let ids =
+            upload_clearing_profiles(id, &[profile.clone(), profile], &mut registry, &mut images);
+        assert_eq!(ids.len(), 2);
+        let handle = &registry.get(id).unwrap().clearing_profile_image;
+        assert_ne!(*handle, Handle::default());
+        assert_eq!(images.get(handle).unwrap().height(), 2);
+    }
+
+    /// The shaders carry their own copies of the tile flag, the height
+    /// variance clamp and the clearing-disc constants, and read discs at
+    /// their size.
+    #[test]
+    fn disc_and_tile_constants_match_the_shaders() {
+        use crate::material::{FLAT_HEIGHT_CAP, MAX_DISC_EDGE_NOISE};
+        use crate::rt_selection::BLADE_GROUND_LIFT;
+        let shared = include_str!("meadow_shared.wesl");
+        for line in [
+            format!("const MEADOW_PATCH_FLAG_TILE: u32 = {TILE_FLAG}u;"),
+            format!("const MEADOW_MAX_HEIGHT_VARIANCE: f32 = {MAX_HEIGHT_VARIANCE:?};"),
+            format!("const MEADOW_BLADE_GROUND_LIFT: f32 = {BLADE_GROUND_LIFT:?};"),
+            format!("const MEADOW_FLAT_HEIGHT_CAP: f32 = {FLAT_HEIGHT_CAP:?};"),
+            format!("const MEADOW_MAX_DISC_EDGE_NOISE: f32 = {MAX_DISC_EDGE_NOISE:?};"),
+        ] {
+            assert!(
+                shared.contains(&line),
+                "`{line}` missing from meadow_shared.wesl"
+            );
+        }
+        assert_eq!(size_of::<TrunkDisc>(), 48);
+        assert_eq!(TrunkDisc::min_size().get(), 48);
+        assert_eq!(
+            size_of::<PatchTrunkSlot>(),
+            16 + 48 * crate::MAX_TRUNK_DISCS_PER_PATCH
         );
     }
 

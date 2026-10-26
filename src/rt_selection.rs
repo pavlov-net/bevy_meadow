@@ -1,9 +1,26 @@
 //! Camera-local RT blade selection with persistent primitive ownership.
-//! CPU roots mirror the shader's two-attempt placement; GPU trig may differ
-//! by a few ulps, so this is a budget/LOD decision, not geometric clipping.
-use crate::placement::PatchPlacement;
-use bevy::math::Vec2;
+//!
+//! The CPU mirrors the shaders' blade roots and survival (rim, clearing
+//! discs, a tile's cover test) so dead blades take no slot. GPU arithmetic
+//! may differ by a few ulps, so this is a budget/LOD decision, not geometric
+//! clipping: the expansion re-derives every blade and collapses any it finds
+//! dead.
+//!
+//! Work per update scales with the selected budget, not the blades in
+//! range. The near band walks patches nearest first and stops once no
+//! patch can hold a blade nearer than the current farthest pick. The far
+//! band keeps each blade with a probability that falls with its distance;
+//! blades are ranked by index, so each patch walks only the prefix of its
+//! blades that its nearest point can keep, the way the raster LOD gate does.
+use crate::field::{
+    CoverSurvival, CoverTexel, MeadowGrid, cover_survives, hash_u32, hash01_u32, tile_root,
+};
+use crate::material::{ClearingProfiles, PatchTrunkSlot};
+use crate::placement::{PatchPlacement, PatchShape};
+use bevy::math::{Vec2, Vec3};
 use bevy::platform::collections::{HashMap, HashSet};
+use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -14,6 +31,148 @@ pub(crate) const INACTIVE: [u32; 2] = [u32::MAX; 2];
 pub(crate) const RT_NEAR_DISTANCE: f32 = 18.0;
 /// Casters end where raster grass stops casting shadows.
 const FAR_DISTANCE: f32 = crate::mesh::SHADOW_MAX_DIST;
+/// Eye travel, in metres, that triggers a reselection.
+const RESELECT_DISTANCE: f32 = 0.5;
+/// Share of the far capacity the budget aims for, leaving room for the
+/// estimate's error before the hard cut.
+const FAR_BUDGET_TARGET: f32 = 0.9;
+/// Samples per side of the grid a patch's far-band blade count is
+/// estimated over.
+const ESTIMATE_SAMPLES: u32 = 4;
+
+/// One live patch, by its stable index into the variant's patch buffers.
+pub(crate) type LivePlacements = Arc<Vec<(u32, PatchPlacement)>>;
+
+pub(crate) fn same_placements(a: &LivePlacements, b: &LivePlacements) -> bool {
+    Arc::ptr_eq(a, b) || a == b
+}
+
+fn same_arc<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    a.as_ref().map(Arc::as_ptr) == b.as_ref().map(Arc::as_ptr)
+}
+
+/// Blade `blade`'s seed in a patch seeded `seed` (`derive_blade`).
+fn blade_seed(seed: u32, blade: u32) -> u32 {
+    hash_u32(seed ^ blade.wrapping_mul(0x27d4_eb2d))
+}
+
+/// The blade's root, `None` where the shader rejects both disc attempts.
+fn blade_root(p: &PatchPlacement, blade: u32) -> Option<Vec2> {
+    let seed = blade_seed(p.seed, blade);
+    if p.is_tile() {
+        return Some(p.centre + tile_root(p.radius, seed));
+    }
+    for attempt in 0u32..2 {
+        let theta = hash01_u32(seed.wrapping_add(attempt * 17)) * std::f32::consts::TAU;
+        let r = hash01_u32(seed.wrapping_add(attempt * 17 + 1)).sqrt();
+        let candidate = Vec2::new(theta.cos(), theta.sin()) * r * p.radius;
+        let harmonic = 1.0
+            + p.edge_noise_amp
+                * ((theta * 3.0 + (p.seed & 0xff) as f32 * 0.37).sin()
+                    + 0.5 * (theta * 5.0 + (p.seed & 0x3f) as f32 * 1.7).sin());
+        if candidate.length() <= p.radius * harmonic {
+            return Some(p.centre + candidate);
+        }
+    }
+    None
+}
+
+/// Height of a blade's root above the heightfield. MUST equal
+/// `MEADOW_BLADE_GROUND_LIFT` in `meadow_shared.wesl`.
+pub(crate) const BLADE_GROUND_LIFT: f32 = 0.02;
+
+/// Everything a selection reads besides the eye.
+#[derive(Clone, Default)]
+pub(crate) struct RtInputs {
+    pub(crate) placements: LivePlacements,
+    /// The variant's clearing-disc rows, indexed like its patches, and the
+    /// clearing profiles they reference.
+    pub(crate) trunks: Arc<Vec<PatchTrunkSlot>>,
+    pub(crate) profiles: Arc<ClearingProfiles>,
+    pub(crate) cover: Option<Arc<MeadowGrid<CoverTexel>>>,
+    pub(crate) survival: CoverSurvival,
+    /// Ground heights, for 3D distances; without them distances are planar.
+    pub(crate) heights: Option<Arc<MeadowGrid<f32>>>,
+}
+
+impl RtInputs {
+    /// Whether `other` selects the same blades as `self` for any eye.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        same_placements(&self.placements, &other.placements)
+            && Arc::ptr_eq(&self.trunks, &other.trunks)
+            && Arc::ptr_eq(&self.profiles, &other.profiles)
+            && same_arc(&self.cover, &other.cover)
+            && same_arc(&self.heights, &other.heights)
+            && self.survival == other.survival
+    }
+
+    /// Whether the blade rooted at `root` survives the patch's clearing
+    /// discs and, on a tile, the cover field under them.
+    pub(crate) fn live(&self, index: u32, p: &PatchPlacement, blade: u32, root: Vec2) -> bool {
+        let mut stand = 1.0f32;
+        let discs = self
+            .trunks
+            .get(index as usize)
+            .map_or(&[][..], |slot| slot.discs());
+        let mut ground_y = None;
+        for disc in discs {
+            if disc.centre().distance_squared(root) < disc.outer_radius().powi(2) {
+                // The kernels' `ground_y`: a missing heightfield samples as 0.
+                let ground_y = *ground_y.get_or_insert_with(|| {
+                    self.heights.as_ref().map_or(0.0, |h| h.sample(root)) + BLADE_GROUND_LIFT
+                });
+                stand = stand.min(disc.effect(&self.profiles, root, ground_y, 0.0).0);
+                // A cleared blade is dead on a tile and a disc patch alike.
+                if stand <= 0.0 {
+                    return false;
+                }
+            }
+        }
+        match (p.shape, &self.cover) {
+            (PatchShape::Tile { cover_ceiling }, Some(cover)) => cover_survives(
+                &self.survival,
+                root,
+                blade_seed(p.seed, blade),
+                cover.sample(root).density * stand,
+                cover_ceiling,
+            ),
+            _ => stand > 1e-4,
+        }
+    }
+
+    /// A lower bound on the height between `eye_y` and patch `p`'s ground,
+    /// from the heightfield at its centre and corners less a metre of
+    /// slack for relief between them; 0 without a heightfield.
+    fn height_gap(&self, p: &PatchPlacement, eye_y: f32) -> f32 {
+        let Some(heights) = &self.heights else {
+            return 0.0;
+        };
+        let r = p.outer_radius();
+        let (lo, hi) = [
+            Vec2::ZERO,
+            Vec2::new(-r, -r),
+            Vec2::new(r, -r),
+            Vec2::new(-r, r),
+            Vec2::splat(r),
+        ]
+        .iter()
+        .map(|offset| heights.sample(p.centre + *offset))
+        .fold((f32::MAX, f32::MIN), |(lo, hi), h| (lo.min(h), hi.max(h)));
+        (eye_y - hi - 1.0).max(lo - 1.0 - eye_y).max(0.0)
+    }
+
+    /// Ground height at `root`, or `eye_y` without a heightfield.
+    fn ground(&self, root: Vec2, eye_y: f32) -> f32 {
+        self.heights
+            .as_ref()
+            .map_or(eye_y, |h| h.sample(root) + BLADE_GROUND_LIFT)
+    }
+
+    /// Squared eye distance of the blade at `root`.
+    fn distance_squared(&self, root: Vec2, eye: Vec3) -> f32 {
+        Vec3::new(root.x, self.ground(root, eye.y), root.y).distance_squared(eye)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Owner {
@@ -21,18 +180,81 @@ struct Owner {
     blade: u32,
     incarnation: u64,
 }
-struct CachedPatch {
-    incarnation: u64,
-    key: [u32; 9],
-    roots: Vec<(u32, Vec2)>,
-}
+
+/// A near-band candidate, ordered nearest first.
 #[derive(Clone, Copy)]
-struct Candidate {
+struct NearCandidate {
     owner: Owner,
     distance_squared: f32,
     rank: u32,
-    near_overlap: bool,
-    far_priority: f32,
+}
+impl PartialEq for NearCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for NearCandidate {}
+impl PartialOrd for NearCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for NearCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance_squared
+            .total_cmp(&other.distance_squared)
+            .then(self.rank.cmp(&other.rank))
+            .then(self.owner.cmp(&other.owner))
+    }
+}
+
+/// A far-band candidate. Priority below zero marks a blade inside the near
+/// band's reach, which the far band must hold for the complementary
+/// transition; the rest rank by how deep they sit under their keep share.
+#[derive(Clone, Copy)]
+struct FarCandidate {
+    owner: Owner,
+    priority: f32,
+}
+fn far_order(a: &FarCandidate, b: &FarCandidate) -> std::cmp::Ordering {
+    a.priority
+        .total_cmp(&b.priority)
+        .then(a.owner.cmp(&b.owner))
+}
+
+/// `meadow_blade_rank`: blade `blade`'s place in the LOD prefix order of
+/// `count` blades, in (0, 1).
+fn lod_rank(blade: u32, count: u32) -> f32 {
+    (blade as f32 + 0.5) / count.max(1) as f32
+}
+
+/// Per-blade tie-break rank, decorrelated from the placement hash.
+fn tie_break(p: &PatchPlacement, blade: u32) -> u32 {
+    hash_u32(p.seed ^ blade.wrapping_mul(0x9e37_79b9))
+}
+
+/// The far band's share of live blades kept at eye distance `d`, past the
+/// near band's reach `end`, under budget `budget` (`None`: unbounded). Full
+/// up to `end`, thinning with distance; the budget term `1 - exp(-T /
+/// beyond²)` approaches 1 continuously at `end`, so coverage has no cliff
+/// at the boundary.
+fn keep_share(d: f32, end: f32, budget: Option<f32>) -> f32 {
+    let beyond = (d - end).max(0.0);
+    if beyond <= 0.0 {
+        return 1.0;
+    }
+    let ramp = (beyond / (FAR_DISTANCE - end).max(1e-3)).clamp(0.0, 1.0);
+    let density = (1.0 - 0.75 * ramp) * (1.0 - 0.5 * ramp);
+    density * budget.map_or(1.0, |t| 1.0 - (-t / (beyond * beyond)).exp())
+}
+
+/// A candidate patch: its live index, placement, incarnation and the
+/// nearest planar distance any of its blades can lie from the eye.
+struct Reach<'a> {
+    index: u32,
+    placement: &'a PatchPlacement,
+    incarnation: u64,
+    nearest: f32,
 }
 
 #[derive(Default)]
@@ -42,97 +264,27 @@ pub(crate) struct RtSelection {
     pub(crate) near_generation: u64,
     pub(crate) far_generation: u64,
     pub(crate) near_transition: [f32; 2],
-    pub(crate) selection_center: Vec2,
+    pub(crate) selection_center: Vec3,
     pub(crate) candidate_count: usize,
     pub(crate) coverage_radius: f32,
     exact_radius: Option<f32>,
-    cache: HashMap<u32, CachedPatch>,
+    /// `(placement, incarnation)` per live patch index; a changed placement
+    /// at an index is a new owner.
+    incarnations: HashMap<u32, (PatchPlacement, u64)>,
     next_incarnation: u64,
     near_owners: Vec<Option<Owner>>,
     far_owners: Vec<Option<Owner>>,
-    last_update: Option<(Vec2, usize, usize, Vec<[u32; 9]>)>,
+    last_update: Option<(Vec3, usize, usize, RtInputs)>,
 }
 
-fn placement_key(index: u32, p: &PatchPlacement) -> [u32; 9] {
-    [
-        index,
-        p.centre.x.to_bits(),
-        p.centre.y.to_bits(),
-        p.radius.to_bits(),
-        p.blade_count,
-        p.seed,
-        p.edge_noise_amp.to_bits(),
-        p.canopy_density_at_centre.to_bits(),
-        0,
-    ]
-}
-fn hash(mut x: u32) -> u32 {
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7feb352d);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846ca68b);
-    x ^ (x >> 16)
-}
-fn unit(x: u32) -> f32 {
-    (x & 0x00ff_ffff) as f32 / 16_777_216.0
-}
-fn root(p: &PatchPlacement, blade: u32) -> Option<Vec2> {
-    let seed = hash(p.seed ^ blade.wrapping_mul(0x27d4eb2d));
-    for attempt in 0u32..2 {
-        let h0 = hash(seed.wrapping_add(attempt * 17));
-        let h1 = hash(seed.wrapping_add(attempt * 17 + 1));
-        let theta = unit(h0) * std::f32::consts::TAU;
-        let candidate = Vec2::new(theta.cos(), theta.sin()) * unit(h1).sqrt() * p.radius;
-        let harmonic = 1.0
-            + p.edge_noise_amp
-                * ((theta * 3.0 + (p.seed & 0xff) as f32 * 0.37).sin()
-                    + 0.5 * (theta * 5.0 + (p.seed & 0x3f) as f32 * 1.7).sin());
-        if candidate.length() <= p.radius * harmonic {
-            return Some(p.centre + candidate);
-        }
-    }
-    None // Both rejected: the shader sets rim_factor to zero.
-}
-fn roots(p: &PatchPlacement) -> Vec<(u32, Vec2)> {
-    (0..p.blade_count)
-        .filter_map(|b| root(p, b).map(|r| (b, r)))
-        .collect()
-}
-/// Per-blade selection rank, decorrelated from the placement hash.
-fn blade_rank(p: &PatchPlacement, blade: u32) -> u32 {
-    hash(p.seed ^ blade.wrapping_mul(0x9e3779b9))
-}
-fn near_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-    a.distance_squared
-        .total_cmp(&b.distance_squared)
-        .then(a.rank.cmp(&b.rank))
-        .then(a.owner.cmp(&b.owner))
-}
-fn far_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-    b.near_overlap
-        .cmp(&a.near_overlap)
-        .then(a.far_priority.total_cmp(&b.far_priority))
-        .then(a.rank.cmp(&b.rank))
-        .then(a.owner.cmp(&b.owner))
-}
-fn bounded(
-    candidates: &mut Vec<Candidate>,
-    capacity: usize,
-    order: fn(&Candidate, &Candidate) -> std::cmp::Ordering,
-) {
-    if candidates.len() > capacity {
-        candidates.select_nth_unstable_by(capacity, order);
-        candidates.truncate(capacity);
-    }
-}
 fn assign(
-    candidates: &mut [Candidate],
+    selected: impl Iterator<Item = Owner>,
     capacity: usize,
     owners: &mut Vec<Option<Owner>>,
     slots: &mut Vec<[u32; 2]>,
     generation: &mut u64,
 ) {
-    let mut newcomers: HashSet<_> = candidates.iter().map(|c| c.owner).collect();
+    let mut newcomers: HashSet<_> = selected.collect();
     let mut changed = owners.len() != capacity;
     owners.resize(capacity, None);
     for owner in owners.iter_mut() {
@@ -164,37 +316,34 @@ fn assign(
         *generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
 impl RtSelection {
     pub(crate) fn needs_update(
         &self,
-        placements: &[(u32, PatchPlacement)],
-        viewer: Vec2,
+        inputs: &RtInputs,
+        eye: Vec3,
         near_capacity: usize,
         far_capacity: usize,
     ) -> bool {
-        // Share this inexpensive gate with the async task scheduler.
-        self.needs_viewer_update(viewer, near_capacity, far_capacity)
-            || self.last_update.as_ref().is_some_and(|(_, _, _, keys)| {
-                keys.len() != placements.len()
-                    || !keys
-                        .iter()
-                        .zip(placements)
-                        .all(|(key, (index, p))| *key == placement_key(*index, p))
-            })
+        self.needs_viewer_update(eye, near_capacity, far_capacity)
+            || self
+                .last_update
+                .as_ref()
+                .is_some_and(|(_, _, _, last)| !last.same(inputs))
     }
 
-    /// `needs_update` without the placement comparison, for callers that
-    /// know the placements match the last update.
+    /// `needs_update` without the input comparison, for callers that know
+    /// the inputs match the last update.
     pub(crate) fn needs_viewer_update(
         &self,
-        viewer: Vec2,
+        eye: Vec3,
         near_capacity: usize,
         far_capacity: usize,
     ) -> bool {
         self.last_update
             .as_ref()
-            .is_none_or(|(old_viewer, old_near, old_far, _)| {
-                old_viewer.distance_squared(viewer) > 0.25
+            .is_none_or(|(old_eye, old_near, old_far, _)| {
+                old_eye.distance_squared(eye) > RESELECT_DISTANCE * RESELECT_DISTANCE
                     || *old_near != near_capacity
                     || *old_far != far_capacity
             })
@@ -203,18 +352,184 @@ impl RtSelection {
     #[cfg(test)]
     pub(crate) fn update(
         &mut self,
-        placements: &[(u32, PatchPlacement)],
-        viewer: Vec2,
+        inputs: &RtInputs,
+        eye: Vec3,
         near_capacity: usize,
         far_capacity: usize,
     ) {
-        self.update_mode(placements, viewer, near_capacity, far_capacity, None);
+        self.update_mode(inputs, eye, near_capacity, far_capacity, None);
+    }
+
+    /// The live patches near enough to hold a caster, with their
+    /// incarnations, nearest first.
+    fn reach<'a>(&mut self, inputs: &'a RtInputs, eye: Vec3) -> Vec<Reach<'a>> {
+        let same_patches = self
+            .last_update
+            .as_ref()
+            .is_some_and(|(_, _, _, last)| Arc::ptr_eq(&last.placements, &inputs.placements));
+        if !same_patches {
+            let live: HashSet<_> = inputs.placements.iter().map(|(index, _)| *index).collect();
+            self.incarnations.retain(|index, _| live.contains(index));
+        }
+        let mut reach = Vec::new();
+        for (index, p) in inputs.placements.iter() {
+            let planar = (p.centre.distance(Vec2::new(eye.x, eye.z)) - p.outer_radius()).max(0.0);
+            if planar > FAR_DISTANCE || p.blade_count == 0 {
+                continue;
+            }
+            let nearest = planar.hypot(inputs.height_gap(p, eye.y));
+            if nearest > FAR_DISTANCE {
+                continue;
+            }
+            let next = &mut self.next_incarnation;
+            let entry = self.incarnations.entry(*index).or_insert_with(|| {
+                *next += 1;
+                (*p, *next)
+            });
+            if entry.0 != *p {
+                *next += 1;
+                *entry = (*p, *next);
+            }
+            reach.push(Reach {
+                index: *index,
+                placement: p,
+                incarnation: entry.1,
+                nearest,
+            });
+        }
+        reach.sort_by(|a, b| a.nearest.total_cmp(&b.nearest).then(a.index.cmp(&b.index)));
+        reach
+    }
+
+    /// The `capacity` live blades nearest `eye` within `radius`, and the
+    /// number of live blades the walk met within it.
+    fn select_near(
+        inputs: &RtInputs,
+        reach: &[Reach],
+        eye: Vec3,
+        radius: f32,
+        capacity: usize,
+    ) -> (Vec<NearCandidate>, usize) {
+        if capacity == 0 {
+            return (Vec::new(), 0);
+        }
+        let mut heap = BinaryHeap::with_capacity(capacity);
+        let mut met = 0;
+        let eye_xz = Vec2::new(eye.x, eye.z);
+        for r in reach {
+            // The heap's worst pick bounds what the rest can contribute.
+            let limit_squared = match heap.peek() {
+                Some(worst) if heap.len() == capacity => {
+                    let NearCandidate {
+                        distance_squared, ..
+                    } = *worst;
+                    distance_squared.min(radius * radius)
+                }
+                _ => radius * radius,
+            };
+            if r.nearest * r.nearest > limit_squared {
+                break;
+            }
+            let p = r.placement;
+            for blade in 0..p.blade_count {
+                let Some(root) = blade_root(p, blade) else {
+                    continue;
+                };
+                if root.distance_squared(eye_xz) > limit_squared {
+                    continue;
+                }
+                let distance_squared = inputs.distance_squared(root, eye);
+                if distance_squared > radius * radius || !inputs.live(r.index, p, blade, root) {
+                    continue;
+                }
+                met += 1;
+                let candidate = NearCandidate {
+                    owner: Owner {
+                        patch: r.index,
+                        blade,
+                        incarnation: r.incarnation,
+                    },
+                    distance_squared,
+                    rank: tie_break(p, blade),
+                };
+                if heap.len() < capacity {
+                    heap.push(candidate);
+                } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+                    heap.pop();
+                    heap.push(candidate);
+                }
+            }
+        }
+        (heap.into_vec(), met)
+    }
+
+    /// Far-band blade samples: `(eye distance, live blades it stands for)`
+    /// over a grid of each patch's ground, within `start..=FAR_DISTANCE`.
+    fn far_samples(inputs: &RtInputs, reach: &[Reach], eye: Vec3, start: f32) -> Vec<(f32, f32)> {
+        let n = ESTIMATE_SAMPLES;
+        let offsets = (0..n * n).map(|i| {
+            (Vec2::new((i % n) as f32, (i / n) as f32) + 0.5) / n as f32 * 2.0 - Vec2::ONE
+        });
+        let tile_offsets: Vec<Vec2> = offsets.clone().collect();
+        let disc_offsets: Vec<Vec2> = offsets.filter(|o| o.length_squared() <= 1.0).collect();
+        let mut samples = Vec::new();
+        for r in reach {
+            let p = r.placement;
+            let (offsets, ceiling) = match p.shape {
+                PatchShape::Tile { cover_ceiling } => {
+                    (&tile_offsets, Some(cover_ceiling.max(1e-4)))
+                }
+                PatchShape::Disc => (&disc_offsets, None),
+            };
+            let blades = p.blade_count as f32 / offsets.len() as f32;
+            for offset in offsets {
+                let point = p.centre + *offset * p.radius;
+                let d = inputs.distance_squared(point, eye).sqrt();
+                if d < start || d > FAR_DISTANCE {
+                    continue;
+                }
+                let live = match (&inputs.cover, ceiling) {
+                    (Some(cover), Some(ceiling)) => {
+                        (cover.sample(point).density / ceiling).min(1.0)
+                    }
+                    _ => 1.0,
+                };
+                samples.push((d, blades * live));
+            }
+        }
+        samples
+    }
+
+    /// The far band's budget term: unbounded when every eligible blade
+    /// fits, else the largest that keeps the estimate from `samples` on
+    /// target.
+    fn far_budget(samples: &[(f32, f32)], end: f32, capacity: usize) -> Option<f32> {
+        let estimate = |budget| -> f32 {
+            samples
+                .iter()
+                .map(|&(d, blades)| blades * keep_share(d, end, budget))
+                .sum()
+        };
+        let target = capacity as f32 * FAR_BUDGET_TARGET;
+        if estimate(None) <= target {
+            return None;
+        }
+        let (mut lo, mut hi) = (-12.0_f32, 12.0_f32);
+        for _ in 0..16 {
+            let mid = 0.5 * (lo + hi);
+            if estimate(Some(mid.exp2())) > target {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(lo.exp2())
     }
 
     pub(crate) fn update_mode(
         &mut self,
-        placements: &[(u32, PatchPlacement)],
-        viewer: Vec2,
+        inputs: &RtInputs,
+        eye: Vec3,
         near_capacity: usize,
         far_capacity: usize,
         exact_radius: Option<f32>,
@@ -224,64 +539,26 @@ impl RtSelection {
             self.exact_radius = exact_radius;
         }
         let near_distance = exact_radius.unwrap_or(RT_NEAR_DISTANCE);
-        // Hold the selection center within 0.5m; shader transitions use the
-        // same center so they never outrun the currently selected slots.
-        if !self.needs_update(placements, viewer, near_capacity, far_capacity) {
+        // Hold the selection centre within the reselect distance; shader
+        // transitions use the same centre so they never outrun the
+        // currently selected slots.
+        if !self.needs_update(inputs, eye, near_capacity, far_capacity) {
             return;
         }
-        self.selection_center = viewer;
-        let live: HashSet<_> = placements.iter().map(|(index, _)| *index).collect();
-        self.cache.retain(|index, _| live.contains(index));
-        let mut near = Vec::new();
-        for (index, p) in placements {
-            // All generated roots lie within radius, even with a noisy edge.
-            if p.centre.distance(viewer) > FAR_DISTANCE + p.radius {
-                continue;
-            }
-            let key = placement_key(*index, p);
-            let cached = self.cache.entry(*index).or_insert_with(|| CachedPatch {
-                key,
-                incarnation: {
-                    self.next_incarnation += 1;
-                    self.next_incarnation
-                },
-                roots: roots(p),
-            });
-            if cached.key != key {
-                cached.key = key;
-                self.next_incarnation += 1;
-                cached.incarnation = self.next_incarnation;
-                cached.roots = roots(p);
-            }
-            for &(blade, position) in &cached.roots {
-                let distance_squared = position.distance_squared(viewer);
-                if distance_squared <= near_distance * near_distance {
-                    near.push(Candidate {
-                        owner: Owner {
-                            patch: *index,
-                            blade,
-                            incarnation: cached.incarnation,
-                        },
-                        distance_squared,
-                        rank: blade_rank(p, blade),
-                        near_overlap: false,
-                        far_priority: 0.0,
-                    });
-                }
-            }
-        }
-        self.candidate_count = near.len();
-        bounded(&mut near, near_capacity, near_order);
-        // When not saturated retain the full 18m band, avoiding a changing
+        self.selection_center = eye;
+        let reach = self.reach(inputs, eye);
+        let (near, met) = Self::select_near(inputs, &reach, eye, near_distance, near_capacity);
+        self.candidate_count = met;
+        // When not saturated retain the full near band, avoiding a changing
         // transition whenever the outermost patch streams in or out.
-        let end = if near.len() == near_capacity && near_capacity != 0 {
+        let end = if near_capacity == 0 {
+            0.0
+        } else if near.len() == near_capacity {
             near.iter()
                 .map(|c| c.distance_squared)
                 .fold(0.0, f32::max)
                 .sqrt()
                 .min(near_distance)
-        } else if near_capacity == 0 {
-            0.0
         } else {
             near_distance
         };
@@ -293,88 +570,73 @@ impl RtSelection {
         } else {
             [end * 0.75, end]
         };
-        let selected_near: HashSet<_> = near.iter().map(|c| c.owner).collect();
         let mut far = Vec::new();
-        let start_squared = self.near_transition[0] * self.near_transition[0];
-        let end_squared = end * end;
-        for (index, p) in placements {
-            if exact_radius.is_some() || p.centre.distance(viewer) > FAR_DISTANCE + p.radius {
-                continue;
+        if exact_radius.is_none() && far_capacity > 0 {
+            let start = self.near_transition[0];
+            let samples = Self::far_samples(inputs, &reach, eye, start);
+            let budget = Self::far_budget(&samples, end, far_capacity);
+            let eye_xz = Vec2::new(eye.x, eye.z);
+            for r in &reach {
+                let p = r.placement;
+                // Keep shares fall with distance, so the patch's nearest
+                // point bounds its blades' and its walk stops at that prefix.
+                let bound = keep_share(r.nearest, end, budget);
+                let prefix = ((bound * p.blade_count as f32).ceil() as u32).min(p.blade_count);
+                for blade in 0..prefix {
+                    let Some(root) = blade_root(p, blade) else {
+                        continue;
+                    };
+                    if root.distance_squared(eye_xz) > FAR_DISTANCE * FAR_DISTANCE {
+                        continue;
+                    }
+                    let d = inputs.distance_squared(root, eye).sqrt();
+                    if d < start || d > FAR_DISTANCE {
+                        continue;
+                    }
+                    let rank = lod_rank(blade, p.blade_count);
+                    let share = keep_share(d, end, budget);
+                    if rank >= share || !inputs.live(r.index, p, blade, root) {
+                        continue;
+                    }
+                    far.push(FarCandidate {
+                        owner: Owner {
+                            patch: r.index,
+                            blade,
+                            incarnation: r.incarnation,
+                        },
+                        priority: if d <= end { -1.0 } else { rank / share },
+                    });
+                }
             }
-            let Some(cached) = self.cache.get(index) else {
-                continue;
-            };
-            for &(blade, position) in &cached.roots {
-                let distance_squared = position.distance_squared(viewer);
-                if distance_squared < start_squared
-                    || distance_squared > FAR_DISTANCE * FAR_DISTANCE
-                {
-                    continue;
-                }
-                let rank = blade_rank(p, blade);
-                let beyond_near = (distance_squared.sqrt() - end).max(0.0);
-                let ramp = (beyond_near / (FAR_DISTANCE - end)).clamp(0.0, 1.0);
-                // Full eligibility across the complementary transition;
-                // thinning beyond it is never compensated by wider geometry.
-                let density = (1.0 - 0.75 * ramp) * (1.0 - 0.5 * ramp);
-                if unit(hash(rank ^ 0xa511e9b3)) >= density {
-                    continue;
-                }
-                let owner = Owner {
-                    patch: *index,
-                    blade,
-                    incarnation: cached.incarnation,
-                };
-                far.push(Candidate {
-                    owner,
-                    distance_squared,
-                    rank,
-                    near_overlap: distance_squared <= end_squared && selected_near.contains(&owner),
-                    // Exponential weighted selection makes retention approach
-                    // 1 continuously at the exact-near boundary. With budget
-                    // cutoff T, retention is 1-exp(-T/distance²), rather than
-                    // jumping directly to a global far-band keep fraction.
-                    // Separate randomness from density and transition gates.
-                    far_priority: {
-                        // 23-bit bin midpoints are representable strictly
-                        // inside (0,1), including both endpoint bins.
-                        let u =
-                            ((hash(rank ^ 0x68bc21eb) & 0x007f_ffff) as f32 + 0.5) / 8_388_608.0;
-                        -(1.0 - u).ln() * beyond_near * beyond_near
-                    },
-                });
+            if far.len() > far_capacity {
+                far.select_nth_unstable_by(far_capacity, far_order);
+                far.truncate(far_capacity);
             }
         }
-        bounded(&mut far, far_capacity, far_order);
         assign(
-            &mut near,
+            near.iter().map(|c| c.owner),
             near_capacity,
             &mut self.near_owners,
             &mut self.near_slots,
             &mut self.near_generation,
         );
         assign(
-            &mut far,
+            far.iter().map(|c| c.owner),
             far_capacity,
             &mut self.far_owners,
             &mut self.far_slots,
             &mut self.far_generation,
         );
-        self.last_update = Some((
-            viewer,
-            near_capacity,
-            far_capacity,
-            placements
-                .iter()
-                .map(|(index, p)| placement_key(*index, p))
-                .collect(),
-        ));
+        self.last_update = Some((eye, near_capacity, far_capacity, inputs.clone()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::material::TrunkDisc;
+    use bevy::math::UVec2;
+
     fn patch(x: f32, seed: u32) -> PatchPlacement {
         PatchPlacement {
             centre: Vec2::new(x, 0.0),
@@ -384,13 +646,45 @@ mod tests {
             edge_noise_amp: 0.2,
             canopy_density_at_centre: 0.0,
             palette: 0,
+            shape: PatchShape::Disc,
         }
     }
+    fn inputs(placements: &[(u32, PatchPlacement)]) -> RtInputs {
+        RtInputs {
+            placements: Arc::new(placements.to_vec()),
+            ..Default::default()
+        }
+    }
+    fn eye(x: f32) -> Vec3 {
+        Vec3::new(x, 0.0, 0.0)
+    }
+    /// Every live blade of `inputs` within `radius` of `eye`, nearest first.
+    fn live_within(inputs: &RtInputs, eye: Vec3, radius: f32) -> Vec<[u32; 2]> {
+        let mut all = Vec::new();
+        for (index, p) in inputs.placements.iter() {
+            for blade in 0..p.blade_count {
+                if let Some(root) = blade_root(p, blade)
+                    && inputs.live(*index, p, blade, root)
+                {
+                    let d = inputs.distance_squared(root, eye);
+                    if d <= radius * radius {
+                        all.push((d, tie_break(p, blade), [*index, blade]));
+                    }
+                }
+            }
+        }
+        all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        all.into_iter().map(|(_, _, id)| id).collect()
+    }
+    fn occupied(slots: &[[u32; 2]]) -> HashSet<[u32; 2]> {
+        slots.iter().copied().filter(|s| *s != INACTIVE).collect()
+    }
+
     #[test]
     fn nearest_coverage_capacity_and_retained_slots() {
-        let patches = [(0, patch(2.0, 12)), (1, patch(12.0, 13))];
+        let patches = inputs(&[(0, patch(2.0, 12)), (1, patch(12.0, 13))]);
         let mut s = RtSelection::default();
-        s.update(&patches, Vec2::ZERO, 50, 40);
+        s.update(&patches, Vec3::ZERO, 50, 40);
         assert_eq!(s.near_slots.len(), 50);
         assert_eq!(s.far_slots.len(), 40);
         assert!(s.near_slots.iter().all(|id| id[0] == 0));
@@ -400,35 +694,36 @@ mod tests {
             .enumerate()
             .map(|(i, id)| (*id, i))
             .collect();
-        let selected: HashSet<_> = s.near_slots.iter().copied().collect();
+        let selected = occupied(&s.near_slots);
         let furthest = s.near_transition[1];
         for b in 0..100 {
-            if let Some(r) = root(&patches[0].1, b) {
-                if r.length() < furthest {
-                    assert!(selected.contains(&[0, b]));
-                }
+            if let Some(r) = blade_root(&patches.placements[0].1, b)
+                && r.length() < furthest
+            {
+                assert!(selected.contains(&[0, b]));
             }
         }
-        s.update(&patches, Vec2::new(0.05, 0.0), 50, 40);
+        s.update(&patches, eye(0.6), 50, 40);
         for (i, id) in s.near_slots.iter().enumerate() {
             if let Some(old_i) = old.get(id) {
                 assert_eq!(i, *old_i);
             }
         }
     }
+
     #[test]
     fn ownership_generation_and_determinism() {
-        let mut patches = [(0, patch(2.0, 12)), (1, patch(12.0, 13))];
+        let mut list = vec![(0, patch(2.0, 12)), (1, patch(12.0, 13))];
         let mut s = RtSelection::default();
-        s.update(&patches, Vec2::ZERO, 50, 40);
+        s.update(&inputs(&list), Vec3::ZERO, 50, 40);
         let before = (
             s.near_slots.clone(),
             s.far_slots.clone(),
             s.near_generation,
             s.far_generation,
         );
-        patches.reverse();
-        s.update(&patches, Vec2::ZERO, 50, 40);
+        list.reverse();
+        s.update(&inputs(&list), Vec3::ZERO, 50, 40);
         assert_eq!(
             before,
             (
@@ -439,40 +734,151 @@ mod tests {
             )
         );
         let mut other = RtSelection::default();
-        other.update(&patches, Vec2::ZERO, 50, 40);
+        other.update(&inputs(&list), Vec3::ZERO, 50, 40);
         assert_eq!(other.near_slots, s.near_slots);
         assert_eq!(other.far_slots, s.far_slots);
         assert_ne!(other.near_generation, s.near_generation);
-        assert_ne!(other.far_generation, s.far_generation);
-        patches[1].1.seed += 1;
-        s.update(&patches, Vec2::ZERO, 50, 40);
+        list[1].1.seed += 1;
+        s.update(&inputs(&list), Vec3::ZERO, 50, 40);
         assert!(s.near_generation > before.2);
         let generation = s.near_generation;
-        s.update(&[], Vec2::ZERO, 50, 40);
+        s.update(&inputs(&[]), Vec3::ZERO, 50, 40);
         assert!(s.near_slots.iter().all(|s| *s == INACTIVE));
         assert!(s.near_generation > generation);
     }
+
+    /// A patch leaving the live set frees only its own slots: the others'
+    /// owners keep their slots, so their RT identity survives eviction.
     #[test]
-    fn far_budget_preserves_complementary_transition() {
-        let patches = [
-            (0, patch(2.0, 12)),
-            (1, patch(22.0, 13)),
-            (2, patch(30.0, 14)),
+    fn evicting_a_patch_keeps_other_owners_in_place() {
+        let list = [
+            (3, patch(-3.0, 21)),
+            (7, patch(3.0, 22)),
+            (9, patch(9.0, 23)),
         ];
         let mut s = RtSelection::default();
-        s.update(&patches, Vec2::ZERO, 50, 50);
-        let far: HashSet<_> = s.far_slots.iter().copied().collect();
-        for id in &s.near_slots {
-            let r = root(&patches[0].1, id[1]).unwrap();
-            if r.length() >= s.near_transition[0] {
-                assert!(far.contains(id));
+        s.update(&inputs(&list), Vec3::ZERO, 400, 400);
+        let before_near = s.near_slots.clone();
+        let before_far = s.far_slots.clone();
+        s.update(&inputs(&[list[0], list[2]]), Vec3::ZERO, 400, 400);
+        for (before, after) in [(before_near, &s.near_slots), (before_far, &s.far_slots)] {
+            for (old, new) in before.iter().zip(after) {
+                if old[0] == 7 {
+                    assert_eq!(*new, INACTIVE);
+                } else if *old != INACTIVE {
+                    assert_eq!(old, new, "a surviving owner moved slot");
+                }
             }
         }
     }
+
+    /// A tile field with clearing discs: the pruned near selection is the
+    /// brute-force nearest `capacity` live blades, and every selected blade
+    /// in either band passes the survival test the shaders apply.
+    #[test]
+    fn selection_matches_brute_force_and_skips_dead_blades() {
+        let dims = UVec2::new(17, 17);
+        let texels = (0..dims.x * dims.y)
+            .map(|i| CoverTexel::new(((i % dims.x) as f32 / 16.0).min(1.0), 1.0, 0.0))
+            .collect();
+        let cover = MeadowGrid::new(Vec2::splat(-16.0), Vec2::splat(16.0), dims, texels);
+        let heights = MeadowGrid::new(
+            Vec2::splat(-16.0),
+            Vec2::splat(16.0),
+            UVec2::new(2, 2),
+            vec![0.0, 4.0, 0.0, 4.0],
+        );
+        let tiles: Vec<_> = (0..16u32)
+            .map(|i| {
+                let centre = Vec2::new((i % 4) as f32 * 8.0 - 12.0, (i / 4) as f32 * 8.0 - 12.0);
+                (
+                    i * 3 + 1,
+                    PatchPlacement::tile(centre, 4.0, 600, 1000 + i, 1.0, 0),
+                )
+            })
+            .collect();
+        // Tile index 28 is centred at (-4, 4).
+        let mut trunks = vec![PatchTrunkSlot::default(); 64];
+        trunks[28] = PatchTrunkSlot::from_discs(&[TrunkDisc::new(Vec2::new(-4.0, 4.0), 2.0, 0.5)]);
+        let field = RtInputs {
+            placements: Arc::new(tiles),
+            trunks: Arc::new(trunks),
+            profiles: Arc::default(),
+            cover: Some(Arc::new(cover)),
+            survival: CoverSurvival {
+                noise_scale_m: 3.0,
+                clumpiness: 0.6,
+            },
+            heights: Some(Arc::new(heights)),
+        };
+        let eye = Vec3::new(1.5, 3.0, -2.0);
+        let capacity = 300;
+        let mut s = RtSelection::default();
+        s.update(&field, eye, capacity, 2000);
+        let reference: HashSet<[u32; 2]> = live_within(&field, eye, RT_NEAR_DISTANCE)
+            .into_iter()
+            .take(capacity)
+            .collect();
+        assert_eq!(occupied(&s.near_slots), reference);
+        let by_index: HashMap<u32, PatchPlacement> = field.placements.iter().copied().collect();
+        let selected = occupied(&s.near_slots);
+        let far = occupied(&s.far_slots);
+        assert!(far.len() > 500, "{}", far.len());
+        for id in selected.union(&far) {
+            let p = &by_index[&id[0]];
+            let root = blade_root(p, id[1]).unwrap();
+            assert!(
+                field.live(id[0], p, id[1], root),
+                "dead blade {id:?} selected"
+            );
+            if id[0] == 28 {
+                assert!(root.distance(Vec2::new(-4.0, 4.0)) > 2.0);
+            }
+        }
+    }
+
+    /// Selection measures eye distance in 3D: an eye high above the grass
+    /// selects nothing in the near band.
+    #[test]
+    fn high_eye_selects_by_3d_distance() {
+        let heights = MeadowGrid::new(
+            Vec2::splat(-50.0),
+            Vec2::splat(50.0),
+            UVec2::new(2, 2),
+            vec![0.0; 4],
+        );
+        let mut field = inputs(&[(0, patch(0.0, 5))]);
+        field.heights = Some(Arc::new(heights));
+        let mut s = RtSelection::default();
+        s.update(&field, Vec3::new(0.0, 30.0, 0.0), 50, 50);
+        assert!(occupied(&s.near_slots).is_empty());
+        assert!(!occupied(&s.far_slots).is_empty());
+        s.update(&field, Vec3::new(0.0, 60.0, 0.0), 50, 50);
+        assert!(occupied(&s.far_slots).is_empty());
+    }
+
+    #[test]
+    fn far_budget_preserves_complementary_transition() {
+        let list = inputs(&[
+            (0, patch(2.0, 12)),
+            (1, patch(22.0, 13)),
+            (2, patch(30.0, 14)),
+        ]);
+        let mut s = RtSelection::default();
+        s.update(&list, Vec3::ZERO, 50, 50);
+        let far = occupied(&s.far_slots);
+        for id in occupied(&s.near_slots) {
+            let r = blade_root(&list.placements[0].1, id[1]).unwrap();
+            if r.length() >= s.near_transition[0] {
+                assert!(far.contains(&id));
+            }
+        }
+    }
+
     #[test]
     fn saturated_far_budget_has_continuous_radial_coverage() {
         // Uniform disc with substantially more eligible blades than slots.
-        // Retention thins gradually with distance; a global far hash cutoff
+        // Retention thins gradually with distance; a global far cutoff
         // would drop from complete overlap to sparse coverage in the first
         // bin outside the near boundary.
         let p = PatchPlacement {
@@ -483,18 +889,22 @@ mod tests {
             edge_noise_amp: 0.0,
             canopy_density_at_centre: 0.0,
             palette: 0,
+            shape: PatchShape::Disc,
         };
+        let list = inputs(&[(0, p)]);
         let mut s = RtSelection::default();
-        s.update(&[(0, p)], Vec2::ZERO, 8_000, 20_000);
-        let far: HashSet<_> = s.far_slots.iter().copied().collect();
-        assert_eq!(far.len(), 20_000);
-        assert!(!far.contains(&INACTIVE));
+        s.update(&list, Vec3::ZERO, 8_000, 20_000);
+        let far = occupied(&s.far_slots);
+        assert!(far.len() > 17_000 && far.len() <= 20_000, "{}", far.len());
         let end = s.near_transition[1];
         let bounds = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 50.0];
         let mut total = [0usize; 8];
         let mut selected = [0usize; 8];
-        for &(blade, position) in &s.cache[&0].roots {
-            let delta = position.length() - end;
+        for blade in 0..p.blade_count {
+            let Some(root) = blade_root(&p, blade) else {
+                continue;
+            };
+            let delta = root.length() - end;
             if let Some(bin) = bounds
                 .windows(2)
                 .position(|w| delta >= w[0] && delta < w[1])
@@ -508,7 +918,6 @@ mod tests {
             .zip(total)
             .map(|(&n, d)| n as f32 / d as f32)
             .collect();
-        eprintln!("near end {end:.2}m, far radial retention {rates:?}");
         assert!(
             rates[0] > 0.97,
             "boundary coverage must approach full: {rates:?}"
@@ -524,78 +933,74 @@ mod tests {
             rates[7] < 0.05,
             "must respect budget through gradual thinning: {rates:?}"
         );
-        for id in &s.near_slots {
-            let r = root(&p, id[1]).unwrap().length();
+        for id in occupied(&s.near_slots) {
+            let r = blade_root(&p, id[1]).unwrap().length();
             if r >= s.near_transition[0] {
-                assert!(far.contains(id));
+                assert!(far.contains(&id));
             }
         }
     }
+
     #[test]
-    fn selection_center_hysteresis_and_placement_changes() {
-        let mut patches = [(0, patch(2.0, 12))];
+    fn selection_center_hysteresis_and_input_changes() {
+        let mut list = vec![(0, patch(2.0, 12))];
         let mut s = RtSelection::default();
-        s.update(&patches, Vec2::ZERO, 50, 50);
+        let same = inputs(&list);
+        s.update(&same, Vec3::ZERO, 50, 50);
         let generation = s.near_generation;
-        s.update(&patches, Vec2::new(0.4, 0.0), 50, 50);
-        assert_eq!(s.selection_center, Vec2::ZERO);
-        assert!(!s.needs_update(&patches, Vec2::new(0.4, 0.0), 50, 50));
-        assert!(s.needs_update(&patches, Vec2::new(0.6, 0.0), 50, 50));
+        s.update(&same, eye(0.4), 50, 50);
+        assert_eq!(s.selection_center, Vec3::ZERO);
+        assert!(!s.needs_update(&same, eye(0.4), 50, 50));
+        assert!(s.needs_update(&same, eye(0.6), 50, 50));
+        assert!(s.needs_update(&same, Vec3::new(0.0, 0.6, 0.0), 50, 50));
         assert_eq!(s.near_generation, generation);
-        s.update(&patches, Vec2::new(0.6, 0.0), 50, 50);
-        assert_eq!(s.selection_center, Vec2::new(0.6, 0.0));
-        patches[0].1.seed += 1;
-        assert!(s.needs_update(&patches, Vec2::new(0.6, 0.0), 50, 50));
-        assert!(!s.needs_viewer_update(Vec2::new(0.6, 0.0), 50, 50));
-        assert!(s.needs_viewer_update(Vec2::new(0.6, 0.0), 51, 50));
-        s.update(&patches, Vec2::new(0.7, 0.0), 50, 50);
-        assert_eq!(s.selection_center, Vec2::new(0.7, 0.0));
+        s.update(&same, eye(0.6), 50, 50);
+        assert_eq!(s.selection_center, eye(0.6));
+        list[0].1.seed += 1;
+        let changed = inputs(&list);
+        assert!(s.needs_update(&changed, eye(0.6), 50, 50));
+        assert!(!s.needs_viewer_update(eye(0.6), 50, 50));
+        assert!(s.needs_viewer_update(eye(0.6), 51, 50));
+        let mut retrunked = same.clone();
+        retrunked.trunks = Arc::new(Vec::new());
+        assert!(s.needs_update(&retrunked, eye(0.6), 50, 50));
+        s.update(&changed, eye(0.7), 50, 50);
+        assert_eq!(s.selection_center, eye(0.7));
     }
+
     #[test]
     fn exact_reference_has_complete_local_coverage_and_no_proxies() {
-        let patches = [(0, patch(2.0, 12)), (1, patch(12.0, 13))];
+        let list = inputs(&[(0, patch(2.0, 12)), (1, patch(12.0, 13))]);
         let mut s = RtSelection::default();
-        s.update_mode(&patches, Vec2::ZERO, 200, 200, Some(4.0));
-        let expected: HashSet<_> = patches
-            .iter()
-            .flat_map(|(p, placement)| {
-                (0..placement.blade_count).filter_map(move |b| {
-                    root(placement, b)
-                        .filter(|r| r.length() <= 4.0)
-                        .map(|_| [*p, b])
-                })
-            })
-            .collect();
-        let actual: HashSet<_> = s
-            .near_slots
-            .iter()
-            .copied()
-            .filter(|s| *s != INACTIVE)
-            .collect();
+        s.update_mode(&list, Vec3::ZERO, 200, 200, Some(4.0));
+        let expected: HashSet<_> = live_within(&list, Vec3::ZERO, 4.0).into_iter().collect();
+        let actual = occupied(&s.near_slots);
         assert_eq!(actual, expected);
         assert_eq!(s.candidate_count, expected.len());
         assert_eq!(s.coverage_radius, 4.0);
         assert!(s.near_transition[0] > 4.0);
         assert!(s.far_slots.iter().all(|s| *s == INACTIVE));
         // Mode and radius changes must bypass the stationary-camera cache.
-        s.update_mode(&patches, Vec2::ZERO, 200, 200, Some(1.0));
+        s.update_mode(&list, Vec3::ZERO, 200, 200, Some(1.0));
         assert_eq!(s.coverage_radius, 1.0);
-        assert!(s.near_slots.iter().filter(|s| **s != INACTIVE).count() < actual.len());
-        s.update(&patches, Vec2::ZERO, 200, 200);
+        assert!(occupied(&s.near_slots).len() < actual.len());
+        s.update(&list, Vec3::ZERO, 200, 200);
         assert_eq!(s.coverage_radius, 18.0);
         assert!(s.near_transition[0] < 18.0);
     }
+
     #[test]
     fn exact_reference_reports_capacity_limited_coverage() {
         let p = patch(2.0, 12);
+        let list = inputs(&[(0, p)]);
         let mut s = RtSelection::default();
-        s.update_mode(&[(0, p)], Vec2::ZERO, 10, 20, Some(4.0));
+        s.update_mode(&list, Vec3::ZERO, 10, 20, Some(4.0));
         assert!(s.candidate_count > 10);
         assert!(s.coverage_radius < 4.0);
         assert_eq!(s.near_slots.len(), 10);
-        let selected: HashSet<_> = s.near_slots.iter().copied().collect();
+        let selected = occupied(&s.near_slots);
         for b in 0..p.blade_count {
-            if root(&p, b).is_some_and(|r| r.length() < s.coverage_radius) {
+            if blade_root(&p, b).is_some_and(|r| r.length() < s.coverage_radius) {
                 assert!(selected.contains(&[0, b]));
             }
         }
@@ -605,11 +1010,30 @@ mod tests {
     #[test]
     fn empty_and_zero_capacity() {
         let mut s = RtSelection::default();
-        s.update(&[], Vec2::ZERO, 0, 0);
+        s.update(&inputs(&[]), Vec3::ZERO, 0, 0);
         assert!(s.near_slots.is_empty());
         assert_eq!(s.near_transition, [0.0, 0.0]);
-        s.update(&[(0, patch(2.0, 12))], Vec2::ZERO, 0, 0);
+        s.update(&inputs(&[(0, patch(2.0, 12))]), Vec3::ZERO, 0, 0);
         assert!(s.near_slots.is_empty());
         assert!(s.far_slots.is_empty());
+    }
+
+    /// The CPU roots carry the shader's derivation constants.
+    #[test]
+    fn roots_match_the_shader_constants() {
+        let compute = include_str!("meadow_compute.wesl");
+        let shared = include_str!("meadow_shared.wesl");
+        for needle in [
+            "hash_u32(p_seed ^ (blade_idx * 0x27D4EB2Du))",
+            "hash_u32(blade_seed + attempt * 17u)",
+            "sin(theta * 3.0 + f32(p_seed & 0xFFu) * 0.37)",
+            "0.5 * sin(theta * 5.0 + f32(p_seed & 0x3Fu) * 1.7)",
+        ] {
+            assert!(
+                compute.contains(needle),
+                "`{needle}` missing from meadow_compute.wesl"
+            );
+        }
+        assert!(shared.contains("return (2.0 * u - 1.0) * half;"));
     }
 }

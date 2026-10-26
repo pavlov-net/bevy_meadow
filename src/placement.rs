@@ -43,16 +43,68 @@ pub struct PatchPlacement {
     pub canopy_density_at_centre: f32,
     /// Index of the variant palette-table entry this patch's blades take
     /// their colour and variance from. `place_patches` leaves it 0; the
-    /// consumer assigns it.
+    /// consumer assigns it. Tile blades take theirs from the cover field
+    /// where it sets one.
     pub palette: u32,
+    pub shape: PatchShape,
+}
+
+/// The ground a patch's blades fill.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum PatchShape {
+    /// A disc of `radius` whose edge `edge_noise_amp` modulates, with blades
+    /// thinning across the variant's rim falloff.
+    #[default]
+    Disc,
+    /// A world-aligned square of half-width `radius`, filled uniformly to its
+    /// edge so neighbouring tiles join without overlap. Its blades survive,
+    /// grow and colour by the [`MeadowCoverField`](crate::MeadowCoverField),
+    /// and thin with LOD by their own distance from the eye.
+    Tile {
+        /// The largest cover density in the tile, in `(0, 1]`. Size
+        /// `blade_count` for this share of the tile's full density: survival
+        /// divides the density by it, so the expected cover stays the field's.
+        cover_ceiling: f32,
+    },
 }
 
 impl PatchPlacement {
+    /// A tile patch: the square of half-width `half_size` about `centre`.
+    /// `blade_count` should be the tile's area times the blade density times
+    /// `cover_ceiling`.
+    pub fn tile(
+        centre: Vec2,
+        half_size: f32,
+        blade_count: u32,
+        seed: u32,
+        cover_ceiling: f32,
+        palette: u32,
+    ) -> Self {
+        Self {
+            centre,
+            radius: half_size,
+            blade_count,
+            seed,
+            edge_noise_amp: 0.0,
+            canopy_density_at_centre: 0.0,
+            palette,
+            shape: PatchShape::Tile { cover_ceiling },
+        }
+    }
+
     /// Conservative bounding radius for culling / trunk-disc
     /// inclusion: max blade height isn't included here (the entity's
-    /// `Aabb` carries that), only the noisy-blob radial growth.
+    /// `Aabb` carries that), only the noisy-blob radial growth or a tile's
+    /// corners.
     pub fn outer_radius(&self) -> f32 {
-        self.radius * (1.0 + self.edge_noise_amp)
+        match self.shape {
+            PatchShape::Disc => self.radius * (1.0 + self.edge_noise_amp),
+            PatchShape::Tile { .. } => self.radius * std::f32::consts::SQRT_2,
+        }
+    }
+
+    pub fn is_tile(&self) -> bool {
+        matches!(self.shape, PatchShape::Tile { .. })
     }
 }
 
@@ -238,6 +290,7 @@ pub fn place_patches(
             edge_noise_amp: params.patch_edge_noise_amp,
             canopy_density_at_centre: canopy,
             palette: 0,
+            shape: PatchShape::Disc,
         });
     }
 
@@ -306,6 +359,7 @@ pub fn place_patches(
             edge_noise_amp: params.patch_edge_noise_amp,
             canopy_density_at_centre: canopy,
             palette: 0,
+            shape: PatchShape::Disc,
         });
     }
 

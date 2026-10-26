@@ -24,6 +24,8 @@ struct PatchData {
 
 struct TrunkDisc {
     center_radius_fade: vec4<f32>,
+    profile_frame: vec4<f32>,
+    noise_profile: vec4<f32>,
 }
 
 struct PatchTrunkSlot {
@@ -80,6 +82,10 @@ struct MeadowMeshView {
 @group(3) @binding(6) var<uniform> mesh_view: MeadowMeshView;
 // The variant's palette table; each patch indexes it by its flags.
 @group(3) @binding(7) var<storage, read> palettes: array<PaletteParams, 64>;
+// The cover field atlas tile patches read (`meadow_shared::meadow_sample_cover`).
+@group(3) @binding(8) var cover_field: texture_2d<f32>;
+// The variant's clearing-profile table (`material.rs::ClearingProfiles`).
+@group(3) @binding(9) var clearing_profiles: texture_2d<f32>;
 
 // ---------- shared stage interface ----------
 

@@ -51,17 +51,22 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderStartup, RenderSystem
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::field::MeadowCoverField;
 use crate::material::{MAX_MEADOW_PALETTES, MeadowMaterial, PaletteParams, VariantParams};
 use crate::mesh::{
     BLADE_RECORD_SIZE, INDIRECT_ARGS_SIZE, MEADOW_MAX_BANDS, MEADOW_MAX_VIEWS, MESH_TASK_BLADES,
     SHADOW_MAX_DIST,
 };
+use crate::plugin::MeadowHeightfield;
 use crate::plugin::{
     MeadowLodCurve, MeadowPalettes, MeadowPatch, MeadowVariant, MeadowVariantId,
     MeadowVariantRegistry, MeadowViewer, palette_table,
 };
 use crate::render::{MeadowRenderDriver, RenderMeadowMeshIds};
-use crate::rt_selection::{INACTIVE as RT_VACANT_SLOT, RT_NEAR_DISTANCE, RtSelection};
+use crate::rt_selection::{
+    INACTIVE as RT_VACANT_SLOT, LivePlacements, RT_NEAR_DISTANCE, RtInputs, RtSelection,
+    same_placements,
+};
 
 const MEADOW_COMPUTE_SHADER: &str = "embedded://bevy_meadow/meadow_compute.wesl";
 
@@ -258,32 +263,25 @@ pub struct MeadowGpuBuffers {
     pub by_variant: HashMap<MeadowVariantId, VariantGpuBuffers>,
 }
 
-/// One variant's live `(patch_index, placement)` pairs. The extract cache
-/// replaces the `Arc` only when the contents change, so pointer identity
-/// implies equal contents.
-type LivePlacements = Arc<Vec<(u32, crate::placement::PatchPlacement)>>;
-
-fn same_placements(a: &LivePlacements, b: &LivePlacements) -> bool {
-    Arc::ptr_eq(a, b) || a == b
-}
-
 // Selection runs off-thread: dense patches must not stall rendering while
 // the camera moves. Publish only complete mappings for the current patches.
 #[derive(Default)]
 struct RtSelectionJob {
     state: Option<RtSelection>,
     task: Option<bevy::tasks::Task<RtSelection>>,
-    /// Placements the in-flight task selects from or, while idle, the ones
-    /// `state` matches. While they are the live list, only viewer motion
+    /// Inputs the in-flight task selects from or, while idle, the ones
+    /// `state` matches. While they are the live inputs, only viewer motion
     /// can make the selection stale.
-    inputs: LivePlacements,
+    inputs: RtInputs,
+    /// Placements the published slots were selected from, less any patch
+    /// purged since.
     snapshot_inputs: LivePlacements,
     near: Arc<Vec<[u32; 2]>>,
     far: Arc<Vec<[u32; 2]>>,
     near_generation: u64,
     far_generation: u64,
     transition: [f32; 2],
-    center: Vec2,
+    center: Vec3,
     /// Radius of the exact-only reference mode, `None` while it is off.
     exact_radius: Option<f32>,
     candidate_count: usize,
@@ -292,7 +290,8 @@ struct RtSelectionJob {
     far_selected: usize,
 }
 impl RtSelectionJob {
-    fn update(&mut self, live: &LivePlacements, viewer: Vec2, diagnostics: MeadowRtDiagnostics) {
+    fn update(&mut self, inputs: &RtInputs, viewer: Vec3, diagnostics: MeadowRtDiagnostics) {
+        let live = &inputs.placements;
         // The radius shapes the selection only in exact-only mode.
         let exact_radius = diagnostics.exact_only.then_some(diagnostics.exact_radius_m);
         if self.exact_radius != exact_radius {
@@ -338,52 +337,50 @@ impl RtSelectionJob {
                 Arc::make_mut(&mut self.snapshot_inputs).retain(|(i, _)| !invalid.contains(i));
             }
         }
-        if let Some(task) = self.task.as_mut() {
-            if let Some(state) = bevy::tasks::block_on(bevy::tasks::poll_once(task)) {
-                if same_placements(&self.inputs, live) {
-                    // New snapshots get distinct generations even if the worker
-                    // state was recreated after a world transition or RT toggle.
-                    let inputs_changed = !same_placements(&self.snapshot_inputs, live);
-                    if self.near.as_ref() != &state.near_slots || inputs_changed {
-                        self.near = Arc::new(state.near_slots.clone());
-                        self.near_generation = next_rt_snapshot_generation();
-                    }
-                    if self.far.as_ref() != &state.far_slots || inputs_changed {
-                        self.far = Arc::new(state.far_slots.clone());
-                        self.far_generation = next_rt_snapshot_generation();
-                    }
-                    self.transition = state.near_transition;
-                    self.center = state.selection_center;
-                    self.near_selected = occupied_rt_slots(&state.near_slots);
-                    self.far_selected = occupied_rt_slots(&state.far_slots);
-                    self.candidate_count = state.candidate_count;
-                    self.coverage_radius = state.coverage_radius;
-                    self.snapshot_inputs = Arc::clone(live);
+        if let Some(task) = self.task.as_mut()
+            && let Some(state) = bevy::tasks::block_on(bevy::tasks::poll_once(task))
+        {
+            if self.inputs.same(inputs) {
+                // New snapshots get distinct generations even if the worker
+                // state was recreated after a world transition or RT toggle.
+                let inputs_changed = !same_placements(&self.snapshot_inputs, live);
+                if self.near.as_ref() != &state.near_slots || inputs_changed {
+                    self.near = Arc::new(state.near_slots.clone());
+                    self.near_generation = next_rt_snapshot_generation();
                 }
-                self.state = Some(state);
-                self.task = None;
+                if self.far.as_ref() != &state.far_slots || inputs_changed {
+                    self.far = Arc::new(state.far_slots.clone());
+                    self.far_generation = next_rt_snapshot_generation();
+                }
+                self.transition = state.near_transition;
+                self.center = state.selection_center;
+                self.near_selected = occupied_rt_slots(&state.near_slots);
+                self.far_selected = occupied_rt_slots(&state.far_slots);
+                self.candidate_count = state.candidate_count;
+                self.coverage_radius = state.coverage_radius;
+                self.snapshot_inputs = Arc::clone(live);
             }
+            self.state = Some(state);
+            self.task = None;
         }
         if self.task.is_none() {
             let state = self.state.get_or_insert_with(Default::default);
             let (near_capacity, far_capacity) =
                 (RT_NEAR_MAX_BLADES as usize, RT_FAR_MAX_BLADES as usize);
-            let stale = if Arc::ptr_eq(&self.inputs, live) {
+            let stale = if self.inputs.same(inputs) {
                 state.needs_viewer_update(viewer, near_capacity, far_capacity)
             } else {
-                state.needs_update(live, viewer, near_capacity, far_capacity)
+                state.needs_update(inputs, viewer, near_capacity, far_capacity)
             };
+            // An unchanged selection matches `inputs` too.
+            self.inputs = inputs.clone();
             if stale {
                 let mut state = self.state.take().unwrap();
-                self.inputs = Arc::clone(live);
-                let live = Arc::clone(live);
+                let inputs = inputs.clone();
                 self.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-                    state.update_mode(&live, viewer, near_capacity, far_capacity, exact_radius);
+                    state.update_mode(&inputs, viewer, near_capacity, far_capacity, exact_radius);
                     state
                 }));
-            } else {
-                // The selection's placement keys match `live`.
-                self.inputs = Arc::clone(live);
             }
         }
     }
@@ -461,17 +458,20 @@ fn shadow_survival(lod: &MeadowLodCurve, dist: f32) -> f32 {
 /// `viewer_xz`. Survivors are a prefix of the blade indices, so the task
 /// list covers only this many. Every threshold falls with distance, so
 /// each band's is taken at the nearest the viewer can come; `shadows`
-/// adds the shadow casters' threshold to band 0.
+/// adds the shadow casters' threshold to band 0. `gate_slack` is how much
+/// nearer than `centre` the patch gates its prefix: a tile's outer radius
+/// (`gate_dist` in the kernels), 0 for a disc.
 fn task_slice_bound(
     variant: &MeadowVariant,
     centre: Vec2,
+    gate_slack: f32,
     blade_count: u32,
     viewer_xz: Vec2,
     shadows: bool,
 ) -> u32 {
     let lod = &variant.lod;
     let dist = centre.distance(viewer_xz);
-    let nearest = (dist - TASK_LIST_VIEWER_STEP).max(0.0);
+    let nearest = (dist - gate_slack - TASK_LIST_VIEWER_STEP).max(0.0);
     let farthest = dist + TASK_LIST_VIEWER_STEP;
     let mut threshold = 0.0_f32;
     // Band 0 (near blades, shadow casters) inside `tuft_start`.
@@ -487,6 +487,15 @@ fn task_slice_bound(
         threshold = threshold.max(tuft_near.max(tuft_far));
     }
     gate_count(threshold, blade_count)
+}
+
+/// How much nearer than its centre patch `index` of `placements` gates its
+/// LOD prefix: a tile's outer radius, 0 for a disc.
+fn gate_slack(placements: &[crate::placement::PatchPlacement], index: u32) -> f32 {
+    placements
+        .get(index as usize)
+        .filter(|p| p.is_tile())
+        .map_or(0.0, crate::placement::PatchPlacement::outer_radius)
 }
 
 impl MeadowPatchLists {
@@ -532,6 +541,7 @@ impl MeadowPatchLists {
                     let bound = task_slice_bound(
                         &entry.variant,
                         p.centre,
+                        gate_slack(&entry.placements, p.patch_index),
                         p.blade_count,
                         viewer_xz,
                         shadows,
@@ -573,6 +583,12 @@ pub struct ExtractedVariant {
     pub patches: AssetId<bevy::render::storage::ShaderBuffer>,
     pub trunk_slots: AssetId<bevy::render::storage::ShaderBuffer>,
     pub heightfield: AssetId<Image>,
+    /// The variant's clearing-profile table
+    /// (`RegisteredVariant::clearing_profile_image`).
+    pub clearing_profiles: AssetId<Image>,
+    /// The cover field atlas (`MeadowCoverField::atlas`).
+    pub cover: AssetId<Image>,
+    /// The material's params with the cover field's lanes filled in.
     pub variant_params: VariantParams,
     /// The variant's palette table. Replaced only when its contents change.
     pub palettes: PaletteTable,
@@ -598,7 +614,22 @@ pub struct ExtractedVariant {
     pub rt_near_generation: u64,
     pub rt_far_generation: u64,
     pub rt_transition: [f32; 2],
-    pub rt_selection_center: Vec2,
+    pub rt_selection_center: Vec3,
+}
+
+impl ExtractedVariant {
+    /// The heightfield, cover field and clearing-profile views the kernels
+    /// bind, in that order, each falling back to the 1×1 zeros texture until
+    /// it is resident: the kernels read a field narrower than 2 texels as
+    /// ground at 0, full cover on neutral ground and no clearing profile.
+    pub(crate) fn textures<'a>(
+        &self,
+        gpu_images: &'a RenderAssets<GpuImage>,
+        fallback: &'a bevy::render::texture::FallbackImage,
+    ) -> [&'a GpuImage; 3] {
+        [self.heightfield, self.cover, self.clearing_profiles]
+            .map(|id| gpu_images.get(id).unwrap_or(&fallback.d2))
+    }
 }
 
 #[derive(Resource, Default)]
@@ -625,12 +656,12 @@ pub struct MeadowComputePipeline {
 /// Identity fingerprint of the resources a variant's compute bind group
 /// binds: the 9 storage/uniform buffers (vp uniform, patches, trunk_slots,
 /// view_cull, active_patches, blades, cursors, indirect, palettes) plus the
-/// heightfield texture view. A bind group references resources by handle,
-/// not contents, so `queue.write_buffer` doesn't invalidate it — only a
+/// heightfield, cover field and clearing-profile texture views. A bind group
+/// references resources by handle, not contents, so `queue.write_buffer` doesn't invalidate it — only a
 /// realloc/grow of one of our buffers, a heightfield fallback→resident
 /// flip, or a trunk-slots re-upload changes an id here. Rebuild only when
 /// this differs from the cached value.
-type ComputeBindGroupFingerprint = ([BufferId; 9], TextureViewId);
+type ComputeBindGroupFingerprint = ([BufferId; 9], [TextureViewId; 3]);
 
 #[derive(Resource, Default)]
 pub struct MeadowComputeBindGroups {
@@ -720,7 +751,8 @@ fn compute_bind_group_layout() -> BindGroupLayoutDescriptor {
     // Compute group 0 — order + types match meadow_compute.wesl exactly.
     // The runtime-array storage buffers use `*_sized(.., None)` since the
     // element type is a WGSL struct, not a Rust `ShaderType`.
-    // Binding 14 (palettes) sits past the RT expansion's 9..=13.
+    // Bindings 14 (palettes), 15 (cover field) and 16 (clearing profiles)
+    // sit past the RT expansion's 9..=13.
     BindGroupLayoutDescriptor::new(
         "meadow_compute_layout",
         &BindGroupLayoutEntries::with_indices(
@@ -739,6 +771,14 @@ fn compute_bind_group_layout() -> BindGroupLayoutDescriptor {
                 (7, storage_buffer_sized(false, None)),           // cursors (rw atomic)
                 (8, storage_buffer_sized(false, None)),           // indirect (rw)
                 (14, storage_buffer_read_only_sized(false, None)), // palettes
+                (
+                    15,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ), // cover_field
+                (
+                    16,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ), // clearing_profiles
             ),
         ),
     )
@@ -796,8 +836,9 @@ fn init_meadow_draw_bgl(mut commands: Commands) {
 
 /// One variant's LOD/shadow gate parameters plus the survivor estimates
 /// `extract_meadow_variants` accumulates against them each frame.
-struct VariantEstimate {
+struct VariantEstimate<'a> {
     id: MeadowVariantId,
+    placements: &'a [crate::placement::PatchPlacement],
     lod: MeadowLodCurve,
     /// Near tuft survival fraction (`MeadowVariant::tuft_survival`).
     tuft_near: f32,
@@ -815,6 +856,10 @@ fn extract_meadow_variants(
     patches: Extract<Query<Ref<MeadowPatch>>>,
     mut removed_patches: Extract<RemovedComponents<MeadowPatch>>,
     (viewer, cascade_bounds): (Extract<Option<Res<MeadowViewer>>>, Res<MeadowCascadeBounds>),
+    (cover_field, heightfield): (
+        Extract<Option<Res<MeadowCoverField>>>,
+        Extract<Option<Res<MeadowHeightfield>>>,
+    ),
     rt_config: Extract<Option<Res<MeadowRaytracingConfig>>>,
     diagnostics: Extract<Res<MeadowRtDiagnostics>>,
     telemetry: Extract<Res<MeadowRtTelemetry>>,
@@ -844,7 +889,11 @@ fn extract_meadow_variants(
     let Some(registry) = registry.as_deref() else {
         return;
     };
-    let viewer_xz = viewer.as_deref().map(|v| v.eye_xz).unwrap_or(Vec2::ZERO);
+    let eye = viewer.as_deref().map_or(Vec3::ZERO, |v| v.eye);
+    let viewer_xz = eye.xz();
+    let cover_field = cover_field.as_deref().cloned().unwrap_or_default();
+    let (cover_extents, cover_params) = cover_field.params();
+    let heights = heightfield.as_deref().and_then(|h| h.grid.clone());
     let rt_enabled = rt_config.as_deref().is_some_and(|c| c.enabled);
     // The task work list exists solely for the mesh path — build it only
     // while that path can consume it (device support, not force-compute).
@@ -863,6 +912,7 @@ fn extract_meadow_variants(
         .iter()
         .map(|(id, e)| VariantEstimate {
             id: *id,
+            placements: &e.placements,
             lod: e.variant.lod,
             tuft_near: e.variant.tuft_survival().0,
             main_near: 0.0,
@@ -890,7 +940,9 @@ fn extract_meadow_variants(
         let Some(est) = estimates.iter_mut().find(|e| e.id == patch.variant) else {
             continue;
         };
-        let dist = patch.centre.distance(viewer_xz);
+        let dist = (patch.centre.distance(viewer_xz)
+            - gate_slack(est.placements, patch.patch_index))
+        .max(0.0);
         // Band is per-patch (centre distance vs `tuft_start`), matching the
         // kernel: band 0 (near blades, shadow casters) inside `tuft_start`,
         // band 1 (far tufts) beyond. The kernels' survival thresholds
@@ -951,7 +1003,15 @@ fn extract_meadow_variants(
         };
         let selection = selections.entry(*id).or_default();
         if rt_enabled && !variant_lists.active_patches.is_empty() {
-            selection.update(&variant_lists.rt_live, viewer_xz, diagnostics);
+            let inputs = RtInputs {
+                placements: Arc::clone(&variant_lists.rt_live),
+                trunks: Arc::clone(&entry.trunk_slots),
+                profiles: Arc::clone(&entry.clearing_profiles),
+                cover: cover_field.grid.clone(),
+                survival: cover_field.survival,
+                heights: heights.clone(),
+            };
+            selection.update(&inputs, eye, diagnostics);
             stats.push(MeadowRtVariantStats {
                 variant: *id,
                 exact_only: diagnostics.exact_only,
@@ -970,13 +1030,18 @@ fn extract_meadow_variants(
                 selection_center: selection.center,
             });
         }
+        let mut variant_params = material.extension.variant_params;
+        variant_params.cover_extents = cover_extents;
+        variant_params.cover = cover_params;
         out.by_variant.insert(
             *id,
             ExtractedVariant {
                 patches: material.extension.patches.id(),
                 trunk_slots: material.extension.trunk_slots.id(),
                 heightfield: material.extension.heightfield.id(),
-                variant_params: material.extension.variant_params,
+                clearing_profiles: entry.clearing_profile_image.id(),
+                cover: cover_field.atlas.id(),
+                variant_params,
                 palettes: Arc::clone(&palette_tables[id]),
                 active_patches: Arc::clone(&variant_lists.active_patches),
                 task_slices: Arc::clone(&variant_lists.task_slices),
@@ -984,12 +1049,12 @@ fn extract_meadow_variants(
                 est_main_far: est.main_far.ceil() as u32,
                 est_shadow_records: est.shadow.ceil() as u32,
                 rt_near_slots: if rt_enabled {
-                    selection.near.clone()
+                    Arc::clone(&selection.near)
                 } else {
                     Default::default()
                 },
                 rt_far_slots: if rt_enabled {
-                    selection.far.clone()
+                    Arc::clone(&selection.far)
                 } else {
                     Default::default()
                 },
@@ -1579,12 +1644,8 @@ fn prepare_meadow_compute_bind_groups(
         let Some(trunk_slots) = shader_buffers.get(ev.trunk_slots) else {
             continue;
         };
-        // Until the consumer supplies an atlas the handle is default /
-        // not yet resident; fall back to the 1×1 zeros texture (the
-        // shader's `sample_heightfield` short-circuits a <2px texture to
-        // ground_y = 0), matching the prior `FallbackImage` path the
-        // `AsBindGroup` derive gave the raster shader.
-        let heightfield = gpu_images.get(ev.heightfield).unwrap_or(&fallback_image.d2);
+        let textures = ev.textures(&gpu_images, &fallback_image);
+        let [heightfield, cover, profiles] = textures;
         let Some(gpu) = params.by_variant.get(id) else {
             continue;
         };
@@ -1612,7 +1673,7 @@ fn prepare_meadow_compute_bind_groups(
                 vb.indirect.id(),
                 gpu.palettes.id(),
             ],
-            heightfield.texture_view.id(),
+            textures.map(|image| image.texture_view.id()),
         );
         // Skip the (non-trivial) bind-group rebuild when nothing changed.
         if let Some((_, cached)) = bind_groups.by_variant.get(id)
@@ -1635,6 +1696,8 @@ fn prepare_meadow_compute_bind_groups(
                 (7, vb.cursors.as_entire_binding()),
                 (8, vb.indirect.as_entire_binding()),
                 (14, gpu.palettes.as_entire_binding()),
+                (15, &cover.texture_view),
+                (16, &profiles.texture_view),
             )),
         );
         bind_groups.by_variant.insert(*id, (bg, fingerprint));
@@ -1769,7 +1832,7 @@ pub struct MeadowRtVariantStats {
     pub far_capacity: usize,
     pub candidate_count: usize,
     pub pending: bool,
-    pub selection_center: Vec2,
+    pub selection_center: Vec3,
 }
 
 /// Shared snapshot published by extraction, readable from main-world UI.
@@ -1820,9 +1883,9 @@ pub struct RtVariantBuffers {
     pub near: RtBandBuffers,
     /// Far band: [`RT_FAR_MAX_BLADES`] × 3-vert / 1-tri proxies.
     pub far: RtBandBuffers,
-    /// `vec4<f32>(transition_start, transition_end, selection_centre.x,
-    /// selection_centre.y)`: the near/far transition distances, measured from
-    /// the centre of the selection snapshot the slot arrays come from.
+    /// `array<vec4<f32>, 2>((transition_start, transition_end, _, _),
+    /// (centre.xyz, _))`: the near/far transition distances, measured from the
+    /// eye of the selection snapshot the slot arrays come from.
     rt_params: Buffer,
     /// Cached expand bind group, keyed on the input identities (the asset
     /// buffers and heightfield view can be swapped by the asset system; the
@@ -1837,8 +1900,9 @@ pub struct RtVariantBuffers {
 }
 
 /// Identity of every externally-owned resource the expand bind group binds:
-/// (params uniform, patches, trunk_slots, palettes; heightfield view).
-type RtExpandKey = ([BufferId; 4], TextureViewId);
+/// (params uniform, patches, trunk_slots, palettes; heightfield, cover field
+/// and clearing-profile views).
+type RtExpandKey = ([BufferId; 4], [TextureViewId; 3]);
 
 /// Frames a variant may stay inactive — no live patches, or missing from
 /// the extract entirely — before its RT buffers are freed (and
@@ -1894,8 +1958,8 @@ fn init_meadow_rt_pipeline(
     pipeline_cache: &PipelineCache,
 ) -> MeadowRtExpandPipeline {
     // Explicit binding indices — a SUBSET of meadow_compute.wesl's group 0
-    // (the read-only inputs and the palette table) plus RT bindings at
-    // 9..=13. Raster-only bindings 4..=8 are omitted.
+    // (the read-only inputs, the palette table, the cover field and the
+    // clearing profiles) plus RT bindings at 9..=13. Raster-only bindings 4..=8 are omitted.
     let expand_layout = BindGroupLayoutDescriptor::new(
         "meadow_rt_expand_layout",
         &BindGroupLayoutEntries::with_indices(
@@ -1908,12 +1972,20 @@ fn init_meadow_rt_pipeline(
                     3,
                     texture_2d(TextureSampleType::Float { filterable: false }),
                 ), // heightfield
-                (9, uniform_buffer::<Vec4>(false)),               // rt_params
+                (9, uniform_buffer::<[Vec4; 2]>(false)),          // rt_params
                 (10, storage_buffer_read_only_sized(false, None)), // stable near slots
                 (11, storage_buffer_sized(false, None)),          // rt_verts_near
                 (12, storage_buffer_read_only_sized(false, None)), // stable far slots
                 (13, storage_buffer_sized(false, None)),          // rt_verts_far
                 (14, storage_buffer_read_only_sized(false, None)), // palettes
+                (
+                    15,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ), // cover_field
+                (
+                    16,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ), // clearing_profiles
             ),
         ),
     );
@@ -2139,7 +2211,7 @@ fn prepare_meadow_rt_buffers(
                 ),
                 rt_params: render_device.create_buffer(&BufferDescriptor {
                     label: Some("meadow_rt_params"),
-                    size: 16,
+                    size: 32,
                     usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }),
@@ -2278,11 +2350,16 @@ fn dispatch_meadow_rt_expand(
                 bytemuck::cast_slice(&[
                     ev.rt_transition[0],
                     ev.rt_transition[1],
+                    0.0,
+                    0.0,
                     ev.rt_selection_center.x,
                     ev.rt_selection_center.y,
+                    ev.rt_selection_center.z,
+                    0.0,
                 ]),
             );
-            let heightfield = gpu_images.get(ev.heightfield).unwrap_or(&fallback_image.d2);
+            let textures = ev.textures(&gpu_images, &fallback_image);
+            let [heightfield, cover, profiles] = textures;
             let key = (
                 [
                     params_buf.id(),
@@ -2290,7 +2367,7 @@ fn dispatch_meadow_rt_expand(
                     trunk_slots.buffer.id(),
                     palettes.id(),
                 ],
-                heightfield.texture_view.id(),
+                textures.map(|image| image.texture_view.id()),
             );
             if rtv
                 .expand_bind_group
@@ -2311,6 +2388,8 @@ fn dispatch_meadow_rt_expand(
                         (12, rtv.far.slots.as_entire_binding()),
                         (13, rtv.far.vertices.as_entire_binding()),
                         (14, palettes.as_entire_binding()),
+                        (15, &cover.texture_view),
+                        (16, &profiles.texture_view),
                     )),
                 );
                 rtv.expand_bind_group = Some((key, bind_group));
@@ -2414,8 +2493,8 @@ mod tests {
     /// Run `job` until its worker has published and no further task is due.
     fn settle(
         job: &mut RtSelectionJob,
-        live: &LivePlacements,
-        viewer: Vec2,
+        live: &RtInputs,
+        viewer: Vec3,
         diagnostics: MeadowRtDiagnostics,
     ) {
         for _ in 0..10_000 {
@@ -2437,21 +2516,21 @@ mod tests {
             exact_only,
             exact_radius_m,
         };
-        let live = LivePlacements::default();
+        let live = RtInputs::default();
         let mut job = RtSelectionJob::default();
-        settle(&mut job, &live, Vec2::ZERO, diagnostics(false, 4.0));
+        settle(&mut job, &live, Vec3::ZERO, diagnostics(false, 4.0));
 
         let published = (job.near_generation, job.far_generation);
-        job.update(&live, Vec2::ZERO, diagnostics(false, 6.0));
+        job.update(&live, Vec3::ZERO, diagnostics(false, 6.0));
         assert_eq!((job.near_generation, job.far_generation), published);
 
-        job.update(&live, Vec2::ZERO, diagnostics(true, 6.0));
+        job.update(&live, Vec3::ZERO, diagnostics(true, 6.0));
         assert_ne!(job.near_generation, published.0);
         assert_ne!(job.far_generation, published.1);
-        settle(&mut job, &live, Vec2::ZERO, diagnostics(true, 6.0));
+        settle(&mut job, &live, Vec3::ZERO, diagnostics(true, 6.0));
 
         let published = (job.near_generation, job.far_generation);
-        job.update(&live, Vec2::ZERO, diagnostics(true, 7.0));
+        job.update(&live, Vec3::ZERO, diagnostics(true, 7.0));
         assert_ne!(job.near_generation, published.0);
         assert_ne!(job.far_generation, published.1);
     }
@@ -2473,22 +2552,27 @@ mod tests {
             edge_noise_amp: 0.2,
             canopy_density_at_centre: 0.0,
             palette: 0,
+            shape: crate::placement::PatchShape::Disc,
         };
-        let both: LivePlacements = Arc::new(vec![(0, placement(2.0, 12)), (1, placement(6.0, 13))]);
+        let rt = |list: Vec<(u32, crate::placement::PatchPlacement)>| RtInputs {
+            placements: Arc::new(list),
+            ..Default::default()
+        };
+        let both = rt(vec![(0, placement(2.0, 12)), (1, placement(6.0, 13))]);
         let mut job = RtSelectionJob::default();
-        settle(&mut job, &both, Vec2::ZERO, diagnostics);
+        settle(&mut job, &both, Vec3::ZERO, diagnostics);
         assert!(job.near.iter().any(|slot| slot[0] == 1));
 
-        job.update(&both, Vec2::new(0.4, 0.0), diagnostics);
+        job.update(&both, Vec3::new(0.4, 0.0, 0.0), diagnostics);
         assert!(job.task.is_none());
-        job.update(&both, Vec2::new(1.0, 0.0), diagnostics);
+        job.update(&both, Vec3::new(1.0, 0.0, 0.0), diagnostics);
         assert!(job.task.is_some());
-        settle(&mut job, &both, Vec2::new(1.0, 0.0), diagnostics);
-        assert_eq!(job.center, Vec2::new(1.0, 0.0));
+        settle(&mut job, &both, Vec3::new(1.0, 0.0, 0.0), diagnostics);
+        assert_eq!(job.center, Vec3::new(1.0, 0.0, 0.0));
 
-        let one: LivePlacements = Arc::new(vec![(0, placement(2.0, 12))]);
+        let one = rt(vec![(0, placement(2.0, 12))]);
         let generation = job.near_generation;
-        job.update(&one, Vec2::new(1.0, 0.0), diagnostics);
+        job.update(&one, Vec3::new(1.0, 0.0, 0.0), diagnostics);
         assert!(job.near.iter().all(|slot| slot[0] != 1));
         assert!(job.far.iter().all(|slot| slot[0] != 1));
         assert_ne!(job.near_generation, generation);
@@ -2523,9 +2607,11 @@ mod tests {
         let (tuft_near, tuft_far) = variant.tuft_survival();
         let blade_count = 40_000;
         // Mirror of `meadow_band_threshold`: main views use the near or tuft
-        // arm, shadow views the shadow arm of band 0 (tufts never cast).
-        let gate = |dist: f32, shadow: bool| -> u32 {
-            let threshold = if dist >= lod.tuft_start {
+        // arm, shadow views the shadow arm of band 0 (tufts never cast). The
+        // band follows the centre's distance `band_dist`, the threshold
+        // the gate distance `dist`.
+        let gate = |band_dist: f32, dist: f32, shadow: bool| -> u32 {
+            let threshold = if band_dist >= lod.tuft_start {
                 if shadow {
                     return 0;
                 }
@@ -2540,15 +2626,24 @@ mod tests {
             gate_count(threshold, blade_count)
         };
         let centre = Vec2::new(3.0, -2.0);
-        for step in 0..260 {
+        // A disc gates at its centre, a tile at its nearest corner.
+        for (slack, step) in [(0.0, 0..260), (4.0 * std::f32::consts::SQRT_2, 0..260)]
+            .into_iter()
+            .flat_map(|(slack, steps)| steps.map(move |step| (slack, step)))
+        {
             let built = centre + Vec2::new(step as f32 * 0.5, 0.0);
             for shadows in [false, true] {
-                let bound = task_slice_bound(&variant, centre, blade_count, built, shadows);
+                let bound = task_slice_bound(&variant, centre, slack, blade_count, built, shadows);
                 for k in 0..16 {
                     let angle = k as f32 * std::f32::consts::TAU / 16.0;
                     let viewer = built + Vec2::from_angle(angle) * TASK_LIST_VIEWER_STEP * 0.999;
-                    let dist = centre.distance(viewer);
-                    let needed = gate(dist, false).max(if shadows { gate(dist, true) } else { 0 });
+                    let band_dist = centre.distance(viewer);
+                    let dist = (band_dist - slack).max(0.0);
+                    let needed = gate(band_dist, dist, false).max(if shadows {
+                        gate(band_dist, dist, true)
+                    } else {
+                        0
+                    });
                     assert!(
                         bound >= needed,
                         "built at {built:?}, viewer {viewer:?}: bound {bound} < {needed}"
@@ -2558,13 +2653,20 @@ mod tests {
         }
         // Shadow casters thin with player distance, so the band-0 scan
         // shrinks before `tuft_start` with shadow views too.
-        let with_shadows =
-            task_slice_bound(&variant, centre, blade_count, centre + Vec2::X * 50.0, true);
+        let with_shadows = task_slice_bound(
+            &variant,
+            centre,
+            0.0,
+            blade_count,
+            centre + Vec2::X * 50.0,
+            true,
+        );
         assert!(with_shadows < blade_count / 2, "{with_shadows}");
         // Far patches scan only their tuft share.
         let far = task_slice_bound(
             &variant,
             centre,
+            0.0,
             blade_count,
             centre + Vec2::X * 90.0,
             false,

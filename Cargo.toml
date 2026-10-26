@@ -52,6 +52,10 @@ bytemuck = { version = "1", features = ["derive"] }
 name = "meadow"
 path = "examples/meadow.rs"
 
+[[example]]
+name = "cover_field"
+path = "examples/cover_field.rs"
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # Shared per-frame producer encoder (`bevy_solari::scene::
 # RaytracingProducerEncoder`) for the RT blade expansion — recording there

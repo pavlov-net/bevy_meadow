@@ -17,6 +17,11 @@
 //! - `place_patches` + `TreeDensityField` + `PatchOverride` — pure
 //!   CPU placement, deterministic from `(variant.seed, biome AABB,
 //!   tree positions)`.
+//! - `PatchShape` — a patch is a noisy disc, or a world-aligned square
+//!   tile whose blades grow from the cover field.
+//! - `MeadowCoverField` + `CoverSurvival` + `MeadowGrid` — the world-level
+//!   cover density / height / palette grid tile blades sample, and how its
+//!   density turns into surviving blades.
 //! - `MeadowPatch` — required-components struct; one per placed
 //!   patch.
 //! - `MeadowPalette` — one entry of a variant's palette table; each patch
@@ -32,6 +37,7 @@
 //!   for meadow pixels Solari lights.
 
 pub mod compute;
+pub mod field;
 pub mod material;
 pub mod mesh;
 #[cfg(feature = "mesh-shaders")]
@@ -50,9 +56,12 @@ pub use compute::{
     MeadowRaytracingConfig, MeadowRtBuffers, MeadowRtDiagnostics, MeadowRtTelemetry,
     MeadowRtVariantStats, RtBandBuffers, RtVariantBuffers,
 };
+pub use field::{CoverSurvival, CoverTexel, MeadowCoverField, MeadowGrid};
 pub use material::{
-    MAX_MEADOW_PALETTES, MAX_TRUNK_DISCS_PER_PATCH, MeadowExt, MeadowMaterial, PaletteParams,
-    PatchData, PatchTrunkSlot, TrunkDisc, VariantParams,
+    CLEARING_PROFILE_TABLE_SIZE, ClearingProfileId, ClearingProfiles, FLAT_HEIGHT_CAP,
+    MAX_DISC_EDGE_NOISE, MAX_MEADOW_PALETTES, MAX_TRUNK_DISCS_PER_PATCH, MeadowClearingProfile,
+    MeadowExt, MeadowMaterial, NO_HEIGHT_CAP, PaletteParams, PatchData, PatchTrunkSlot, TrunkDisc,
+    VariantParams,
 };
 pub use mesh::{
     BLADE_INDICES_PER_BLADE, BLADE_LENGTH_PER_HEIGHT, BLADE_VERTS_PER_BLADE, MAX_BLADES_PER_PATCH,
@@ -60,14 +69,15 @@ pub use mesh::{
     build_blade_template_mesh, build_tuft_template_mesh,
 };
 pub use placement::{
-    PatchOverride, PatchOverrideMode, PatchPlacement, PlacementParams, TreeDensityField,
-    place_patches,
+    PatchOverride, PatchOverrideMode, PatchPlacement, PatchShape, PlacementParams,
+    TreeDensityField, place_patches,
 };
 pub use plugin::{
     MEAN_BLADE_SHADE, MeadowHeightfield, MeadowLodCurve, MeadowPalette, MeadowPalettes,
     MeadowPatch, MeadowPlugin, MeadowVariant, MeadowVariantId, MeadowVariantRegistry, MeadowViewer,
     MeadowWindState, PatchAudioTag, TUFT_REFERENCE_BLADES_PER_M2, WindDirection, WindParams,
-    palette_table, upload_placements, upload_trunk_slots,
+    palette_table, upload_clearing_profiles, upload_placements, upload_trunk_rows,
+    upload_trunk_slots,
 };
 
 pub use plugin::{MeadowSolariGeometryNormals, MeadowWindFreeze};

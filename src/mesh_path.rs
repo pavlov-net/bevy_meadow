@@ -258,7 +258,7 @@ pub struct MeadowMeshMvTarget {
 /// Identity fingerprint of a variant's mesh-path bind groups (same
 /// rationale as the compute path's `ComputeBindGroupFingerprint`), plus
 /// the view-slot count the per-slot groups were built for.
-type MeshBindGroupFingerprint = ([BufferId; 7], TextureViewId, u32);
+type MeshBindGroupFingerprint = ([BufferId; 7], [TextureViewId; 3], u32);
 
 /// Per variant, one meadow bind group per view slot (`[slot]`), differing
 /// only in which `MeadowMeshViewUniform` entry binding 6 points at.
@@ -370,6 +370,8 @@ fn meadow_mesh_bgl_desc() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only_sized(false, None), // 5 task_slices
                 uniform_buffer::<MeadowMeshViewUniform>(false), // 6 mesh_view (per-slot group)
                 storage_buffer_read_only_sized(false, None), // 7 palettes
+                texture_2d(TextureSampleType::Float { filterable: false }), // 8 cover_field
+                texture_2d(TextureSampleType::Float { filterable: false }), // 9 clearing_profiles
             ),
         ),
     )
@@ -1031,7 +1033,8 @@ fn prepare_meadow_mesh_bind_groups(
         let Some(trunk_slots) = shader_buffers.get(ev.trunk_slots) else {
             continue;
         };
-        let heightfield = gpu_images.get(ev.heightfield).unwrap_or(&fallback_image.d2);
+        let textures = ev.textures(&gpu_images, &fallback_image);
+        let [heightfield, cover, profiles] = textures;
         let Some(gpu) = params.by_variant.get(id) else {
             continue;
         };
@@ -1055,7 +1058,7 @@ fn prepare_meadow_mesh_bind_groups(
                 view_uniform_buffer.id(),
                 gpu.palettes.id(),
             ],
-            heightfield.texture_view.id(),
+            textures.map(|image| image.texture_view.id()),
             slot_count,
         );
         if let Some((_, cached)) = bind_groups.by_variant.get(id)
@@ -1082,6 +1085,8 @@ fn prepare_meadow_mesh_bind_groups(
                             size: Some(MeadowMeshViewUniform::min_size()),
                         },
                         gpu.palettes.as_entire_binding(),
+                        &cover.texture_view,
+                        &profiles.texture_view,
                     )),
                 )
             })
@@ -1530,6 +1535,8 @@ pub fn meadow_mesh_shadow_pass(
 }
 
 #[cfg(test)]
+// Shader tests report a skipped bevy checkout on stderr.
+#[allow(clippy::print_stderr)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1810,8 +1817,8 @@ mod tests {
             .normalize();
         let viewport = Vec4::new(17.0, 23.0, 960.0, 540.0);
         for mut projection in [
-            Mat4::perspective_infinite_reverse_rh(1.0, 16.0 / 9.0, 0.1),
-            Mat4::orthographic_rh(-2.0, 2.0, -1.0, 1.0, 100.0, 0.1),
+            bevy::math::proj::perspective_infinite_reverse(1.0, 16.0 / 9.0, 0.1),
+            bevy::math::proj::orthographic(-2.0, 2.0, -1.0, 1.0, 100.0, 0.1),
         ] {
             projection.z_axis.x += 0.37 / viewport.z;
             projection.z_axis.y -= 0.21 / viewport.w;
@@ -1854,6 +1861,8 @@ mod tests {
         // `meadow_unpack_geometric_normal_oct`: the payload leaves
         // emissive/base color, reflectance/metallic and every other A bit
         // intact.
+        // `!(scale > ..)` rejects NaN like the WGSL it mirrors.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         fn pack(mut pixel: [u32; 4], normal: Vec3, enabled: bool) -> [u32; 4] {
             let magnitude = normal.abs();
             let scale = magnitude.max_element();
@@ -2239,6 +2248,9 @@ mod tests {
         for f in [
             "derive_blade",
             "blade_visibility",
+            "patch_outer_radius",
+            "patch_max_height",
+            "gate_blade",
             "sample_heightfield",
             "patch_sphere_culled",
         ] {

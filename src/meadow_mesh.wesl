@@ -54,11 +54,15 @@ import bevy_meadow::meadow_shared::{
     hash01_u32, meadow_template_vertex, meadow_place_vertex, meadow_blade_normal_varying,
     meadow_gate_count, meadow_band_threshold, meadow_shadow_ramp, meadow_patch_palette,
     meadow_max_height_scale, meadow_patch_noise, meadow_blade_height_scale, meadow_blade_albedo,
-    meadow_pack_albedo, meadow_unpack_albedo,
+    meadow_pack_albedo, meadow_unpack_albedo, meadow_patch_is_tile, meadow_patch_outer_radius,
+    meadow_tile_root, meadow_cover_survives, meadow_sample_cover, meadow_blade_palette,
+    meadow_grid_bound, meadow_grid_footprint,
+    meadow_blade_rank, MEADOW_MAX_HEIGHT_VARIANCE, MEADOW_MAX_DRYNESS_HEIGHT, MEADOW_NEUTRAL_DRYNESS,
+    GatedBlade, PaletteParams, meadow_disc_effect, MEADOW_BLADE_GROUND_LIFT,
 };
 import bevy_meadow::meadow_mesh_bindings::{
     variant_params, patches, trunk_slots, heightfield, view_cull, task_slices, mesh_view, palettes,
-    PatchData, MeadowViewCull, MeadowVertexOut,
+    cover_field, clearing_profiles, PatchData, MeadowViewCull, MeadowVertexOut,
 };
 
 enable wgpu_mesh_shader;
@@ -106,6 +110,10 @@ fn derive_blade(blade_idx: u32, p: PatchData) -> BladeAttrs {
     var sample = vec2<f32>(0.0, 0.0);
     var dist_norm = 0.0;
     var hit = false;
+    if (meadow_patch_is_tile(p.blade_count_noise_canopy_flags.w)) {
+        sample = meadow_tile_root(radius, blade_seed);
+        hit = true;
+    }
     for (var attempt = 0u; attempt < 2u; attempt = attempt + 1u) {
         if (hit) {
             continue;
@@ -146,56 +154,142 @@ fn derive_blade(blade_idx: u32, p: PatchData) -> BladeAttrs {
     return BladeAttrs(centre + sample, yaw, height, width, clump_seed, rim_factor, blade_seed);
 }
 
-fn blade_visibility(root_xz: vec2<f32>, patch_idx: u32) -> f32 {
+// Clearing discs at a blade root for a blade `height` tall growing from
+// `ground_y` (`meadow_disc_effect`): x = the share of grass they let stand,
+// y = the blade's height under their profiles.
+fn blade_visibility(root_xz: vec2<f32>, patch_idx: u32, ground_y: f32, height: f32) -> vec2<f32> {
+    // Read `count` directly from the storage buffer and bail before
+    // touching the discs. Indexing `trunk_slots[..].discs[i]` keeps the
+    // access in the storage buffer: copying the slot struct would spill
+    // its disc array to function-local memory on every blade, and most
+    // patches have no discs.
     let n = min(trunk_slots[patch_idx].count, 16u);
-    if (n == 0u) {
-        return 1.0;
-    }
-    var scale: f32 = 1.0;
+    var result = vec2<f32>(1.0, height);
     for (var i = 0u; i < n; i = i + 1u) {
         let c = trunk_slots[patch_idx].discs[i].center_radius_fade;
-        let centre = c.xy;
-        let radius = c.z;
-        let fade = max(c.w, 1e-4);
-        let outer = radius + fade;
-        let to_centre = root_xz - centre;
-        let d_sq = dot(to_centre, to_centre);
-        if (d_sq >= outer * outer) {
+        let d = trunk_slots[patch_idx].discs[i].noise_profile;
+        let reach = d.w;
+        let to_centre = root_xz - c.xy;
+        if (dot(to_centre, to_centre) >= reach * reach) {
             continue;
         }
-        let s = smoothstep(radius, outer, sqrt(d_sq));
-        scale = min(scale, s);
-        if (scale <= 0.0) {
+        let a = trunk_slots[patch_idx].discs[i].profile_frame;
+        result = min(
+            result,
+            meadow_disc_effect(clearing_profiles, c, a, d, root_xz, ground_y, height),
+        );
+        if (result.x <= 0.0) {
             break;
         }
     }
-    return scale;
+    return result;
 }
 
+// Planar radius bounding the patch's blade roots.
+fn patch_outer_radius(p: PatchData) -> f32 {
+    return meadow_patch_outer_radius(
+        p.centre_xz_radius_seed.z,
+        p.blade_count_noise_canopy_flags.y,
+        meadow_patch_is_tile(p.blade_count_noise_canopy_flags.w),
+    );
+}
+
+// Tallest blade the patch can hold: a tile's blades take any palette
+// entry, the field's height scale and the wettest ground's gain, a disc's
+// its own entry on neutral ground.
+fn patch_max_height(p: PatchData) -> f32 {
+    let flags = p.blade_count_noise_canopy_flags.w;
+    if (meadow_patch_is_tile(flags)) {
+        return variant_params.height_range.y * (1.0 + MEADOW_MAX_HEIGHT_VARIANCE)
+            * MEADOW_MAX_DRYNESS_HEIGHT * variant_params.cover.z;
+    }
+    return variant_params.height_range.y
+        * meadow_max_height_scale(palettes[meadow_patch_palette(flags)]);
+}
+
+// Blade `b` of patch `p` through its per-blade gates: on a tile, cover
+// survival under the clearing discs and (with `lod`) the LOD rank at the
+// blade's own eye distance against band `band`'s threshold; on a disc
+// patch, the clearing discs' collapse; then the rim. A `collapse_t` of 0
+// drops the blade.
+fn gate_blade(
+    blade: BladeAttrs,
+    b: u32,
+    p: PatchData,
+    patch_idx: u32,
+    band: u32,
+    is_shadow: bool,
+    lod_max: f32,
+    lod: bool,
+) -> GatedBlade {
+    var out: GatedBlade;
+    let flags = p.blade_count_noise_canopy_flags.w;
+    out.palette = meadow_patch_palette(flags);
+    out.noise = 0.5;
+    out.dryness = MEADOW_NEUTRAL_DRYNESS;
+    out.ground_y = sample_heightfield(blade.world_xz) + MEADOW_BLADE_GROUND_LIFT;
+    var field_height = 1.0;
+    var dist = length(variant_params.viewer_world_xz.xy - p.centre_xz_radius_seed.xy);
+    // The discs' clearing gates the blade, their height caps once its height
+    // is known.
+    var collapse = 1.0;
+    if (meadow_patch_is_tile(flags)) {
+        let eye = variant_params.viewer_world_xz.xzy;
+        dist = distance(eye, vec3<f32>(blade.world_xz.x, out.ground_y, blade.world_xz.y));
+        // The rank needs no discs: reject on it first.
+        if (lod) {
+            let rank = meadow_blade_rank(b, u32(p.blade_count_noise_canopy_flags.x));
+            if (rank >= meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max)) {
+                out.collapse_t = 0.0;
+                return out;
+            }
+        }
+        let cover = meadow_sample_cover(cover_field, variant_params.cover_extents, blade.world_xz);
+        let ceiling = p.blade_count_noise_canopy_flags.y;
+        let stand = blade_visibility(blade.world_xz, patch_idx, out.ground_y, 0.0).x;
+        if (!meadow_cover_survives(variant_params, blade.world_xz, blade.seed, cover.x * stand, ceiling)) {
+            out.collapse_t = 0.0;
+            return out;
+        }
+        field_height = cover.y;
+        out.dryness = cover.w;
+        out.palette = meadow_blade_palette(cover.z, blade.seed, out.palette);
+    } else {
+        collapse = blade_visibility(blade.world_xz, patch_idx, out.ground_y, 0.0).x;
+    }
+    out.collapse_t = collapse * blade.rim_factor;
+    if (out.collapse_t <= 1e-4) {
+        return out;
+    }
+    let palette = palettes[out.palette];
+    out.noise = meadow_patch_noise(palette, blade.world_xz, out.dryness);
+    var height = blade.height * meadow_blade_height_scale(palette, out.noise, out.dryness, blade.seed) * field_height;
+    if (band == 1u) {
+        // Far-band tufts fade height to zero by `lod_max` so the band
+        // dissolves into the ground instead of ending hard.
+        let fade_start = variant_params.tuft.w;
+        height = height * clamp((lod_max - dist) / max(lod_max - fade_start, 1e-3), 0.0, 1.0);
+    }
+    out.height = blade_visibility(blade.world_xz, patch_idx, out.ground_y, height).y;
+    return out;
+}
+
+// Ground height at `world_xz`, bilinear; 0 without a heightfield.
 fn sample_heightfield(world_xz: vec2<f32>) -> f32 {
-    let extents_min = variant_params.heightfield_extents.xy;
-    let extents_max = variant_params.heightfield_extents.zw;
-    let extents_size = max(extents_max - extents_min, vec2<f32>(1e-3, 1e-3));
-    let dims = vec2<f32>(textureDimensions(heightfield, 0));
-    if (dims.x < 2.0 || dims.y < 2.0) {
+    if (!meadow_grid_bound(heightfield)) {
         return 0.0;
     }
-    let uv = clamp((world_xz - extents_min) / extents_size, vec2<f32>(0.0), vec2<f32>(1.0));
-    let pixel = uv * (dims - vec2<f32>(1.0));
-    let p0 = vec2<i32>(floor(pixel));
-    let p1 = vec2<i32>(min(p0.x + 1, i32(dims.x) - 1), p0.y);
-    let p2 = vec2<i32>(p0.x, min(p0.y + 1, i32(dims.y) - 1));
-    let p3 = vec2<i32>(p1.x, p2.y);
-    let t = pixel - vec2<f32>(p0);
-    let h0 = textureLoad(heightfield, p0, 0).r;
-    let h1 = textureLoad(heightfield, p1, 0).r;
-    let h2 = textureLoad(heightfield, p2, 0).r;
-    let h3 = textureLoad(heightfield, p3, 0).r;
-    let top = mix(h0, h1, t.x);
-    let bot = mix(h2, h3, t.x);
-    return mix(top, bot, t.y);
+    let f = meadow_grid_footprint(heightfield, variant_params.heightfield_extents, world_xz);
+    return mix(mix(f.c00.r, f.c10.r, f.t.x), mix(f.c01.r, f.c11.r, f.t.x), f.t.y);
 }
 
+// Conservative patch bounding-sphere vs. view frustum. Planes are
+// normalized (Bevy `Frustum`), point outside a plane when
+// `dot(n, c) + d <= -radius`. Order: sides 0-3, near 4, far 5.
+// Shadow views skip the near plane (casters between the light and the
+// cascade box are outside it but still cast in) and the far plane
+// (`SHADOW_MAX_DIST` LOD already bounds shadow grass); main view also
+// tests the near plane to drop behind-camera grass.
 fn patch_sphere_culled(centre: vec3<f32>, radius: f32, vc: MeadowViewCull, is_shadow: bool) -> bool {
     var plane_count = 4u;
     if (!is_shadow) {
@@ -297,10 +391,10 @@ fn meadow_task(
     // Patch-level frustum reject — same math as the compute kernel.
     let centre_xz = p.centre_xz_radius_seed.xy;
     let centre_y = sample_heightfield(centre_xz);
-    let palette = palettes[meadow_patch_palette(p.blade_count_noise_canopy_flags.w)];
-    let max_h = variant_params.height_range.y * meadow_max_height_scale(palette);
-    let edge_noise = p.blade_count_noise_canopy_flags.y;
-    let cull_radius = p.centre_xz_radius_seed.z * (1.0 + edge_noise) + max_h * 2.0;
+    let flags = p.blade_count_noise_canopy_flags.w;
+    let tile = meadow_patch_is_tile(flags);
+    let outer = patch_outer_radius(p);
+    let cull_radius = outer + patch_max_height(p) * 2.0;
     if (patch_sphere_culled(vec3<f32>(centre_xz.x, centre_y, centre_xz.y), cull_radius, vc, is_shadow)) {
         return vec3<u32>(0u, 0u, 0u);
     }
@@ -308,6 +402,12 @@ fn meadow_task(
     let lod_max = vc.params.y;
     let tuft_start = variant_params.tuft.x;
     let dist = length(variant_params.viewer_world_xz.xy - centre_xz);
+    // A tile gates its prefix at its nearest root and each blade again at
+    // its own eye distance (`gate_blade`).
+    var gate_dist = dist;
+    if (tile) {
+        gate_dist = max(dist - outer, 0.0);
+    }
 
     // Camera view-depth of the patch centre (see meadow_compute.wesl for
     // why cascade assignment uses this, not planar viewer distance).
@@ -331,17 +431,10 @@ fn meadow_task(
         }
     }
 
-    let height_fade_start = variant_params.tuft.w;
-    var tuft_height_scale = 1.0;
-    if (band == 1u) {
-        tuft_height_scale =
-            clamp((lod_max - dist) / max(lod_max - height_fade_start, 1e-3), 0.0, 1.0);
-    }
-
     // The gate keeps a prefix of the blade indices; a slice past it has no
     // survivors. The CPU work list already stops near the prefix
     // (`compute.rs::task_slice_bound`).
-    let threshold = meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max);
+    let threshold = meadow_band_threshold(variant_params, band, is_shadow, gate_dist, lod_max);
     let survivors = meadow_gate_count(threshold, blade_count);
     if (slice_base >= survivors) {
         return vec3<u32>(0u, 0u, 0u);
@@ -349,7 +442,7 @@ fn meadow_task(
 
     // Per-lane: derive lane `lid`'s blade slot. MIRROR of
     // `cull_and_compact`'s per-blade body (band routing, cascade clip,
-    // trunk-disc collapse, heightfield sample).
+    // per-blade gates).
     let b = slice_base + lid;
     var survived = false;
     var out: SurvivorBlade;
@@ -363,10 +456,11 @@ fn meadow_task(
             ) + vf.w;
             cast_ok = bvd >= vc.params2.z && bvd <= lod_max;
         }
-        let collapse_t = blade_visibility(blade.world_xz, patch_idx) * blade.rim_factor;
-        if (cast_ok && collapse_t > 1e-4) {
-            let ground_y = sample_heightfield(blade.world_xz) + 0.02;
-            let noise = meadow_patch_noise(palette, blade.world_xz);
+        var gated: GatedBlade;
+        if (cast_ok) {
+            gated = gate_blade(blade, b, p, patch_idx, band, is_shadow, lod_max, true);
+        }
+        if (cast_ok && gated.collapse_t > 1e-4) {
             var wind_now = wind_displacement(
                 blade.world_xz, 1.0, variant_params.wind.z, blade.clump_seed);
             var wind_prev = wind_displacement(
@@ -383,15 +477,16 @@ fn meadow_task(
             }
             out.world_xz = blade.world_xz;
             out.yaw = blade.yaw;
-            out.height = blade.height * meadow_blade_height_scale(palette, noise, blade.seed)
-                * tuft_height_scale;
+            out.height = gated.height;
             out.width = blade.width;
             out.albedo = 0u;
             if (!is_shadow) {
-                out.albedo = meadow_pack_albedo(meadow_blade_albedo(palette, noise, blade.seed));
+                out.albedo = meadow_pack_albedo(
+                    meadow_blade_albedo(palettes[gated.palette], gated.noise, gated.dryness, blade.seed),
+                );
             }
-            out.ground_y = ground_y;
-            out.collapse_t = collapse_t;
+            out.ground_y = gated.ground_y;
+            out.collapse_t = gated.collapse_t;
             out.wind_now = wind_now;
             out.wind_prev = wind_prev;
             survived = true;
