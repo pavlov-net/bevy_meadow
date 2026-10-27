@@ -20,6 +20,7 @@ use crate::render::MeadowRenderDriver;
 
 use bevy::render::storage::ShaderBuffer;
 
+use crate::compute::MeadowRaytracingConfig;
 use crate::field::{MeadowCoverField, MeadowGrid};
 use crate::material::{
     ClearingProfileId, ClearingProfiles, MAX_MEADOW_PALETTES, MeadowClearingProfile, MeadowExt,
@@ -607,6 +608,21 @@ pub struct MeadowViewer {
     pub depth_plane: Vec4,
 }
 
+/// World-level sun: past their blade normals, blades shade as a canopy lit
+/// by it and the sky (`meadow_shared.wesl::meadow_canopy_shade`), their mean
+/// the near blades' under any sun, looking into it or away. The consumer
+/// writes it as its sun and sky change; `broadcast_sun` copies it into
+/// every variant.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
+pub struct MeadowSun {
+    /// Unit direction to the sun, or zero without one.
+    pub to_sun: Vec3,
+    /// The sun's beam (direct normal) illuminance over the sky's diffuse
+    /// illuminance on level ground: how the canopy weighs their colours and
+    /// its sheen.
+    pub sun_over_sky: f32,
+}
+
 /// World-level shared wind direction. `bevy_meadow` and `bevy_tree`
 /// both read from this resource so foliage agrees on the gust
 /// direction. The broadcast system below copies its value into every
@@ -714,21 +730,30 @@ impl Plugin for MeadowPlugin {
         app.init_resource::<WindDirection>();
         app.init_resource::<MeadowWindFreeze>();
         app.init_resource::<MeadowSolariGeometryNormals>();
+        // Each broadcast also runs when the registry changes: a variant
+        // registered after a resource's last write otherwise keeps its
+        // `VariantParams` defaults until that resource next changes.
+        let registered = resource_changed::<MeadowVariantRegistry>;
         app.add_systems(
             PostUpdate,
-            (broadcast_solari_geometry_normals, apply_wind_freeze)
+            (
+                broadcast_raytracing_flags.run_if(
+                    resource_changed::<MeadowSolariGeometryNormals>
+                        .or_eager(resource_exists_and_changed::<MeadowRaytracingConfig>)
+                        .or_eager(resource_removed::<MeadowRaytracingConfig>)
+                        .or_eager(registered),
+                ),
+                apply_wind_freeze,
+            )
                 .before(bevy::asset::AssetEventSystems),
         );
         app.init_resource::<MeadowWindState>();
         app.init_resource::<MeadowHeightfield>();
         app.init_resource::<MeadowCoverField>();
         app.init_resource::<MeadowViewer>();
+        app.init_resource::<MeadowSun>();
 
         app.add_systems(Startup, setup_meadow_meshes);
-        // Each broadcast also runs when the registry changes: a variant
-        // registered after a resource's last write otherwise keeps its
-        // `VariantParams` defaults until that resource next changes.
-        let registered = resource_changed::<MeadowVariantRegistry>;
         app.add_systems(
             Update,
             (
@@ -739,6 +764,7 @@ impl Plugin for MeadowPlugin {
                 broadcast_heightfield
                     .run_if(resource_changed::<MeadowHeightfield>.or_eager(registered)),
                 broadcast_viewer.run_if(resource_changed::<MeadowViewer>.or_eager(registered)),
+                broadcast_sun.run_if(resource_changed::<MeadowSun>.or_eager(registered)),
                 spawn_meadow_render_drivers,
             ),
         );
@@ -867,6 +893,22 @@ fn broadcast_viewer(
         {
             mat.extension.variant_params.viewer_world_xz = eye;
             mat.extension.variant_params.viewer_forward = fwd;
+        }
+    }
+}
+
+/// Push `MeadowSun` into every registered variant's `sun`.
+fn broadcast_sun(
+    sun: Res<MeadowSun>,
+    registry: Res<MeadowVariantRegistry>,
+    mut materials: ResMut<Assets<MeadowMaterial>>,
+) {
+    let packed = sun.to_sun.extend(sun.sun_over_sky.max(0.0));
+    for (_, entry) in registry.iter() {
+        if let Some(mut mat) = materials.get_mut(&entry.material)
+            && mat.extension.variant_params.sun != packed
+        {
+            mat.extension.variant_params.sun = packed;
         }
     }
 }
@@ -1115,17 +1157,27 @@ pub struct MeadowSolariGeometryNormals {
     pub enabled: bool,
 }
 
-fn broadcast_solari_geometry_normals(
-    config: Res<MeadowSolariGeometryNormals>,
+/// Mark in every variant's `width_range` whether the geometric-normal
+/// payload is on (`z`, [`MeadowSolariGeometryNormals`]) and whether
+/// raytraced casters shade the grass (`w`, [`MeadowRaytracingConfig`]):
+/// past the casters grass shades as a canopy, across the raytraced casters'
+/// fade or past the shadow maps' cut (`meadow_blade_shade`).
+fn broadcast_raytracing_flags(
+    geometry_normals: Res<MeadowSolariGeometryNormals>,
+    raytracing: Option<Res<MeadowRaytracingConfig>>,
     registry: Res<MeadowVariantRegistry>,
     mut materials: ResMut<Assets<MeadowMaterial>>,
 ) {
-    let marker = if config.enabled { 1.0 } else { 0.0 };
+    let flag = |on: bool| if on { 1.0 } else { 0.0 };
+    let normals = flag(geometry_normals.enabled);
+    let casters = flag(raytracing.is_some_and(|config| config.enabled));
     for (_, entry) in registry.iter() {
-        if let Some(mut mat) = materials.get_mut(&entry.material)
-            && mat.extension.variant_params.width_range.z != marker
-        {
-            mat.extension.variant_params.width_range.z = marker;
+        if let Some(mut mat) = materials.get_mut(&entry.material) {
+            let width_range = mat.extension.variant_params.width_range;
+            if width_range.z != normals || width_range.w != casters {
+                mat.extension.variant_params.width_range.z = normals;
+                mat.extension.variant_params.width_range.w = casters;
+            }
         }
     }
 }
@@ -1142,7 +1194,7 @@ mod tests {
     fn layouts_match_the_shaders() {
         assert_eq!(PaletteParams::min_size().get(), 48);
         assert_eq!(size_of::<PaletteParams>(), 48);
-        assert_eq!(VariantParams::min_size().get(), 13 * 16);
+        assert_eq!(VariantParams::min_size().get(), 14 * 16);
         let shared = include_str!("meadow_shared.wesl");
         assert!(
             shared.contains(&format!(

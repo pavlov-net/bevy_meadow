@@ -11,6 +11,10 @@
 // (`material.rs::VariantParams`, `material.rs::PaletteParams`,
 // `compute.rs`); std430 offsets are load-bearing.
 
+// Local rather than `bevy_render::maths::PI`, whose import would make the
+// geometry and compute shader tests need a bevy checkout.
+const PI: f32 = 3.141592653589793;
+
 // Capacity of a variant's palette table (`array<PaletteParams, 64>` in its
 // own storage buffer). MUST equal `material.rs::MAX_MEADOW_PALETTES`.
 const MEADOW_MAX_PALETTES: u32 = 64u;
@@ -32,7 +36,7 @@ struct PaletteParams {
     variance: vec4<f32>,
 }
 
-// Mirror of `material.rs::VariantParams` (13 × vec4 = 208 B). Bound at
+// Mirror of `material.rs::VariantParams` (14 × vec4 = 224 B). Bound at
 // `@binding(100)` in raster (material group) and `@binding(0)` in
 // compute.
 struct VariantParams {
@@ -53,6 +57,9 @@ struct VariantParams {
     // x = 1 / survival noise scale (metres), y = clumpiness, z = largest
     // height scale in the field (at least 1), w = unused.
     cover: vec4<f32>,
+    // xyz = unit direction to the sun (zero without one), w = its beam
+    // illuminance over the sky's on level ground.
+    sun: vec4<f32>,
 }
 
 // Transient (not a buffer layout) — function return/param only.
@@ -183,11 +190,11 @@ fn meadow_blade_world_normal(
 }
 
 // Weight of the blade's own normal in its shading normal at view depth
-// `depth`: 1 near, falling to 0 (the upright normal) where blades shrink
-// toward a pixel and per-blade normals would shimmer. It ends where the
-// Solari casters start to fade (`RT_SHADOW_FADE_START`), before the near
-// band thins, so the shading, shadow and density changes take separate
-// bands.
+// `depth`: 1 near, falling to 0 (the canopy normal, `meadow_shading_normal`)
+// where blades shrink toward a pixel and per-blade normals would shimmer.
+// It ends where the Solari casters start to fade
+// (`MEADOW_RT_SHADOW_FADE_START`), before the near band thins, so the
+// shading, shadow and density changes take separate bands.
 const MEADOW_BLADE_NORMAL_FADE: vec2<f32> = vec2<f32>(15.0, 35.0);
 
 fn meadow_blade_normal_weight(depth: f32) -> f32 {
@@ -357,6 +364,12 @@ fn meadow_gate_count(threshold: f32, blade_count: u32) -> u32 {
 // Grass farther than this from the player casts no shadow-map shadow, in
 // metres. MUST equal `mesh.rs::SHADOW_MAX_DIST`.
 const MEADOW_SHADOW_MAX_DIST: f32 = 50.0;
+
+// The raytraced casters' density fades to zero from here to
+// `MEADOW_SHADOW_MAX_DIST`. No widening compensates the fade, which would
+// cancel it; past the casters the receivers shade as a canopy
+// (`meadow_blade_shade`).
+const MEADOW_RT_SHADOW_FADE_START: f32 = 35.0;
 
 // Shadow-caster LOD ramp at planar player distance `dist`: 0 within
 // `shadow_full_dist` (`VariantParams.density.z`), 1 at
@@ -993,11 +1006,330 @@ fn meadow_blade_base_color(albedo: vec3<f32>, y_norm: f32) -> vec3<f32> {
 fn meadow_blade_emissive(albedo: vec3<f32>, y_norm: f32) -> vec3<f32> {
     return albedo * smoothstep(0.7, 1.0, y_norm) * 0.06;
 }
+
+// Sheen of a canopy too fine to shade leaf by leaf, as a share of the
+// reflection off the surface standing in for it, of normal `n` and
+// `perceptual_roughness`, for the view and light directions `v` and `l`
+// (`l` zero without a sun) over a canopy facing `up`, under a sun of beam
+// illuminance `sun_over_sky` (non-negative) times the sky's on a surface
+// facing `up`. The blades' own GGX lobes (perceptual roughness 0.85) over
+// the seen faces of the blade template reflect the sun as
+// `F E lit (1 + v.l) (0.045 - 0.0248 (h.up)^4)`, `lit` the share of them
+// it reaches and `h` the half vector, within 0.006 at views up to 12
+// degrees off the ground (`mesh.rs` test): rough faces turned edge-on to
+// a viewer looking into the light mask their own reflection, and none
+// face up to glint a sun straight ahead. Leaves facing every way reflect
+// a uniform sky as `0.014 L` at any view. The surface reflects the sun as
+// `F E (n.l) D V` and a uniform sky as its environment BRDF (Karis's
+// analytic fit) times `L`; the share is the leaves' sum over the
+// surface's, Fresnel for a dielectric, and never more than the surface's
+// own reflection.
+fn meadow_canopy_sheen(
+    n: vec3<f32>,
+    up: vec3<f32>,
+    v: vec3<f32>,
+    l: vec3<f32>,
+    lit: f32,
+    perceptual_roughness: f32,
+    sun_over_sky: f32,
+) -> f32 {
+    let n_dot_v = max(dot(n, v), 1e-4);
+    let a = clamp(perceptual_roughness, 0.089, 1.0);
+    // Karis's analytic environment BRDF at F0 0.04: bevy_pbr's `F_AB`
+    // without the DFG lookup table, which its view bindings hold.
+    let r = a * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    let env = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+    let surface_sky = 0.04 * env.x + env.y;
+    var leaves_sun = 0.0;
+    var surface_sun = 0.0;
+    let n_dot_l = dot(n, l);
+    let half_sum = v + l;
+    if (n_dot_l > 0.0 && dot(half_sum, half_sum) > 1e-6) {
+        let h = normalize(half_sum);
+        let n_dot_h = saturate(dot(n, h));
+        // bevy_pbr's `D_GGX` and `V_SmithGGXCorrelated`, inlined: their
+        // module imports the view bindings.
+        let a2 = a * a * a * a;
+        let k = a * a / (1.0 - n_dot_h * n_dot_h + n_dot_h * n_dot_h * a2);
+        let d = k * k / PI;
+        let lambda_v = n_dot_l * sqrt((n_dot_v - a2 * n_dot_v) * n_dot_v + a2);
+        let lambda_l = n_dot_v * sqrt((n_dot_l - a2 * n_dot_l) * n_dot_l + a2);
+        let vis = 0.5 / (lambda_v + lambda_l);
+        let h_up = dot(h, up);
+        // Radiance per sky luminance `E_sky / pi`, Fresnel included; no sun
+        // below the horizon to shine.
+        let sun = PI * sun_over_sky * smoothstep(-0.02, 0.05, dot(l, up))
+            * (0.04 + 0.96 * pow(1.0 - saturate(dot(l, h)), 5.0));
+        let h_up2 = h_up * h_up;
+        leaves_sun = sun * lit * (1.0 + dot(v, l)) * (0.045 - 0.0248 * h_up2 * h_up2);
+        surface_sun = sun * n_dot_l * d * vis;
+    }
+    return saturate((leaves_sun + 0.014) / max(surface_sun + surface_sky, 1e-6));
+}
+
+// Leaf phases of a grass canopy: the mean Lambert factor `max(0, n.l)` of
+// the visible face of the leaves a viewer looking back along `v` sees, for
+// unit `v` and `l` (the direction to the light). Opaque, two-sided leaves
+// of the spherical distribution, each showing the face toward the viewer:
+// `E[max(0, (n.v)(n.l))] / E[|n.v|] = ((pi - b) cos b + sin b) / (1.5 pi)`
+// with `cos b = v.l`. 2/3 with the light behind the viewer, 0 looking
+// into it. Blade normals of the template's lean, bend and rounding match
+// it within 0.04 at the grazing views far grass is seen at (`mesh.rs`
+// test). `x` is the phase along `v`, `y` the phase along `-v`,
+// `(sin b - b cos b) / (1.5 pi)`.
+fn meadow_leaf_phases(v: vec3<f32>, l: vec3<f32>) -> vec2<f32> {
+    let c = clamp(dot(v, l), -1.0, 1.0);
+    let b = acos(c);
+    let s = sqrt(1.0 - c * c);
+    return vec2<f32>((PI - b) * c + s, s - b * c) / (1.5 * PI);
+}
+
+// Least cosine to `up` the canopy reads of a view or light direction, so a
+// canopy seen or lit edge-on stays finite.
+const MEADOW_CANOPY_MIN_COS: f32 = 0.02;
+
+// Share of the leaves a viewer sees deep in a canopy that the light also
+// reaches, with independent view and light gaps through spherical leaves:
+// `k_v / (k_v + k_s)` for extinctions `k = G / mu` about the ground normal
+// `up`. Near 1 seen edge-on: the top layer is all lit.
+fn meadow_canopy_lit(up: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> f32 {
+    let mu_v = max(dot(up, v), MEADOW_CANOPY_MIN_COS);
+    let mu_l = max(dot(up, l), MEADOW_CANOPY_MIN_COS);
+    return mu_l / (mu_l + mu_v);
+}
+
+// Share of a uniform sky's light on a surface facing `up` that the leaves
+// a viewer sees deep in a canopy receive: the leaf phase
+// (`meadow_leaf_phases`) of every sky direction times its lit share
+// (`meadow_canopy_lit`), over the surface's `pi`. For the view's cosine
+// `mu` to `up`, fit to quadrature within 0.001 (`mesh.rs` test): 0.47
+// seen edge-on, where the top layer's faces turned to the viewer see half
+// the sky, 0.29 seen from straight above. A surface standing in for a
+// canopy, which its sky lights whole, takes it as an albedo factor.
+fn meadow_canopy_sky(up: vec3<f32>, v: vec3<f32>) -> f32 {
+    let mu = max(dot(up, v), MEADOW_CANOPY_MIN_COS);
+    let log_term = log(1.0 + 1.0 / mu);
+    return 0.5 + 0.5754 * mu - (0.5889 + 0.5436 * mu) * mu * log_term;
+}
+
+// `meadow_canopy_sky` for leaves nothing shades: the leaf phase of every
+// sky direction alone, exactly `1/2 + mu / 3`.
+fn meadow_canopy_sky_open(up: vec3<f32>, v: vec3<f32>) -> f32 {
+    return 0.5 + max(dot(up, v), 0.0) / 3.0;
+}
+
+// Light the leaves a viewer sees deep in a canopy take from their sunlit
+// neighbours, per unit of the beam and of the neighbours' albedo, before
+// the further bounces (`meadow_canopy_shade`), for the light's cosine
+// `mu_l` to the canopy's up, the lit share `deep_lit`
+// (`meadow_canopy_lit`) and the leaf phase back toward the light `back`
+// (`meadow_leaf_phases(v, l).y`): fit within 0.03 to a Monte Carlo of the
+// canopy (spherical, opaque, two-sided leaves, `G` 0.5), whose single
+// scattering is the leaf phase times the lit share. Most looking into the
+// sun, where the seen faces are the shaded ones the sunlit faces around
+// them light, and least with the sun behind; 0.13 looking into a
+// 20-degree sun.
+fn meadow_canopy_bounce(mu_l: f32, deep_lit: f32, back: f32) -> f32 {
+    return deep_lit * (0.033 + 0.031 * back) + mu_l * (0.042 + 0.213 * back);
+}
+
+// Least cosine between a grass shading normal and the view: Solari's BRDF
+// rejects NdotV <= 0, and a normal kept clear of it keeps its light.
+const MEADOW_VIEW_MARGIN: f32 = 0.1;
+
+// Shading normal whose Lambert factor `n.l` is `light`, for a light above
+// the horizon of `up`: on that cone, the normal nearest `up` that faces
+// the viewer by `MEADOW_VIEW_MARGIN` (nearest the viewer where none does),
+// so the view margin never moves its light.
+fn meadow_canopy_normal(up: vec3<f32>, v: vec3<f32>, l: vec3<f32>, light: f32) -> vec3<f32> {
+    let target_cos = clamp(light, 0.0, 1.0);
+    let target_sin = sqrt(1.0 - target_cos * target_cos);
+    let l_dot_v = dot(l, v);
+    let v_across = v - l * l_dot_v;
+    let v_across_length = length(v_across);
+    // The cone's point nearest `up`; with the light overhead, the one toward
+    // the viewer.
+    var toward = up - l * dot(up, l);
+    var toward_length = length(toward);
+    if (toward_length < 1e-4) {
+        toward = v_across;
+        toward_length = v_across_length;
+    }
+    if (toward_length < 1e-4) {
+        return up;
+    }
+    let side = toward / toward_length;
+    let nearest = l * target_cos + side * target_sin;
+    if (dot(nearest, v) >= MEADOW_VIEW_MARGIN || v_across_length < 1e-4) {
+        return nearest;
+    }
+    // Turn about the light toward the viewer until the normal faces them:
+    // `n.v = cos * l.v + sin * |v_across| * cos(psi)` at angle `psi` from the
+    // viewer's side of the cone. `nearest` falls short of the margin, so the
+    // turn ends at `cos(psi) = reach` on `nearest`'s side, or on the
+    // viewer's side where no normal of the cone reaches it.
+    let e_v = v_across / v_across_length;
+    let e_w = cross(l, e_v);
+    let reach = (MEADOW_VIEW_MARGIN - target_cos * l_dot_v) / max(target_sin * v_across_length, 1e-6);
+    var across = e_v;
+    if (reach <= 1.0) {
+        let turn = select(1.0, -1.0, dot(side, e_w) < 0.0) * sqrt(max(1.0 - reach * reach, 0.0));
+        across = e_v * reach + e_w * turn;
+    }
+    return l * target_cos + across * target_sin;
+}
+
+// Rec. 709 luminance weights.
+const MEADOW_LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+// Transient (not a buffer layout): how a surface standing in for a canopy
+// shades (`meadow_canopy_shade`).
+struct MeadowCanopyShade {
+    normal: vec3<f32>,
+    albedo: vec3<f32>,
+}
+
+// Share of a uniform sky's light a surface of normal `n` takes from the
+// sky above `up`, over a surface facing `up`: `(1 + n.up) / 2`.
+fn meadow_sky_view(n: vec3<f32>, up: vec3<f32>) -> f32 {
+    return 0.5 + 0.5 * dot(n, up);
+}
+
+// The shading normal and albedo that light a surface as a canopy of leaves
+// of `albedo` too small to shade one by one, under a sun of beam
+// illuminance `sun_over_sky` (non-negative) times the sky's on a surface
+// facing `up`. The sun gives the seen faces their leaf phase
+// (`meadow_leaf_phases`) times `lit`, the share of them it reaches, and
+// their sunlit neighbours' bounce (`meadow_canopy_bounce`, from the deep
+// canopy's lit share `deep_lit`) times their albedo, each further bounce
+// adding about the albedo again; the sky gives them its share. `deep`
+// weighs the deep canopy's sky share (`meadow_canopy_sky`) and bounce
+// against open leaves' (`meadow_canopy_sky_open`, no bounce): 0 where
+// real neighbours shade and bounce the light.
+//
+// The normal splits its light between them as the leaves do: its Lambert
+// factor `t` over its share of the sky (`meadow_sky_view`) is the sun's
+// share over the sky's, `light`. On the cone of `meadow_canopy_normal`
+// that is `t = h (1 + cos_l t + sin_l sqrt(1 - t^2))` for `h = light / 2`
+// and the sun's cosine `cos_l`, whose root is
+// `h (p + sin_l sqrt(1 - light cos_l)) / (p^2 + h^2 sin_l^2)` with
+// `p = 1 - h cos_l`. Where `h (1 + cos_l) >= 1` no normal splits it so,
+// and the normal faces the sun. The albedo then carries both lights' sum
+// in each channel, their colours weighted by `sun_over_sky`. With the sun
+// below the horizon, `up` and the albedo times the sky's share.
+//
+// Lit by it, far grass matches the mean of near blades shading their own
+// faces: dark and warm looking into a low sun, the shaded faces lit by the
+// sunlit ones around them in their colour squared, and bright with it
+// behind.
+fn meadow_canopy_shade(
+    up: vec3<f32>,
+    v: vec3<f32>,
+    l: vec3<f32>,
+    lit: f32,
+    deep_lit: f32,
+    deep: f32,
+    sun_over_sky: f32,
+    albedo: vec3<f32>,
+) -> MeadowCanopyShade {
+    var sky = meadow_canopy_sky_open(up, v);
+    if (deep > 0.0) {
+        sky = mix(sky, meadow_canopy_sky(up, v), deep);
+    }
+    let cos_l = dot(up, l);
+    if (cos_l <= 0.0) {
+        return MeadowCanopyShade(up, albedo * sky);
+    }
+    let phases = meadow_leaf_phases(v, l);
+    var bounce = 0.0;
+    if (deep > 0.0) {
+        bounce = meadow_canopy_bounce(cos_l, deep_lit, phases.y) * deep;
+    }
+    let sun = vec3<f32>(phases.x * lit) + albedo * (1.0 + albedo) * bounce;
+    let sun_luma = dot(albedo * sun, MEADOW_LUMA) / max(dot(albedo, MEADOW_LUMA), 1e-4);
+    let light = sun_luma / max(sky, 1e-4);
+    let sin_l = sqrt(max(1.0 - cos_l * cos_l, 0.0));
+    let h = 0.5 * light;
+    var t = 1.0;
+    if (h * (1.0 + cos_l) < 1.0) {
+        let p = 1.0 - h * cos_l;
+        let hs = h * sin_l;
+        t = min((h * p + hs * sqrt(max(1.0 - light * cos_l, 0.0))) / (p * p + hs * hs), 1.0);
+    }
+    let normal = meadow_canopy_normal(up, v, l, t);
+    let lights = sun_over_sky * max(dot(normal, l), 0.0) + meadow_sky_view(normal, up);
+    return MeadowCanopyShade(normal, albedo * (sun_over_sky * sun + sky) / max(lights, 1e-4));
+}
+
+// Transient (not a buffer layout): how a blade shades (`meadow_blade_shade`).
+struct MeadowBladeShade {
+    normal: vec3<f32>,
+    base_color: vec3<f32>,
+    // Factor on the blade's specular tint.
+    specular: f32,
+}
+
+// Shading of a blade of `base_color` at `world_position`, seen along unit
+// `v`, under the sun of `params` (`VariantParams.sun`). Blades shade with
+// their own normal `blade_normal` (`meadow_shading_normal`) and colour,
+// blending by `blade_weight` to a canopy (`meadow_canopy_shade`) lit by
+// the share of the seen leaves the sun reaches past the casters' shadows:
+// across the raytraced casters' fade by distance from the eye
+// (`width_range.w` 1 under them), or past the shadow maps' cut by view
+// depth along the `viewer_forward` plane, the casters' own measures, which
+// also bring the shade and bounce of real neighbours short of it. A canopy
+// normal is no one surface, so the canopy's specular tint is its sheen
+// (`meadow_canopy_sheen`), a factor on the lobe alike at every angle.
+// Without a sun the canopy is the upright normal and `base_color`.
+fn meadow_blade_shade(
+    params: VariantParams,
+    blade_normal: vec3<f32>,
+    blade_weight: f32,
+    world_position: vec3<f32>,
+    v: vec3<f32>,
+    base_color: vec3<f32>,
+    perceptual_roughness: f32,
+) -> MeadowBladeShade {
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    if (blade_weight >= 1.0) {
+        let normal = meadow_shading_normal(blade_normal, blade_weight, v, up);
+        return MeadowBladeShade(normal, base_color, 1.0);
+    }
+    let sun = params.sun;
+    var canopy = MeadowCanopyShade(up, base_color);
+    var lit = 1.0;
+    if (dot(sun.xyz, sun.xyz) >= 0.25) {
+        let forward = params.viewer_forward;
+        let depth = dot(forward.xyz, world_position) + forward.w;
+        var unshadowed = select(0.0, 1.0, depth >= MEADOW_SHADOW_MAX_DIST);
+        if (params.width_range.w > 0.5) {
+            let dist = distance(world_position, params.viewer_world_xz.xzy);
+            unshadowed = smoothstep(MEADOW_RT_SHADOW_FADE_START, MEADOW_SHADOW_MAX_DIST, dist);
+        }
+        var deep_lit = 1.0;
+        if (unshadowed > 0.0) {
+            deep_lit = meadow_canopy_lit(up, v, sun.xyz);
+            lit = mix(1.0, deep_lit, unshadowed);
+        }
+        canopy = meadow_canopy_shade(up, v, sun.xyz, lit, deep_lit, unshadowed, sun.w, base_color);
+    }
+    let sheen =
+        meadow_canopy_sheen(canopy.normal, up, v, sun.xyz, lit, perceptual_roughness, sun.w);
+    let weight = saturate(blade_weight);
+    return MeadowBladeShade(
+        meadow_shading_normal(blade_normal, blade_weight, v, canopy.normal),
+        mix(canopy.albedo, base_color, weight),
+        mix(sheen, 1.0, weight),
+    );
+}
+
 // Grass shading normal. Near blades shade with their own normal
 // (`meadow_blade_world_normal`, interpolated), turned to the side facing
 // the viewer, so the blades of a meadow catch the light differently. With
-// `blade_weight` it blends to the upright normal, which keeps sub-pixel
-// grass lighting coherent; weight 0 is the upright normal exactly.
+// `blade_weight` it blends to `canopy_normal` (`meadow_canopy_normal`),
+// which keeps sub-pixel grass lighting coherent and its mean the near
+// blades'; weight 0 is `canopy_normal` exactly.
 //
 // A hillside can put the camera below the normal's hemisphere, and
 // Solari's BRDF rejects NdotV <= 0, making those blades black. The normal
@@ -1007,24 +1339,24 @@ fn meadow_shading_normal(
     blade_normal: vec3<f32>,
     blade_weight: f32,
     view_direction: vec3<f32>,
+    canopy_normal: vec3<f32>,
 ) -> vec3<f32> {
-    let up = vec3<f32>(0.0, 1.0, 0.0);
     let length_squared = dot(view_direction, view_direction);
-    if length_squared < 1e-12 { return up; }
+    if length_squared < 1e-12 { return canopy_normal; }
     let v = view_direction * inverseSqrt(length_squared);
-    var n = up;
+    var n = canopy_normal;
     let blade_length_squared = dot(blade_normal, blade_normal);
     if blade_weight > 0.0 && blade_length_squared > 1e-12 {
         var facing = blade_normal * inverseSqrt(blade_length_squared);
         if dot(facing, v) < 0.0 { facing = -facing; }
-        let blended = mix(up, facing, min(blade_weight, 1.0));
+        let blended = mix(canopy_normal, facing, min(blade_weight, 1.0));
         let blended_length_squared = dot(blended, blended);
         if blended_length_squared > 1e-6 {
             n = blended * inverseSqrt(blended_length_squared);
         }
     }
     let n_dot_v = dot(n, v);
-    let margin = 0.1;
+    let margin = MEADOW_VIEW_MARGIN;
     if n_dot_v >= margin { return n; }
     let tangent = n - v * n_dot_v;
     let tangent_length_squared = dot(tangent, tangent);

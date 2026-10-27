@@ -6,7 +6,7 @@
 //! because the blades sway. The near band is the exact 9-triangle ribbon, the
 //! far band a 1-triangle chord. Requires [`MeadowRaytracingConfig::enabled`].
 //!
-//! Receivers: meadow's upright shading normal is not a blade's geometric
+//! Receivers: meadow's canopy shading normal is not a blade's geometric
 //! normal, so Solari's ordinary `position + normal * t_min` origin lands
 //! inside or behind neighbouring blades. `meadow_receivers.wesl` fills Solari's
 //! per-view receiver-override texture from the G-buffer bits both meadow raster
@@ -110,7 +110,7 @@ impl Plugin for MeadowSolariPlugin {
 #[extract_app(RenderApp)]
 pub struct MeadowReceiverOrigins {
     /// Rays start at the depth-reconstructed position, without the offset along
-    /// the upright shading normal. Applies to pixels that have no geometric
+    /// the canopy shading normal. Applies to pixels that have no geometric
     /// normal (payload disabled, or `geometric_normals` off).
     pub unshifted: bool,
     /// Rays start at the depth-reconstructed position and are offset per ray

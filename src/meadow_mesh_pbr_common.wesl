@@ -18,9 +18,9 @@ import bevy_pbr::render::{
     mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
 };
 import bevy_meadow::meadow_shared::{
-    meadow_shading_normal, meadow_blade_base_color, meadow_blade_emissive,
+    meadow_blade_shade, meadow_blade_base_color, meadow_blade_emissive,
 };
-import bevy_meadow::meadow_mesh_bindings::MeadowVertexOut;
+import bevy_meadow::meadow_mesh_bindings::{MeadowVertexOut, variant_params};
 
 // Both paths need the view direction to keep the grass shading normal in
 // the visible hemisphere. Deferred lighting reconstructs that direction
@@ -29,16 +29,25 @@ fn meadow_blade_pbr_input(in: MeadowVertexOut, is_front: bool) -> PbrInput {
     var pbr_input = pbr_input_new();
     // Mirror of meadow.wesl::apply_blade_palette with the meadow
     // StandardMaterial's values baked in (white base, roughness 0.85).
-    pbr_input.material.base_color = vec4<f32>(meadow_blade_base_color(in.albedo, in.y_norm), 1.0);
     pbr_input.material.perceptual_roughness = 0.85;
     pbr_input.material.emissive = vec4<f32>(meadow_blade_emissive(in.albedo, in.y_norm), 1.0);
     pbr_input.frag_coord = in.position;
     pbr_input.world_position = in.world_position;
     pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr_input.V = calculate_view(in.world_position, pbr_input.is_orthographic);
-    pbr_input.world_normal =
-        meadow_shading_normal(in.blade_normal.xyz, in.blade_normal.w, pbr_input.V);
-    pbr_input.N = pbr_input.world_normal;
+    let blade = meadow_blade_shade(
+        variant_params,
+        in.blade_normal.xyz,
+        in.blade_normal.w,
+        in.world_position.xyz,
+        pbr_input.V,
+        meadow_blade_base_color(in.albedo, in.y_norm),
+        pbr_input.material.perceptual_roughness,
+    );
+    pbr_input.world_normal = blade.normal;
+    pbr_input.N = blade.normal;
+    pbr_input.material.base_color = vec4<f32>(blade.base_color, 1.0);
+    pbr_input.material.specular_tint *= blade.specular;
     // No real MeshUniform row exists for mesh-emitted geometry; force the
     // shadow-receiver bit the same way meadow.wesl does.
     pbr_input.flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;

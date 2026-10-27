@@ -47,7 +47,7 @@ import bevy_pbr::render::{
 
 import bevy_meadow::meadow_shared::{
     VariantParams, CompactedBladeRecord, BladeAttrs, meadow_template_vertex, meadow_place_vertex,
-    meadow_blade_normal_varying, wind_sway, meadow_shading_normal, meadow_unpack_albedo,
+    meadow_blade_normal_varying, wind_sway, meadow_blade_shade, meadow_unpack_albedo,
     meadow_blade_base_color, meadow_blade_emissive,
 };
 
@@ -228,11 +228,21 @@ fn fragment(
 // Shared by the forward fragment and the deferred/normal prepass fragment.
 @if(!PREPASS_PIPELINE || (PREPASS_FRAGMENT && NORMAL_PREPASS_OR_DEFERRED_PREPASS))
 fn apply_blade_palette(in: VertexOutput, pbr_input: ptr<function, PbrInput>) {
-    (*pbr_input).world_normal = meadow_shading_normal(in.world_normal, in.uv.x, (*pbr_input).V);
-    (*pbr_input).N = (*pbr_input).world_normal;
     // Vertex colour times the white material base: the blade albedo.
     let albedo = (*pbr_input).material.base_color.rgb;
-    (*pbr_input).material.base_color = vec4<f32>(meadow_blade_base_color(albedo, in.uv.y), 1.0);
+    let blade = meadow_blade_shade(
+        variant_params,
+        in.world_normal,
+        in.uv.x,
+        in.world_position.xyz,
+        (*pbr_input).V,
+        meadow_blade_base_color(albedo, in.uv.y),
+        (*pbr_input).material.perceptual_roughness,
+    );
+    (*pbr_input).world_normal = blade.normal;
+    (*pbr_input).N = blade.normal;
+    (*pbr_input).material.base_color = vec4<f32>(blade.base_color, 1.0);
+    (*pbr_input).material.specular_tint *= blade.specular;
     (*pbr_input).material.emissive = vec4<f32>(meadow_blade_emissive(albedo, in.uv.y), 1.0);
     // Patch over the garbage `pbr_input.flags` that
     // `pbr_input_from_vertex_output` reads from `mesh[in.instance_index]`.

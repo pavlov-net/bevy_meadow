@@ -68,8 +68,11 @@ pub struct PaletteParams {
 pub struct VariantParams {
     /// Min/max blade height in metres, packed `(min, max, _, _)`.
     pub height_range: Vec4,
-    /// Min/max blade width in metres, packed `(min, max, solari_geometry_normal, _)`.
-    /// `z` enables a Solari-only G-buffer extension; zero for vanilla deferred.
+    /// Min/max blade width in metres, packed `(min, max,
+    /// solari_geometry_normal, raytraced_casters)`. `z` enables a
+    /// Solari-only G-buffer extension; zero for vanilla deferred. `w` = 1
+    /// where raytraced casters shade the grass, from
+    /// `MeadowRaytracingConfig`.
     pub width_range: Vec4,
     /// `x = amplitude` (peak XZ displacement of a blade tip in
     /// metres), `y = period` (seconds per gust cycle),
@@ -144,6 +147,11 @@ pub struct VariantParams {
     /// Cover survival, packed `(1 / noise_scale_m, clumpiness,
     /// max_height_scale, _)` (see [`CoverSurvival`](crate::CoverSurvival)).
     pub cover: Vec4,
+    /// `xyz` = unit direction to the sun, zero without one; `w` = its beam
+    /// illuminance over the sky's on level ground ([`MeadowSun`](crate::MeadowSun)).
+    /// Far grass shades as a canopy lit from it
+    /// (`meadow_shared.wesl::meadow_blade_shade`).
+    pub sun: Vec4,
 }
 
 impl Default for VariantParams {
@@ -172,6 +180,7 @@ impl Default for VariantParams {
             viewer_forward: Vec4::ZERO,
             cover_extents,
             cover,
+            sun: Vec4::ZERO,
         }
     }
 }

@@ -263,6 +263,7 @@ pub fn build_tuft_template_mesh() -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::math::Vec3;
     use bevy::mesh::VertexAttributeValues;
 
     /// Both LOD meshes must carry the same vertex attributes so the single
@@ -328,6 +329,467 @@ mod tests {
                 shared.contains(&line),
                 "`{line}` missing from meadow_shared.wesl"
             );
+        }
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_leaf_phases`: the leaf phase
+    /// along `v` and along `-v`.
+    fn leaf_phases(v: Vec3, l: Vec3) -> (f32, f32) {
+        let c = v.dot(l).clamp(-1.0, 1.0);
+        let (b, s) = (c.acos(), (1.0 - c * c).sqrt());
+        let scale = 1.5 * std::f32::consts::PI;
+        (
+            ((std::f32::consts::PI - b) * c + s) / scale,
+            (s - b * c) / scale,
+        )
+    }
+
+    /// The leaf phase along `v` ([`leaf_phases`]).
+    fn leaf_phase(v: Vec3, l: Vec3) -> f32 {
+        leaf_phases(v, l).0
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_canopy_normal`.
+    fn canopy_normal(up: Vec3, v: Vec3, l: Vec3, light: f32) -> Vec3 {
+        let target = light.clamp(0.0, 1.0);
+        let target_sin = (1.0 - target * target).sqrt();
+        let l_dot_v = l.dot(v);
+        let v_across = v - l * l_dot_v;
+        let v_across_length = v_across.length();
+        let mut toward = up - l * up.dot(l);
+        let mut toward_length = toward.length();
+        if toward_length < 1e-4 {
+            (toward, toward_length) = (v_across, v_across_length);
+        }
+        if toward_length < 1e-4 {
+            return up;
+        }
+        let side = toward / toward_length;
+        let nearest = l * target + side * target_sin;
+        if nearest.dot(v) >= VIEW_MARGIN || v_across_length < 1e-4 {
+            return nearest;
+        }
+        let e_v = v_across / v_across_length;
+        let e_w = l.cross(e_v);
+        let reach = (VIEW_MARGIN - target * l_dot_v) / (target_sin * v_across_length).max(1e-6);
+        let across = if reach <= 1.0 {
+            let turn = if side.dot(e_w) < 0.0 { -1.0 } else { 1.0 };
+            e_v * reach + e_w * (turn * (1.0 - reach * reach).max(0.0).sqrt())
+        } else {
+            e_v
+        };
+        l * target + across * target_sin
+    }
+
+    /// `meadow_shared.wesl::MEADOW_VIEW_MARGIN`.
+    const VIEW_MARGIN: f32 = 0.1;
+
+    /// `meadow_shared.wesl::MEADOW_CANOPY_MIN_COS`.
+    const CANOPY_MIN_COS: f32 = 0.02;
+
+    /// `meadow_shared.wesl::MEADOW_LUMA`.
+    const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+    /// CPU twin of `meadow_shared.wesl::meadow_canopy_lit`.
+    fn canopy_lit(up: Vec3, v: Vec3, l: Vec3) -> f32 {
+        let (mu_v, mu_l) = (up.dot(v).max(CANOPY_MIN_COS), up.dot(l).max(CANOPY_MIN_COS));
+        mu_l / (mu_l + mu_v)
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_canopy_sky`.
+    fn canopy_sky(up: Vec3, v: Vec3) -> f32 {
+        let mu = up.dot(v).max(CANOPY_MIN_COS);
+        0.5 + 0.5754 * mu - (0.5889 + 0.5436 * mu) * mu * (1.0 + 1.0 / mu).ln()
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_canopy_sky_open`.
+    fn canopy_sky_open(up: Vec3, v: Vec3) -> f32 {
+        0.5 + up.dot(v).max(0.0) / 3.0
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_canopy_bounce`.
+    fn canopy_bounce(mu_l: f32, deep_lit: f32, back: f32) -> f32 {
+        deep_lit * (0.033 + 0.031 * back) + mu_l * (0.042 + 0.213 * back)
+    }
+
+    /// The deep canopy's bounce for the sun `l` seen along `v`
+    /// ([`canopy_bounce`]).
+    fn deep_bounce(v: Vec3, l: Vec3) -> f32 {
+        canopy_bounce(l.y, canopy_lit(Vec3::Y, v, l), leaf_phases(v, l).1)
+    }
+
+    /// The canopy normal's Lambert factor in
+    /// `meadow_shared.wesl::meadow_canopy_shade`: the root of
+    /// `t = light / 2 (1 + cos_l t + sin_l sqrt(1 - t^2))`, at most 1.
+    fn canopy_split(light: f32, cos_l: f32) -> f32 {
+        let sin_l = (1.0 - cos_l * cos_l).max(0.0).sqrt();
+        let h = 0.5 * light;
+        if h * (1.0 + cos_l) >= 1.0 {
+            return 1.0;
+        }
+        let p = 1.0 - h * cos_l;
+        let hs = h * sin_l;
+        ((h * p + hs * (1.0 - light * cos_l).max(0.0).sqrt()) / (p * p + hs * hs)).min(1.0)
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_canopy_shade`: normal, albedo.
+    fn canopy_shade(
+        up: Vec3,
+        v: Vec3,
+        l: Vec3,
+        lit: f32,
+        deep_lit: f32,
+        deep: f32,
+        sun_over_sky: f32,
+        albedo: Vec3,
+    ) -> (Vec3, Vec3) {
+        let mut sky = canopy_sky_open(up, v);
+        if deep > 0.0 {
+            sky += (canopy_sky(up, v) - sky) * deep;
+        }
+        let cos_l = up.dot(l);
+        if cos_l <= 0.0 {
+            return (up, albedo * sky);
+        }
+        let (phase, back) = leaf_phases(v, l);
+        let bounce = if deep > 0.0 {
+            canopy_bounce(cos_l, deep_lit, back) * deep
+        } else {
+            0.0
+        };
+        let sun = Vec3::splat(phase * lit) + albedo * (1.0 + albedo) * bounce;
+        let sun_luma = (albedo * sun).dot(LUMA) / albedo.dot(LUMA).max(1e-4);
+        let light = sun_luma / sky.max(1e-4);
+        let normal = canopy_normal(up, v, l, canopy_split(light, cos_l));
+        let lights = sun_over_sky * normal.dot(l).max(0.0) + sky_view(normal, up);
+        (
+            normal,
+            albedo * (sun * sun_over_sky + Vec3::splat(sky)) / lights.max(1e-4),
+        )
+    }
+
+    /// CPU twin of `meadow_shared.wesl::meadow_sky_view`.
+    fn sky_view(n: Vec3, up: Vec3) -> f32 {
+        0.5 + 0.5 * n.dot(up)
+    }
+
+    /// A direction `elevation` degrees above the horizon at `azimuth`.
+    fn direction(elevation: f32, azimuth: f32) -> Vec3 {
+        let (e, a) = (elevation.to_radians(), azimuth.to_radians());
+        Vec3::new(e.cos() * a.sin(), e.sin(), e.cos() * a.cos())
+    }
+
+    /// The canopy shading lights each channel, under a sun and a uniform
+    /// sky, by the leaf phase times the lit share (2/3 with the light behind
+    /// the viewer, none looking into it) plus the neighbours' bounce in that
+    /// channel's albedo, and the sky's share, splitting them exactly as the
+    /// leaves do wherever its normal can; it is the upright normal with the
+    /// light below the horizon. The shader keeps the twin's lines. The
+    /// canopy normal faces the viewer by the view margin wherever its cone
+    /// allows.
+    #[test]
+    fn canopy_normal_lights_like_the_leaves() {
+        let shared = include_str!("meadow_shared.wesl");
+        for needle in [
+            "return vec2<f32>((PI - b) * c + s, s - b * c) / (1.5 * PI);",
+            "let target_cos = clamp(light, 0.0, 1.0);",
+            "sky = mix(sky, meadow_canopy_sky(up, v), deep);",
+            "bounce = meadow_canopy_bounce(cos_l, deep_lit, phases.y) * deep;",
+            "let sun = vec3<f32>(phases.x * lit) + albedo * (1.0 + albedo) * bounce;",
+            "let sun_luma = dot(albedo * sun, MEADOW_LUMA) / max(dot(albedo, MEADOW_LUMA), 1e-4);",
+            "if (h * (1.0 + cos_l) < 1.0) {",
+            "t = min((h * p + hs * sqrt(max(1.0 - light * cos_l, 0.0))) / (p * p + hs * hs), 1.0);",
+            "let normal = meadow_canopy_normal(up, v, l, t);",
+            "let lights = sun_over_sky * max(dot(normal, l), 0.0) + meadow_sky_view(normal, up);",
+            "return MeadowCanopyShade(normal, albedo * (sun_over_sky * sun + sky) / max(lights, 1e-4));",
+            "return 0.5 + 0.5 * dot(n, up);",
+            "let nearest = l * target_cos + side * target_sin;",
+            "let turn = select(1.0, -1.0, dot(side, e_w) < 0.0) * sqrt(max(1.0 - reach * reach, 0.0));",
+            "across = e_v * reach + e_w * turn;",
+            "return l * target_cos + across * target_sin;",
+            "const MEADOW_VIEW_MARGIN: f32 = 0.1;",
+            "const MEADOW_CANOPY_MIN_COS: f32 = 0.02;",
+            "return mu_l / (mu_l + mu_v);",
+            "leaves_sun = sun * lit * (1.0 + dot(v, l)) * (0.045 - 0.0248 * h_up2 * h_up2);",
+            "surface_sun = sun * n_dot_l * d * vis;",
+            "return saturate((leaves_sun + 0.014) / max(surface_sun + surface_sky, 1e-6));",
+        ] {
+            assert!(shared.contains(needle), "`{needle}` missing");
+        }
+        let l = direction(20.0, 0.0);
+        let (toward, back) = leaf_phases(l, l);
+        assert!((toward - 2.0 / 3.0).abs() < 1e-5 && back.abs() < 1e-5);
+        let (toward, back) = leaf_phases(-l, l);
+        assert!(toward.abs() < 1e-5 && (back - 2.0 / 3.0).abs() < 1e-5);
+        for sun in [1.0, 5.0, 10.0, 20.0, 35.0, 50.0, 70.0, 90.0] {
+            for view in [1.0, 3.0, 5.0, 10.0, 30.0, 60.0, 80.0] {
+                for azimuth in (0..12).map(|i| i as f32 * 30.0) {
+                    let (l, v) = (direction(sun, 0.0), direction(view, azimuth));
+                    assert!((leaf_phases(v, l).1 - leaf_phase(-v, l)).abs() < 1e-5);
+                    for (lit, albedo, k, deep) in [
+                        (0.3, Vec3::new(0.12, 0.10, 0.04), 0.5, 1.0),
+                        (0.3, Vec3::new(0.12, 0.10, 0.04), 4.0, 0.5),
+                        (0.7, Vec3::new(0.08, 0.11, 0.03), 20.0, 0.0),
+                        (1.0, Vec3::new(0.05, 0.09, 0.02), 4.0, 1.0),
+                        (1.0, Vec3::new(0.05, 0.09, 0.02), 20.0, 0.2),
+                    ] {
+                        let deep_lit = canopy_lit(Vec3::Y, v, l);
+                        let (n, shaded) =
+                            canopy_shade(Vec3::Y, v, l, lit, deep_lit, deep, k, albedo);
+                        assert!((n.length() - 1.0).abs() < 1e-4, "{n}");
+                        let target = n.dot(l).min(1.0);
+                        let sky = canopy_sky_open(Vec3::Y, v)
+                            + (canopy_sky(Vec3::Y, v) - canopy_sky_open(Vec3::Y, v)) * deep;
+                        let bounce = deep_bounce(v, l) * deep;
+                        let sun_light = leaf_phase(v, l) * lit + albedo * (1.0 + albedo) * bounce;
+                        // Sun and sky together, in every channel.
+                        let rendered = shaded * (k * n.dot(l).max(0.0) + sky_view(n, Vec3::Y));
+                        let want = albedo * (sun_light * k + Vec3::splat(sky));
+                        assert!(
+                            (rendered - want).abs().max_element() < 1e-4 * want.max_element(),
+                            "{sun} {view} {azimuth}: {n} {shaded}"
+                        );
+                        // Split between them as the leaves split them, wherever
+                        // a normal of the cone does and faces the viewer.
+                        let light = (albedo * sun_light).dot(LUMA) / albedo.dot(LUMA) / sky;
+                        if light * (1.0 + l.y) < 2.0 && n.dot(v) > VIEW_MARGIN + 0.01 {
+                            let split = n.dot(l) / sky_view(n, Vec3::Y);
+                            assert!(
+                                (split - light).abs() < 1e-3 * light + 1e-5,
+                                "{sun} {view} {azimuth}: {split} vs {light}"
+                            );
+                        }
+                        // It faces the viewer by the margin wherever any normal
+                        // of its cone can.
+                        let best = target * l.dot(v)
+                            + (1.0 - target * target).sqrt() * (v - l * l.dot(v)).length();
+                        if best >= VIEW_MARGIN + 1e-3 {
+                            assert!(
+                                n.dot(v) >= VIEW_MARGIN - 1e-3,
+                                "{sun} {view} {azimuth}: {n}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let albedo = Vec3::new(0.1, 0.12, 0.05);
+        assert_eq!(
+            canopy_shade(
+                Vec3::Y,
+                Vec3::X,
+                direction(-5.0, 0.0),
+                1.0,
+                1.0,
+                0.0,
+                4.0,
+                albedo
+            ),
+            (Vec3::Y, albedo * 0.5)
+        );
+    }
+
+    /// The canopy normal's Lambert factor is the root of its sky-view
+    /// balance, found by bisection, or 1 where the balance has none below 1.
+    #[test]
+    fn canopy_split_is_the_balance_root() {
+        for e in 1..=360 {
+            let cos_l = (f64::from(e) * 0.25).to_radians().sin();
+            let sin_l = (1.0 - cos_l * cos_l).sqrt();
+            for i in 0..=800 {
+                let light = f64::from(i) * 0.005;
+                let balance = |t: f64| {
+                    0.5 * light * (1.0 + cos_l * t + sin_l * (1.0 - t * t).max(0.0).sqrt()) - t
+                };
+                let want = if balance(1.0) >= 0.0 {
+                    1.0
+                } else {
+                    let (mut lo, mut hi) = (0.0, 1.0);
+                    for _ in 0..60 {
+                        let mid = 0.5 * (lo + hi);
+                        if balance(mid) >= 0.0 {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    0.5 * (lo + hi)
+                };
+                let t = canopy_split(light as f32, cos_l as f32);
+                assert!(
+                    (f64::from(t) - want).abs() < 1e-5,
+                    "{light} {cos_l}: {t} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// The canopy's sky shares are the leaf phase of every sky direction
+    /// over a uniform sky, times its lit share deep in the canopy or alone
+    /// for open leaves, by quadrature. Its bounce is within 0.03 of a Monte
+    /// Carlo of the deep canopy (spherical, opaque, two-sided Lambertian
+    /// leaves of albedo 0.15, `G` 0.5, orders past the second divided out
+    /// as `1 + albedo`), listed as sun elevation, view elevation, view
+    /// azimuth from the sun and bounce.
+    #[test]
+    fn canopy_sky_and_bounce_match_the_leaves() {
+        let shared = include_str!("meadow_shared.wesl");
+        for needle in [
+            "return 0.5 + 0.5754 * mu - (0.5889 + 0.5436 * mu) * mu * log_term;",
+            "return 0.5 + max(dot(up, v), 0.0) / 3.0;",
+            "return deep_lit * (0.033 + 0.031 * back) + mu_l * (0.042 + 0.213 * back);",
+        ] {
+            assert!(shared.contains(needle), "`{needle}` missing");
+        }
+        let n = 160;
+        let d_theta = std::f32::consts::FRAC_PI_2 / n as f32;
+        let d_phi = std::f32::consts::TAU / (2 * n) as f32;
+        for view in [1.5_f32, 3.0, 6.0, 12.0, 20.0, 35.0, 50.0, 70.0, 90.0] {
+            let v = direction(view, 0.0);
+            let (mut deep, mut open) = (0.0, 0.0);
+            for i in 0..n {
+                let theta = (i as f32 + 0.5) * d_theta;
+                for j in 0..2 * n {
+                    let phi = (j as f32 + 0.5) * d_phi;
+                    let s = Vec3::new(
+                        theta.sin() * phi.cos(),
+                        theta.cos(),
+                        theta.sin() * phi.sin(),
+                    );
+                    let phase =
+                        leaf_phase(v, s) * theta.sin() * d_theta * d_phi / std::f32::consts::PI;
+                    open += phase;
+                    deep += phase * s.y / (s.y + v.y);
+                }
+            }
+            let open_twin = canopy_sky_open(Vec3::Y, v);
+            assert!(
+                (open - open_twin).abs() < 2e-3,
+                "{view}: {open} vs {open_twin}"
+            );
+            let deep_twin = canopy_sky(Vec3::Y, v);
+            assert!(
+                (deep - deep_twin).abs() < 2e-3,
+                "{view}: {deep} vs {deep_twin}"
+            );
+        }
+        for (sun, view, azimuth, monte_carlo) in [
+            (8.0, 2.0, 180.0, 0.069),
+            (20.0, 2.0, 0.0, 0.034),
+            (20.0, 2.0, 180.0, 0.108),
+            (20.0, 15.0, 120.0, 0.075),
+            (35.0, 6.0, 60.0, 0.072),
+            (35.0, 65.0, 180.0, 0.056),
+            (50.0, 2.0, 180.0, 0.146),
+            (66.0, 6.0, 180.0, 0.142),
+            (66.0, 35.0, 0.0, 0.056),
+            (85.0, 65.0, 120.0, 0.051),
+        ] {
+            let b = deep_bounce(direction(view, azimuth), direction(sun, 0.0));
+            assert!(
+                (b - monte_carlo).abs() < 0.03,
+                "{sun} {view} {azimuth}: {b} vs {monte_carlo}"
+            );
+        }
+    }
+
+    /// The blade template's normals (lean, bend, rounding, random yaw) with
+    /// their blade width's weight.
+    fn template_normals() -> Vec<(Vec3, f32)> {
+        let taper = |t: f32| (1.0 - t) * (1.0 + 0.6 * t);
+        let mut normals = Vec::new();
+        for i in 0..40_000u32 {
+            let h = |k: u32| crate::field::hash01_u32(i.wrapping_mul(7).wrapping_add(k));
+            let (u_bend, u_root, t, s, yaw) = (
+                h(0),
+                h(1),
+                h(2),
+                2.0 * h(3) - 1.0,
+                h(4) * std::f32::consts::TAU,
+            );
+            let a = 0.08 + 0.32 * u_root + (0.3 + 0.6 * u_bend + 0.9 * u_bend.powi(4)) * t;
+            let n = Vec3::new(0.6 * s, -a.sin(), a.cos()).normalize();
+            let (c, si) = (yaw.cos(), yaw.sin());
+            normals.push((
+                Vec3::new(c * n.x + si * n.z, n.y, -si * n.x + c * n.z),
+                taper(t),
+            ));
+        }
+        normals
+    }
+
+    /// bevy_pbr's `D_GGX(roughness, n.h) * V_SmithGGXCorrelated(...) * n.l`
+    /// at the blades' perceptual roughness 0.85.
+    fn ggx_lobe(n_dot_v: f32, n_dot_l: f32, n_dot_h: f32) -> f32 {
+        let alpha = 0.85 * 0.85;
+        let a2 = alpha * alpha;
+        let k = alpha / (1.0 - n_dot_h * n_dot_h + n_dot_h * n_dot_h * a2);
+        let d = k * k / std::f32::consts::PI;
+        let lambda_v = n_dot_l * ((n_dot_v - a2 * n_dot_v) * n_dot_v + a2).sqrt();
+        let lambda_l = n_dot_v * ((n_dot_l - a2 * n_dot_l) * n_dot_l + a2).sqrt();
+        d * 0.5 / (lambda_v + lambda_l) * n_dot_l
+    }
+
+    /// The blade template's own GGX lobes (perceptual roughness 0.85), over
+    /// the faces a viewer sees, reflect the sun within 0.006 of
+    /// `(1 + v.l) (0.045 - 0.0248 (h.up)^4)` at views up to 12 degrees off
+    /// the ground: the canopy sheen's leaves.
+    #[test]
+    fn blade_sheen_is_the_backscatter() {
+        let normals = template_normals();
+        for sun in [5.0, 20.0, 35.0, 50.0, 70.0, 85.0] {
+            for view in [1.0, 3.0, 6.0, 12.0] {
+                for azimuth in [0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0] {
+                    let (l, v) = (direction(sun, 0.0), direction(view, azimuth));
+                    let h = (v + l).normalize();
+                    let (reflected, seen) =
+                        normals
+                            .iter()
+                            .fold((0.0, 0.0), |(reflected, seen), &(n, w)| {
+                                let face = if n.dot(v) > 0.0 { n } else { -n };
+                                let (n_dot_v, n_dot_l) = (face.dot(v), face.dot(l));
+                                let lobe = if n_dot_l > 0.0 {
+                                    ggx_lobe(n_dot_v, n_dot_l, face.dot(h).max(0.0))
+                                } else {
+                                    0.0
+                                };
+                                (reflected + w * n_dot_v * lobe, seen + w * n_dot_v)
+                            });
+                    let fit = (1.0 + v.dot(l)) * (0.045 - 0.0248 * h.y.powi(4));
+                    assert!(
+                        (reflected / seen - fit).abs() < 0.006,
+                        "{sun} {view} {azimuth}: {} vs {fit}",
+                        reflected / seen
+                    );
+                }
+            }
+        }
+    }
+
+    /// The blade template's normals (lean, bend, rounding, each blade facing
+    /// its viewer) light within 0.04 of the spherical leaf phase at the
+    /// views far grass is seen at.
+    #[test]
+    fn blade_normals_follow_the_spherical_phase() {
+        let normals = template_normals();
+        for sun in [5.0, 20.0, 40.0] {
+            for view in [1.0, 4.0, 10.0] {
+                for azimuth in [0.0, 90.0, 180.0] {
+                    let (l, v) = (direction(sun, 0.0), direction(view, azimuth));
+                    let (lit, seen) = normals.iter().fold((0.0, 0.0), |(lit, seen), &(n, w)| {
+                        (
+                            lit + w * (n.dot(v) * n.dot(l)).max(0.0),
+                            seen + w * n.dot(v).abs(),
+                        )
+                    });
+                    let phase = leaf_phase(v, l);
+                    assert!(
+                        (lit / seen - phase).abs() < 0.04,
+                        "{sun} {view} {azimuth}: {} vs {phase}",
+                        lit / seen
+                    );
+                }
+            }
         }
     }
 

@@ -15,7 +15,8 @@
 
 import bevy_meadow::meadow_shared::{
     VariantParams, PaletteParams, MEADOW_MAX_PALETTES, CompactedBladeRecord, BladeAttrs,
-    MEADOW_CHORD_WIDTH_SCALE, MEADOW_SHADOW_MAX_DIST, wind_sway, hash_u32, hash01_u32, hash01_pair,
+    MEADOW_CHORD_WIDTH_SCALE, MEADOW_SHADOW_MAX_DIST, MEADOW_RT_SHADOW_FADE_START, wind_sway,
+    hash_u32, hash01_u32, hash01_pair,
     meadow_patch_palette, meadow_max_height_scale, meadow_patch_noise, meadow_blade_height_scale,
     meadow_blade_albedo, meadow_pack_albedo, meadow_gate_count, meadow_band_threshold,
     meadow_template_vertex, meadow_place_vertex, meadow_patch_is_tile, meadow_patch_outer_radius,
@@ -521,9 +522,6 @@ fn cull_and_compact(
 // overlap a stable hash chooses one representation. No atomic compaction
 // changes triangle ownership while wind moves the geometry.
 
-// Fade caster density to zero before the hard range limit. This thinning
-// is NOT compensated by width, which would cancel the intended fade.
-const RT_SHADOW_FADE_START: f32 = 35.0;
 // Fixed per-band blade capacities — MUST equal `compute.rs::RT_NEAR_MAX_BLADES`
 // / `RT_FAR_MAX_BLADES`. CPU slot allocation enforces these exact limits.
 const RT_NEAR_MAX_BLADES: u32 = 32768u;
@@ -645,7 +643,7 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
         let h = hash01_pair(seed, key.y);
         // The same threshold selects exactly one representation in overlap.
         let chosen = select((h < transition), (h >= transition), near);
-        let fade = 1.0 - smoothstep(RT_SHADOW_FADE_START, MEADOW_SHADOW_MAX_DIST, dist);
+        let fade = 1.0 - smoothstep(MEADOW_RT_SHADOW_FADE_START, MEADOW_SHADOW_MAX_DIST, dist);
         let fade_hash = hash01_pair(seed ^ 0xA511E9B3u, key.y);
         if (chosen && fade_hash < fade) {
             collapse = gated.collapse_t;
