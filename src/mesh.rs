@@ -306,7 +306,8 @@ mod tests {
     }
 
     /// The shaders carry their own copies of the blade cap, the blade's arc
-    /// length, the shadow distance and the tuft's area ratio.
+    /// length, the shadow distance, the tuft's area ratio and the mean blade
+    /// shade.
     #[test]
     fn constants_match_the_shaders() {
         let shared = include_str!("meadow_shared.wesl");
@@ -317,6 +318,10 @@ mod tests {
             format!(
                 "const MEADOW_TUFT_BLADE_AREA: f32 = {:?};",
                 crate::plugin::TUFT_BLADE_AREA_RATIO
+            ),
+            format!(
+                "const MEADOW_MEAN_BLADE_SHADE: f32 = {:?};",
+                crate::plugin::MEAN_BLADE_SHADE
             ),
         ] {
             assert!(

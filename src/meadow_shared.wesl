@@ -922,6 +922,35 @@ fn meadow_blade_height_scale(palette: PaletteParams, noise: f32, dryness: f32, s
     return meadow_dryness_height(dryness) * (1.0 + palette.variance.x * 0.5 * (blade_term + patch_term));
 }
 
+// Mean of the blade height shade (`meadow_blade_base_color`) over a blade.
+// MUST equal `plugin.rs::MEAN_BLADE_SHADE`.
+const MEADOW_MEAN_BLADE_SHADE: f32 = 0.85;
+
+// Expected shaded albedo of the blades rooted about `root_xz` on ground of
+// `dryness`, averaged over a footprint `footprint_m` metres across: their
+// dead weight (the patch noise there, then single dead blades) between the
+// live and dry colours, under the mean blade shade. Footprints past a
+// quarter of a dead patch fade the patches toward their share, the
+// noise's mean, so they do not alias; the per-blade colour jitter is
+// zero-mean and left out. What a stand of blades too small to draw
+// averages to, such as on far ground.
+fn meadow_stand_albedo(
+    palette: PaletteParams,
+    root_xz: vec2<f32>,
+    dryness: f32,
+    footprint_m: f32,
+) -> vec3<f32> {
+    let share = meadow_patch_share(palette, dryness);
+    let resolved = 1.0 - smoothstep(0.25, 1.0, footprint_m * palette.variance.y);
+    var patch_dead = share;
+    if (resolved > 0.0) {
+        let noise = meadow_patch_noise(palette, root_xz, dryness);
+        patch_dead = mix(share, meadow_patch_dead(palette, noise, share), resolved);
+    }
+    let dead = patch_dead + (1.0 - patch_dead) * palette.dry_blade_share.w;
+    return mix(palette.live_jitter.rgb, palette.dry_blade_share.rgb, dead) * MEADOW_MEAN_BLADE_SHADE;
+}
+
 // A blade's linear albedo from its patch noise, ground dryness and seed.
 fn meadow_blade_albedo(palette: PaletteParams, noise: f32, dryness: f32, seed: u32) -> vec3<f32> {
     // Each blade is live or dead: the soft patch edge thins the dead blades

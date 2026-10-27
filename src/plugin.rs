@@ -1252,6 +1252,61 @@ mod tests {
         })
     }
 
+    /// `meadow_stand_albedo`'s dead weight at a root is the chance
+    /// `meadow_blade_albedo` kills a blade there: the patch's, then a single
+    /// blade's; a footprint past a patch takes the patch share, the
+    /// expectation of the patch chance over the uniform noise.
+    #[test]
+    fn stand_dead_weight_is_the_blades_expectation() {
+        let shared = include_str!("meadow_shared.wesl");
+        for needle in [
+            "let dead = patch_dead + (1.0 - patch_dead) * palette.dry_blade_share.w;",
+            "patch_dead = mix(share, meadow_patch_dead(palette, noise, share), resolved);",
+        ] {
+            assert!(shared.contains(needle), "`{needle}` missing");
+        }
+        let params = MeadowPalette {
+            dead_share: 0.3,
+            dead_patch_size: 6.0,
+            ..MeadowPalette::default()
+        }
+        .params();
+        let n = 100_000u32;
+        for root in [
+            Vec2::new(3.0, 7.0),
+            Vec2::new(-40.0, 12.5),
+            Vec2::new(900.0, -3.0),
+        ] {
+            for dryness in [0.2, 0.5, 0.9] {
+                let share = patch_share(&params, dryness);
+                let chance = patch_dead(&params, patch_noise(&params, root, dryness), share);
+                let expected = chance + (1.0 - chance) * params.dry_blade_share.w;
+                let dead = (0..n)
+                    .filter(|i| {
+                        blade_is_dead(&params, root, dryness, crate::field::hash_u32(i ^ 0x9e37))
+                    })
+                    .count() as f32
+                    / n as f32;
+                assert!(
+                    (dead - expected).abs() < 0.01,
+                    "{root} {dryness}: {dead} vs {expected}"
+                );
+            }
+        }
+        // Over many roots the patch chance averages to its share.
+        let mean = blades(n)
+            .map(|(_, root)| {
+                patch_dead(
+                    &params,
+                    patch_noise(&params, root, 0.5),
+                    patch_share(&params, 0.5),
+                )
+            })
+            .sum::<f32>()
+            / n as f32;
+        assert!((mean - patch_share(&params, 0.5)).abs() < 0.01, "{mean}");
+    }
+
     /// The coverage-weighted mean dead share over many blades is the dead
     /// share on neutral ground, so a meadow's mean albedo is
     /// `mix(live, dry, dead_share)`; elsewhere the patch share scales by
