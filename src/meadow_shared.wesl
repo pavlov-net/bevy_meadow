@@ -184,8 +184,11 @@ fn meadow_blade_world_normal(
 
 // Weight of the blade's own normal in its shading normal at view depth
 // `depth`: 1 near, falling to 0 (the upright normal) where blades shrink
-// toward a pixel and per-blade normals would shimmer.
-const MEADOW_BLADE_NORMAL_FADE: vec2<f32> = vec2<f32>(15.0, 45.0);
+// toward a pixel and per-blade normals would shimmer. It ends where the
+// Solari casters start to fade (`RT_SHADOW_FADE_START`), before the near
+// band thins, so the shading, shadow and density changes take separate
+// bands.
+const MEADOW_BLADE_NORMAL_FADE: vec2<f32> = vec2<f32>(15.0, 35.0);
 
 fn meadow_blade_normal_weight(depth: f32) -> f32 {
     return 1.0 - smoothstep(MEADOW_BLADE_NORMAL_FADE.x, MEADOW_BLADE_NORMAL_FADE.y, depth);
@@ -370,7 +373,9 @@ fn meadow_shadow_ramp(dist: f32, shadow_full_dist: f32) -> f32 {
 // Survival threshold (`meadow_gate_count`) of a patch's band in a view, at
 // the planar player distance `dist` of its centre and the view's far LOD
 // distance `lod_max`:
-// - near blades (band 0) taper 1 -> 0 across [full_distance, tuft_start];
+// - near blades (band 0) thin 1 -> 1 / max_widen (`lod.w`) across
+//   [full_distance, tuft_start], the least share whose widening keeps
+//   their area;
 // - shadow casters (band 0, shadow views) thin from 1 to
 //   `shadow_far_density` over `meadow_shadow_ramp`;
 // - far tufts (band 1) ramp tuft.y -> tuft.z across [tuft_start, lod_max].
@@ -391,7 +396,21 @@ fn meadow_band_threshold(
         return mix(1.0, params.density.w, meadow_shadow_ramp(dist, params.density.z));
     }
     let lod_full = params.lod.x;
-    return 1.0 - clamp((dist - lod_full) / max(tuft_start - lod_full, 1e-3), 0.0, 1.0);
+    let ramp = clamp((dist - lod_full) / max(tuft_start - lod_full, 1e-3), 0.0, 1.0);
+    return mix(1.0, 1.0 / params.lod.w, ramp);
+}
+
+// Area of a far-band tuft over that of a blade of the same width and
+// height. MUST equal `plugin.rs::TUFT_BLADE_AREA_RATIO`.
+const MEADOW_TUFT_BLADE_AREA: f32 = 7.03;
+
+// Width scale of a survivor of band `band` (1 = tufts) that keeps share
+// `keep` of its patch's blades: the inverse of the area share the
+// survivors draw, up to `max_widen` (`VariantParams.lod.w`), so thinning
+// keeps the band's blade area. CPU twin: `MeadowVariant::lod_widen`.
+fn meadow_lod_widen(keep: f32, band: u32, max_widen: f32) -> f32 {
+    let drawn = keep * select(1.0, MEADOW_TUFT_BLADE_AREA, band == 1u);
+    return min(1.0 / max(drawn, 1e-4), max_widen);
 }
 
 // ---------- per-blade palette variance ----------
@@ -709,6 +728,9 @@ struct GatedBlade {
     noise: f32,
     // Ground dryness at the root: the cover field's on a tile, else neutral.
     dryness: f32,
+    // Width factor that keeps the thinned band's blade area
+    // (`meadow_lod_widen`); 1 without the LOD gate.
+    width_scale: f32,
 }
 
 // Ground dryness that keeps a palette entry's own dead-patch share. MUST

@@ -91,7 +91,65 @@ impl MeadowVariant {
             (self.lod.tuft_density_far * scale).min(1.0),
         )
     }
+
+    /// Mean one-sided area of a blade at its unscaled height, m²: blade
+    /// widths and heights are independent uniform draws over their ranges.
+    pub fn mean_blade_area(&self) -> f32 {
+        let mean = |(lo, hi): (f32, f32)| 0.5 * (lo + hi);
+        BLADE_AREA_PER_WIDTH_HEIGHT * mean(self.width_range) * mean(self.height_range)
+    }
+
+    /// Width factor of a survivor of a band that keeps share `keep` of its
+    /// patch's blades: the inverse of the area share the survivors draw, up
+    /// to [`MeadowLodCurve::max_widen`]. A tuft draws
+    /// [`TUFT_BLADE_AREA_RATIO`] blades' area. CPU twin of
+    /// `meadow_shared.wesl::meadow_lod_widen`.
+    pub fn lod_widen(&self, keep: f32, tuft: bool) -> f32 {
+        let drawn = keep * if tuft { TUFT_BLADE_AREA_RATIO } else { 1.0 };
+        (1.0 / drawn.max(1e-4)).min(self.lod.widen_cap())
+    }
+
+    /// The tuft band's widened area share of the full blade area at
+    /// `tuft_start` and at `max_view_distance`, before
+    /// [`Self::drawn_area_share`] caps it at 1 and fades it with the tufts'
+    /// height. Between, the share is linear in distance.
+    pub fn tuft_area_share(&self) -> (f32, f32) {
+        let (near, far) = self.tuft_survival();
+        let scale = TUFT_BLADE_AREA_RATIO * self.lod.widen_cap();
+        (near * scale, far * scale)
+    }
+
+    /// Share of the full blade area the main view draws at player distance
+    /// `dist`: 1 where widening keeps up with the thinning, falling past
+    /// `max_widen` and through the tufts' height fade to 0 at
+    /// `max_view_distance`. What the meadow leaves undrawn is the consumer's
+    /// to show some other way, such as on the ground.
+    pub fn drawn_area_share(&self, dist: f32) -> f32 {
+        let lod = &self.lod;
+        if dist < lod.tuft_start {
+            let keep = lod.near_survival(dist);
+            return (keep * self.lod_widen(keep, false)).min(1.0);
+        }
+        let (near, far) = self.tuft_area_share();
+        let ramp = ((dist - lod.tuft_start) / (lod.max_view_distance - lod.tuft_start).max(1e-3))
+            .clamp(0.0, 1.0);
+        let fade = ((lod.max_view_distance - dist)
+            / (lod.max_view_distance - lod.height_fade_start).max(1e-3))
+        .clamp(0.0, 1.0);
+        (near + (far - near) * ramp).min(1.0) * fade
+    }
 }
+
+/// One-sided area of a blade over its width times its height: the tapered,
+/// bent ribbon of `meadow_shared.wesl::local_blade_position`, mean over the
+/// blade leans.
+pub const BLADE_AREA_PER_WIDTH_HEIGHT: f32 = 0.655;
+
+/// Area of a far-band tuft over that of a blade of the same width and
+/// height: seven arm triangles against the bent, tapered ribbon (mean over
+/// the blade leans). MUST equal `MEADOW_TUFT_BLADE_AREA` in
+/// `meadow_shared.wesl`.
+pub const TUFT_BLADE_AREA_RATIO: f32 = 7.03;
 
 /// Blade density, per m², that [`MeadowLodCurve`]'s tuft survival
 /// fractions are stated at.
@@ -274,13 +332,15 @@ impl MeadowPalettes {
     }
 }
 
-/// Distance LOD thresholds (metres). The LOD gate in the blade kernels
-/// linearly tapers the surviving share of each patch's blades across
-/// `full_distance..max_view_distance` — at `full_distance` every
-/// blade survives, at `max_view_distance` none do. Beyond
-/// `max_view_distance` the patch as a whole is culled by
-/// `VisibilityRange` with a small soft band so the patch fades
-/// gracefully rather than popping out.
+/// Distance LOD thresholds (metres). Every blade survives within
+/// `full_distance`; near blades then thin to `1 / max_widen` by
+/// `tuft_start`, where patches switch to sparse tufts that thin out to
+/// `max_view_distance`. Each survivor of a thinned band widens to keep the
+/// band's blade area ([`MeadowVariant::lod_widen`]) up to `max_widen`;
+/// past that cap, and through the tufts' height fade, the drawn area falls
+/// ([`MeadowVariant::drawn_area_share`]). Beyond `max_view_distance` the
+/// patch as a whole is culled by `VisibilityRange` with a small soft band
+/// so the patch fades gracefully rather than popping out.
 #[derive(Debug, Clone, Copy)]
 pub struct MeadowLodCurve {
     /// Every blade survives at this player distance or closer.
@@ -289,8 +349,8 @@ pub struct MeadowLodCurve {
     /// has faded to nothing here.
     pub max_view_distance: f32,
     /// Player distance beyond which a patch renders as far-LOD tufts
-    /// (band 1) instead of blades (band 0). Near blades taper to nothing
-    /// by here; sparse tufts ramp in.
+    /// (band 1) instead of blades (band 0). Near blades thin to
+    /// `1 / max_widen` by here; sparse tufts take over.
     pub tuft_start: f32,
     /// Tuft survival fraction at `tuft_start` (densest), stated for a
     /// variant of [`TUFT_REFERENCE_BLADES_PER_M2`] blades/m². Tufts sample a
@@ -310,6 +370,9 @@ pub struct MeadowLodCurve {
     pub shadow_full_dist: f32,
     /// Shadow-caster density at the shadow cull distance (`SHADOW_MAX_DIST`).
     pub shadow_far_density: f32,
+    /// Largest factor a thinned blade or tuft widens by to keep its band's
+    /// blade area. Near blades thin no further than its inverse.
+    pub max_widen: f32,
 }
 
 impl Default for MeadowLodCurve {
@@ -323,7 +386,25 @@ impl Default for MeadowLodCurve {
             height_fade_start: 98.0,
             shadow_full_dist: 18.0,
             shadow_far_density: 0.25,
+            max_widen: 4.0,
         }
+    }
+}
+
+impl MeadowLodCurve {
+    /// `max_widen`, at least 1.
+    pub fn widen_cap(&self) -> f32 {
+        self.max_widen.max(1.0)
+    }
+
+    /// Near-blade survival at player distance `dist`: 1 within
+    /// `full_distance`, thinning linearly to `1 / max_widen` at
+    /// `tuft_start`. The main-view band-0 arm of
+    /// `meadow_shared.wesl::meadow_band_threshold`.
+    pub fn near_survival(&self, dist: f32) -> f32 {
+        let ramp = ((dist - self.full_distance) / (self.tuft_start - self.full_distance).max(1e-3))
+            .clamp(0.0, 1.0);
+        1.0 + (1.0 / self.widen_cap() - 1.0) * ramp
     }
 }
 
@@ -443,15 +524,11 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
         height_range: Vec4::new(variant.height_range.0, variant.height_range.1, 0.0, 0.0),
         width_range: Vec4::new(variant.width_range.0, variant.width_range.1, 0.0, 0.0),
         wind: Vec4::new(variant.wind.amplitude, variant.wind.period, 0.0, 0.0),
-        // `x = full_distance`, `y = max_view_distance`,
-        // `z = rim_falloff_fraction`, `w = unused`. The shader's
-        // LOD gate uses these to taper density linearly
-        // across `full..max_view`.
         lod: Vec4::new(
             variant.lod.full_distance,
             variant.lod.max_view_distance,
             variant.rim_falloff_fraction,
-            0.0,
+            variant.lod.widen_cap(),
         ),
         density: Vec4::new(
             variant.blades_per_m2,
@@ -1477,5 +1554,54 @@ mod tests {
         assert_eq!(palette_flags(5), 5 << 8);
         assert_eq!(palette_flags(1000), (MAX_MEADOW_PALETTES as u32 - 1) << 8);
         assert_eq!(palette_flags(MAX_MEADOW_PALETTES as u32 - 1) & 1, 0);
+    }
+
+    /// Thinning keeps the drawn blade area through the near band and into
+    /// the tufts while widening keeps up, and the drawn share only falls
+    /// with distance.
+    #[test]
+    fn lod_keeps_the_blade_area() {
+        let variant = MeadowVariant {
+            blades_per_m2: 1500.0,
+            lod: MeadowLodCurve {
+                full_distance: 40.0,
+                tuft_start: 55.0,
+                max_view_distance: 250.0,
+                height_fade_start: 190.0,
+                ..MeadowLodCurve::default()
+            },
+            ..MeadowVariant::default()
+        };
+        let lod = &variant.lod;
+        for d in [0.0, 40.0, 47.5, 54.9] {
+            let keep = lod.near_survival(d);
+            assert!(
+                (keep * variant.lod_widen(keep, false) - 1.0).abs() < 1e-5,
+                "{d}"
+            );
+            assert_eq!(variant.drawn_area_share(d), 1.0);
+        }
+        assert!((lod.near_survival(55.0) - 1.0 / lod.max_widen).abs() < 1e-6);
+        // A tuft at its band's keep share draws its blades' area, capped.
+        let (tuft_near, _) = variant.tuft_survival();
+        let tuft = tuft_near * TUFT_BLADE_AREA_RATIO * variant.lod_widen(tuft_near, true);
+        assert!((tuft - variant.tuft_area_share().0.min(1.0)).abs() < 1e-5);
+        let mut last = 1.0;
+        for i in 0..=260 {
+            let share = variant.drawn_area_share(i as f32);
+            assert!(share <= last + 1e-6, "{i}: {share} > {last}");
+            last = share;
+        }
+        assert_eq!(variant.drawn_area_share(250.0), 0.0);
+        // No widening keeps every near blade and draws them all.
+        let plain = MeadowVariant {
+            lod: MeadowLodCurve {
+                max_widen: 1.0,
+                ..variant.lod
+            },
+            ..variant.clone()
+        };
+        assert_eq!(plain.lod.near_survival(54.0), 1.0);
+        assert_eq!(plain.lod_widen(0.25, false), 1.0);
     }
 }

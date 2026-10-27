@@ -95,8 +95,8 @@ pub struct VariantParams {
     /// range or beyond — `VisibilityRange` then culls the patch
     /// entity itself in a small soft band), `z = rim_falloff_fraction`
     /// (smoothstep on the outer edge of the noisy patch radius),
-    /// `w = unused`. The shader's LOD gate (a prefix of each patch's blade
-    /// indices) fades survival linearly across `full..max_view`.
+    /// `w = max_widen` (the widening cap thinned blades keep their area
+    /// by, at least 1; [`MeadowLodCurve`](crate::MeadowLodCurve)).
     pub lod: Vec4,
     /// `x = blades_per_m²`, `y = patch_edge_noise_amp`,
     /// `z = shadow_full_dist` (shadow-caster density is full within this
@@ -155,7 +155,7 @@ impl Default for VariantParams {
             wind: Vec4::new(0.18, 4.5, 0.0, 0.0),
             wind_direction: Vec4::new(1.0, 0.0, 0.0, 0.0),
             wind_state: Vec4::new(1.0, 0.6, 0.6, 0.0),
-            lod: Vec4::new(40.0, 110.0, 0.25, 0.0),
+            lod: Vec4::new(40.0, 110.0, 0.25, 1.0),
             density: Vec4::new(150.0, 0.18, 18.0, 0.25),
             // Default to a 1×1 metre extent at the origin — degenerate
             // but well-formed; the shader's bilerp short-circuits when

@@ -199,6 +199,13 @@ ground instead of ending at a hard line. Shadow-caster density has its own ramp
 (`shadow_full_dist`, `shadow_far_density`), full near the camera and sparse
 beyond -- cheap far cascades, grounded contact shadows up close.
 
+Thinning keeps the meadow's blade area: every survivor of a thinned band
+(near taper, tufts, shadow casters, the raytraced far casters) widens by the
+inverse of the area share its band keeps, up to `max_widen`, so near blades
+thin to `1 / max_widen` and a tuft counts as `TUFT_BLADE_AREA_RATIO` blades.
+`MeadowVariant::drawn_area_share` gives the share of the blade area the main
+view draws at a distance, for the ground to carry the rest.
+
 ### Placement
 
 `place_patches` is a pure, deterministic CPU pass: same `(variant_seed,

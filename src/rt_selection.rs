@@ -233,18 +233,24 @@ fn tie_break(p: &PatchPlacement, blade: u32) -> u32 {
     hash_u32(p.seed ^ blade.wrapping_mul(0x9e37_79b9))
 }
 
+/// How the far band thins across its range: its keep share before the
+/// budget term is `(1 - x * ramp) * (1 - y * ramp)`. MUST equal
+/// `RT_FAR_THINNING` in `meadow_compute.wesl`.
+pub(crate) const FAR_THINNING: [f32; 2] = [0.75, 0.5];
+
 /// The far band's share of live blades kept at eye distance `d`, past the
 /// near band's reach `end`, under budget `budget` (`None`: unbounded). Full
 /// up to `end`, thinning with distance; the budget term `1 - exp(-T /
 /// beyond²)` approaches 1 continuously at `end`, so coverage has no cliff
-/// at the boundary.
+/// at the boundary. The expansion widens each kept chord by its inverse
+/// (`rt_far_keep_share` in `meadow_compute.wesl`).
 fn keep_share(d: f32, end: f32, budget: Option<f32>) -> f32 {
     let beyond = (d - end).max(0.0);
     if beyond <= 0.0 {
         return 1.0;
     }
     let ramp = (beyond / (FAR_DISTANCE - end).max(1e-3)).clamp(0.0, 1.0);
-    let density = (1.0 - 0.75 * ramp) * (1.0 - 0.5 * ramp);
+    let density = (1.0 - FAR_THINNING[0] * ramp) * (1.0 - FAR_THINNING[1] * ramp);
     density * budget.map_or(1.0, |t| 1.0 - (-t / (beyond * beyond)).exp())
 }
 
@@ -264,6 +270,9 @@ pub(crate) struct RtSelection {
     pub(crate) near_generation: u64,
     pub(crate) far_generation: u64,
     pub(crate) near_transition: [f32; 2],
+    /// The far band's budget term ([`keep_share`]), negative when
+    /// unbounded; its reach `end` is `near_transition[1]`.
+    pub(crate) far_budget: f32,
     pub(crate) selection_center: Vec3,
     pub(crate) candidate_count: usize,
     pub(crate) coverage_radius: f32,
@@ -571,10 +580,12 @@ impl RtSelection {
             [end * 0.75, end]
         };
         let mut far = Vec::new();
+        self.far_budget = -1.0;
         if exact_radius.is_none() && far_capacity > 0 {
             let start = self.near_transition[0];
             let samples = Self::far_samples(inputs, &reach, eye, start);
             let budget = Self::far_budget(&samples, end, far_capacity);
+            self.far_budget = budget.unwrap_or(-1.0);
             let eye_xz = Vec2::new(eye.x, eye.z);
             for r in &reach {
                 let p = r.placement;
@@ -1035,5 +1046,41 @@ mod tests {
             );
         }
         assert!(shared.contains("return (2.0 * u - 1.0) * half;"));
+    }
+
+    /// The expansion widens far chords by the keep share's inverse, so it
+    /// carries the same thinning.
+    #[test]
+    fn far_keep_share_matches_the_shader() {
+        let compute = include_str!("meadow_compute.wesl");
+        let line = format!(
+            "const RT_FAR_THINNING: vec2<f32> = vec2<f32>({:?}, {:?});",
+            FAR_THINNING[0], FAR_THINNING[1]
+        );
+        assert!(compute.contains(&line), "`{line}` missing");
+        for needle in [
+            "let ramp = clamp(beyond / max(MEADOW_SHADOW_MAX_DIST - end, 1e-3), 0.0, 1.0);",
+            "return density * (1.0 - exp(-budget / (beyond * beyond)));",
+            "let keep = rt_far_keep_share(dist, rt_params[0].y, rt_params[0].z);",
+        ] {
+            assert!(compute.contains(needle), "`{needle}` missing");
+        }
+        assert_eq!(FAR_DISTANCE, crate::mesh::SHADOW_MAX_DIST);
+    }
+
+    /// The budget a selection reports is the one its far band kept blades
+    /// under: unbounded when everything fits, bounded when it saturates.
+    #[test]
+    fn far_budget_is_reported() {
+        let placements: Vec<_> = (0..12)
+            .map(|i| (i, patch(i as f32 * 4.0 - 24.0, 40 + i)))
+            .collect();
+        let inputs = inputs(&placements);
+        let mut roomy = RtSelection::default();
+        roomy.update(&inputs, eye(0.0), 64, 1 << 20);
+        assert!(roomy.far_budget < 0.0, "{}", roomy.far_budget);
+        let mut tight = RtSelection::default();
+        tight.update(&inputs, eye(0.0), 64, 256);
+        assert!(tight.far_budget >= 0.0, "{}", tight.far_budget);
     }
 }

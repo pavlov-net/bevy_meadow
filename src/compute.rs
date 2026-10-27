@@ -107,6 +107,22 @@ fn round_cap(n: u32) -> u32 {
     n.max(1).div_ceil(CAP_GRAN) * CAP_GRAN
 }
 
+/// Region caps `(main near, main far, shadow)` shrunk in proportion until
+/// the blades buffer, which binds whole, fits a binding of
+/// `max_binding_bytes`. The survivors' estimate ignores the frustum, so it
+/// runs high; past the cap the kernels drop survivors rather than write
+/// out of their region.
+fn fit_caps((near, far, shadow): (u32, u32, u32), max_binding_bytes: u64) -> (u32, u32, u32) {
+    let shadow_slots = (MEADOW_MAX_VIEWS - 1) as u64;
+    let total = u64::from(near) + u64::from(far) + shadow_slots * u64::from(shadow);
+    let max_records = max_binding_bytes / BLADE_RECORD_SIZE;
+    if total <= max_records {
+        return (near, far, shadow);
+    }
+    let fit = |cap: u32| (u64::from(cap) * max_records / total) as u32;
+    (fit(near), fit(far), fit(shadow))
+}
+
 // ---------- GPU-uploaded per-view culling data ----------
 
 /// Rust mirror of `MeadowViewCull` (`meadow_compute.wesl`). `frustum`
@@ -281,6 +297,7 @@ struct RtSelectionJob {
     near_generation: u64,
     far_generation: u64,
     transition: [f32; 2],
+    far_budget: f32,
     center: Vec3,
     /// Radius of the exact-only reference mode, `None` while it is off.
     exact_radius: Option<f32>,
@@ -353,6 +370,7 @@ impl RtSelectionJob {
                     self.far_generation = next_rt_snapshot_generation();
                 }
                 self.transition = state.near_transition;
+                self.far_budget = state.far_budget;
                 self.center = state.selection_center;
                 self.near_selected = occupied_rt_slots(&state.near_slots);
                 self.far_selected = occupied_rt_slots(&state.far_slots);
@@ -438,13 +456,6 @@ fn gate_count(threshold: f32, blade_count: u32) -> u32 {
     ((threshold.clamp(0.0, 1.0) * blade_count as f32).ceil() as u32).min(blade_count)
 }
 
-/// Near-blade survival threshold at planar player distance `dist`: the
-/// main-view band-0 arm of `meadow_shared.wesl::meadow_band_threshold`.
-fn near_survival(lod: &MeadowLodCurve, dist: f32) -> f32 {
-    1.0 - ((dist - lod.full_distance) / (lod.tuft_start - lod.full_distance).max(1e-3))
-        .clamp(0.0, 1.0)
-}
-
 /// Shadow-caster survival threshold at planar player distance `dist`: the
 /// shadow-view arm of `meadow_shared.wesl::meadow_band_threshold`.
 fn shadow_survival(lod: &MeadowLodCurve, dist: f32) -> f32 {
@@ -476,7 +487,7 @@ fn task_slice_bound(
     let mut threshold = 0.0_f32;
     // Band 0 (near blades, shadow casters) inside `tuft_start`.
     if nearest < lod.tuft_start {
-        threshold = near_survival(lod, nearest);
+        threshold = lod.near_survival(nearest);
         if shadows {
             threshold = threshold.max(shadow_survival(lod, nearest));
         }
@@ -614,6 +625,8 @@ pub struct ExtractedVariant {
     pub rt_near_generation: u64,
     pub rt_far_generation: u64,
     pub rt_transition: [f32; 2],
+    /// The RT far band's budget term, negative when unbounded.
+    pub rt_far_budget: f32,
     pub rt_selection_center: Vec3,
 }
 
@@ -950,7 +963,7 @@ fn extract_meadow_variants(
         // cascade culling only reduce further, so these are safe upper
         // bounds.
         if dist < est.lod.tuft_start {
-            est.main_near += gate_count(near_survival(&est.lod, dist), patch.blade_count) as f32;
+            est.main_near += gate_count(est.lod.near_survival(dist), patch.blade_count) as f32;
             // Sized per shadow slot for every caster; each cascade's
             // radial clip thins it further.
             est.shadow += gate_count(shadow_survival(&est.lod, dist), patch.blade_count) as f32;
@@ -1061,6 +1074,7 @@ fn extract_meadow_variants(
                 rt_near_generation: selection.near_generation,
                 rt_far_generation: selection.far_generation,
                 rt_transition: selection.transition,
+                rt_far_budget: selection.far_budget,
                 rt_selection_center: selection.center,
             },
         );
@@ -1378,10 +1392,13 @@ pub(crate) fn prepare_meadow_gpu_buffers(
         let (cap_main_near, cap_main_far, cap_shadow) = if mesh_path.active {
             (0, 0, 0)
         } else {
-            (
-                round_cap(ev.est_main_near).max(prev.map_or(0, |vb| vb.cap_main_near)),
-                round_cap(ev.est_main_far).max(prev.map_or(0, |vb| vb.cap_main_far)),
-                round_cap(ev.est_shadow_records).max(prev.map_or(0, |vb| vb.cap_shadow)),
+            fit_caps(
+                (
+                    round_cap(ev.est_main_near).max(prev.map_or(0, |vb| vb.cap_main_near)),
+                    round_cap(ev.est_main_far).max(prev.map_or(0, |vb| vb.cap_main_far)),
+                    round_cap(ev.est_shadow_records).max(prev.map_or(0, |vb| vb.cap_shadow)),
+                ),
+                render_device.limits().max_storage_buffer_binding_size,
             )
         };
         let needs_realloc = prev.is_none_or(|vb| {
@@ -1883,9 +1900,10 @@ pub struct RtVariantBuffers {
     pub near: RtBandBuffers,
     /// Far band: [`RT_FAR_MAX_BLADES`] × 3-vert / 1-tri proxies.
     pub far: RtBandBuffers,
-    /// `array<vec4<f32>, 2>((transition_start, transition_end, _, _),
+    /// `array<vec4<f32>, 2>((transition_start, transition_end, far_budget, _),
     /// (centre.xyz, _))`: the near/far transition distances, measured from the
-    /// eye of the selection snapshot the slot arrays come from.
+    /// eye of the selection snapshot the slot arrays come from, and the far
+    /// band's budget term (negative when unbounded).
     rt_params: Buffer,
     /// Cached expand bind group, keyed on the input identities (the asset
     /// buffers and heightfield view can be swapped by the asset system; the
@@ -2350,7 +2368,7 @@ fn dispatch_meadow_rt_expand(
                 bytemuck::cast_slice(&[
                     ev.rt_transition[0],
                     ev.rt_transition[1],
-                    0.0,
+                    ev.rt_far_budget,
                     0.0,
                     ev.rt_selection_center.x,
                     ev.rt_selection_center.y,
@@ -2621,7 +2639,7 @@ mod tests {
             } else if shadow {
                 shadow_survival(lod, dist)
             } else {
-                near_survival(lod, dist)
+                lod.near_survival(dist)
             };
             gate_count(threshold, blade_count)
         };
@@ -2672,6 +2690,36 @@ mod tests {
             false,
         );
         assert_eq!(far, gate_count(tuft_near, blade_count));
+    }
+
+    /// The kernels' near arm thins like `MeadowLodCurve::near_survival`.
+    #[test]
+    fn near_survival_matches_the_shader() {
+        let shared = include_str!("meadow_shared.wesl");
+        for needle in [
+            "let ramp = clamp((dist - lod_full) / max(tuft_start - lod_full, 1e-3), 0.0, 1.0);",
+            "return mix(1.0, 1.0 / params.lod.w, ramp);",
+        ] {
+            assert!(shared.contains(needle), "`{needle}` missing");
+        }
+        let lod = MeadowLodCurve::default();
+        assert_eq!(lod.near_survival(lod.full_distance), 1.0);
+        assert!((lod.near_survival(lod.tuft_start) - 1.0 / lod.max_widen).abs() < 1e-6);
+    }
+
+    /// Caps past the binding limit shrink to fit it, in proportion.
+    #[test]
+    fn caps_fit_the_binding_limit() {
+        let limit = 2_147_483_644;
+        let roomy = (CAP_GRAN, CAP_GRAN, CAP_GRAN);
+        assert_eq!(fit_caps(roomy, limit), roomy);
+        let caps = (24 * CAP_GRAN, 2 * CAP_GRAN, 8 * CAP_GRAN);
+        let (near, far, shadow) = fit_caps(caps, limit);
+        let records =
+            u64::from(near) + u64::from(far) + (MEADOW_MAX_VIEWS as u64 - 1) * u64::from(shadow);
+        assert!(records * BLADE_RECORD_SIZE <= limit, "{records}");
+        // In proportion: 12 near per far, 3 per shadow slot, to rounding.
+        assert_eq!((near / far, near / shadow), (12, 3));
     }
 
     /// Tufts keep their count per area at any blade density.

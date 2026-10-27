@@ -73,11 +73,11 @@ pub use placement::{
     TreeDensityField, place_patches,
 };
 pub use plugin::{
-    MEAN_BLADE_SHADE, MeadowHeightfield, MeadowLodCurve, MeadowPalette, MeadowPalettes,
-    MeadowPatch, MeadowPlugin, MeadowVariant, MeadowVariantId, MeadowVariantRegistry, MeadowViewer,
-    MeadowWindState, PatchAudioTag, TUFT_REFERENCE_BLADES_PER_M2, WindDirection, WindParams,
-    palette_table, upload_clearing_profiles, upload_placements, upload_trunk_rows,
-    upload_trunk_slots,
+    BLADE_AREA_PER_WIDTH_HEIGHT, MEAN_BLADE_SHADE, MeadowHeightfield, MeadowLodCurve,
+    MeadowPalette, MeadowPalettes, MeadowPatch, MeadowPlugin, MeadowVariant, MeadowVariantId,
+    MeadowVariantRegistry, MeadowViewer, MeadowWindState, PatchAudioTag, TUFT_BLADE_AREA_RATIO,
+    TUFT_REFERENCE_BLADES_PER_M2, WindDirection, WindParams, palette_table,
+    upload_clearing_profiles, upload_placements, upload_trunk_rows, upload_trunk_slots,
 };
 
 pub use plugin::{MeadowSolariGeometryNormals, MeadowWindFreeze};

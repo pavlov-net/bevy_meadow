@@ -306,7 +306,7 @@ mod tests {
     }
 
     /// The shaders carry their own copies of the blade cap, the blade's arc
-    /// length and the shadow distance.
+    /// length, the shadow distance and the tuft's area ratio.
     #[test]
     fn constants_match_the_shaders() {
         let shared = include_str!("meadow_shared.wesl");
@@ -314,11 +314,49 @@ mod tests {
             format!("const MEADOW_MAX_BLADES_PER_PATCH: u32 = {MAX_BLADES_PER_PATCH}u;"),
             format!("const MEADOW_BLADE_LENGTH: f32 = {BLADE_LENGTH_PER_HEIGHT:?};"),
             format!("const MEADOW_SHADOW_MAX_DIST: f32 = {SHADOW_MAX_DIST:?};"),
+            format!(
+                "const MEADOW_TUFT_BLADE_AREA: f32 = {:?};",
+                crate::plugin::TUFT_BLADE_AREA_RATIO
+            ),
         ] {
             assert!(
                 shared.contains(&line),
                 "`{line}` missing from meadow_shared.wesl"
             );
         }
+    }
+
+    /// A blade holds `BLADE_AREA_PER_WIDTH_HEIGHT` and a tuft
+    /// `TUFT_BLADE_AREA_RATIO` blades' area: the ribbon of
+    /// `local_blade_position` (five layers, each segment a chord of the
+    /// bent centreline) over the leans of `meadow_blade_lean`, against the
+    /// arm triangles of `tuft_local_position`.
+    #[test]
+    fn tuft_area_ratio_matches_the_templates() {
+        let taper = |t: f32| (1.0 - t) * (1.0 + 0.6 * t);
+        let layers = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+        let leans = 1000;
+        let mut blade = 0.0;
+        for i in 0..leans {
+            let u = (i as f32 + 0.5) / leans as f32;
+            let bend = 0.3 + 0.6 * u + 0.9 * u.powi(4);
+            for k in 0..5 {
+                let dt = layers[k + 1] - layers[k];
+                let chord = BLADE_LENGTH_PER_HEIGHT * 2.0 * (0.5 * bend * dt).sin() / bend;
+                // Half widths at the segment's ends; the tip has none.
+                let top = if k < 4 { taper(layers[k + 1]) } else { 0.0 };
+                blade += 0.5 * (taper(layers[k]) + top) * chord / leans as f32;
+            }
+        }
+        assert!(
+            (blade - crate::plugin::BLADE_AREA_PER_WIDTH_HEIGHT).abs() < 1e-3,
+            "{blade}"
+        );
+        let arm = 0.5 * 1.2 * (1.0_f32 + 0.45 * 0.45).sqrt();
+        let ratio = TUFT_ARMS as f32 * arm / blade;
+        assert!(
+            (ratio - crate::plugin::TUFT_BLADE_AREA_RATIO).abs() < 0.01,
+            "{ratio}"
+        );
     }
 }

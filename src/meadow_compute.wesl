@@ -22,7 +22,7 @@ import bevy_meadow::meadow_shared::{
     meadow_tile_root, meadow_cover_survives, meadow_sample_cover, meadow_blade_palette,
     meadow_grid_bound, meadow_grid_footprint,
     meadow_blade_rank, MEADOW_MAX_HEIGHT_VARIANCE, MEADOW_MAX_DRYNESS_HEIGHT, MEADOW_NEUTRAL_DRYNESS,
-    GatedBlade, meadow_disc_effect, MEADOW_BLADE_GROUND_LIFT,
+    GatedBlade, meadow_disc_effect, meadow_lod_widen, MEADOW_BLADE_GROUND_LIFT,
 };
 
 // ---------- compute-only structs ----------
@@ -254,17 +254,23 @@ fn gate_blade(
     // The discs' clearing gates the blade, their height caps once its height
     // is known.
     var collapse = 1.0;
-    if (meadow_patch_is_tile(flags)) {
+    let tile = meadow_patch_is_tile(flags);
+    if (tile) {
         let eye = variant_params.viewer_world_xz.xzy;
         dist = distance(eye, vec3<f32>(blade.world_xz.x, out.ground_y, blade.world_xz.y));
-        // The rank needs no discs: reject on it first.
-        if (lod) {
-            let rank = meadow_blade_rank(b, u32(p.blade_count_noise_canopy_flags.x));
-            if (rank >= meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max)) {
-                out.collapse_t = 0.0;
-                return out;
-            }
+    }
+    // A disc patch's prefix gate keeps its share; a tile ranks each blade at
+    // its own distance, before the discs, which the rank does not need.
+    out.width_scale = 1.0;
+    if (lod) {
+        let keep = meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max);
+        if (tile && meadow_blade_rank(b, u32(p.blade_count_noise_canopy_flags.x)) >= keep) {
+            out.collapse_t = 0.0;
+            return out;
         }
+        out.width_scale = meadow_lod_widen(keep, band, variant_params.lod.w);
+    }
+    if (tile) {
         let cover = meadow_sample_cover(cover_field, variant_params.cover_extents, blade.world_xz);
         let ceiling = p.blade_count_noise_canopy_flags.y;
         let stand = blade_visibility(blade.world_xz, patch_idx, out.ground_y, 0.0).x;
@@ -382,8 +388,8 @@ fn cull_and_compact(
 
     // Per-patch LOD band (uniform across the workgroup): near blade (0)
     // inside `tuft_start`, far tuft (1) beyond. A patch is one band at a
-    // time — near blades taper to nothing by `tuft_start` while tufts ramp
-    // in, so the handoff is sparse on both sides.
+    // time: near blades thin to `1 / max_widen` by `tuft_start`, where the
+    // tufts take over.
     var band = 0u;
     if (dist >= tuft_start) {
         band = 1u;
@@ -454,7 +460,7 @@ fn cull_and_compact(
                 rec.world_root_xz = blade.world_xz;
                 rec.ground_y = gated.ground_y;
                 rec.height = gated.height;
-                rec.width = blade.width;
+                rec.width = blade.width * gated.width_scale;
                 rec.yaw = blade.yaw;
                 rec.clump_seed = blade.clump_seed;
                 rec.collapse_t = gated.collapse_t;
@@ -533,7 +539,8 @@ struct RtVertex {
 
 // CPU-selected persistent slots: (patch index, blade index), MAX = vacant.
 // `rt_params[0].xy` delimit the near/far transition around the stable
-// selection centre `rt_params[1].xyz`.
+// selection centre `rt_params[1].xyz`; `rt_params[0].z` is the far band's
+// budget term (`rt_far_keep_share`), negative when unbounded.
 @group(0) @binding(9) var<uniform> rt_params: array<vec4<f32>, 2>;
 @group(0) @binding(10) var<storage, read> rt_slots_near: array<vec2<u32>>;
 @group(0) @binding(11) var<storage, read_write> rt_verts_near: array<RtVertex>;
@@ -581,6 +588,27 @@ fn rt_pack_vertex(
     return v;
 }
 
+// How the far band thins across its range: its keep share before the
+// budget term is `(1 - x * ramp) * (1 - y * ramp)`. MUST equal
+// `rt_selection.rs::FAR_THINNING`.
+const RT_FAR_THINNING: vec2<f32> = vec2<f32>(0.75, 0.5);
+
+// Share of live blades the far band keeps at eye distance `dist`, past the
+// near band's reach `end`, under budget term `budget` (negative:
+// unbounded). GPU twin of `rt_selection.rs::keep_share`.
+fn rt_far_keep_share(dist: f32, end: f32, budget: f32) -> f32 {
+    let beyond = max(dist - end, 0.0);
+    if (beyond <= 0.0) {
+        return 1.0;
+    }
+    let ramp = clamp(beyond / max(MEADOW_SHADOW_MAX_DIST - end, 1e-3), 0.0, 1.0);
+    let density = (1.0 - RT_FAR_THINNING.x * ramp) * (1.0 - RT_FAR_THINNING.y * ramp);
+    if (budget < 0.0) {
+        return density;
+    }
+    return density * (1.0 - exp(-budget / (beyond * beyond)));
+}
+
 fn rt_empty_vertex() -> RtVertex {
     var v: RtVertex;
     v.a = vec4<f32>(vec3<f32>(bitcast<f32>(0x7FC00000u)), 0.0);
@@ -597,6 +625,7 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
     var ground_y = 0.0;
     var collapse = 0.0;
     var palette_u = 0.0;
+    var widen = 1.0;
     let occupied = key.x != 0xFFFFFFFFu;
     if (occupied) {
         let p = patches[key.x];
@@ -606,6 +635,10 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
         ground_y = gated.ground_y;
         palette_u = (f32(gated.palette) + 0.5) / f32(MEADOW_MAX_PALETTES);
         let dist = distance(rt_params[1].xyz, vec3<f32>(blade.world_xz.x, ground_y, blade.world_xz.y));
+        if (!near) {
+            let keep = rt_far_keep_share(dist, rt_params[0].y, rt_params[0].z);
+            widen = meadow_lod_widen(keep, 0u, variant_params.lod.w);
+        }
         let transition =
             smoothstep(rt_params[0].x, max(rt_params[0].y, rt_params[0].x + 0.01), dist);
         let seed = bitcast<u32>(p.centre_xz_radius_seed.w);
@@ -626,8 +659,9 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
         if (occupied) {
             // Far slots are one proxy triangle: the ribbon's base edge and
             // tip (template verts 0/1/10), widened to the ribbon's
-            // silhouette area (`MEADOW_CHORD_WIDTH_SCALE`). Area parity
-            // only: the distance fade thins casters and no widening
+            // silhouette area (`MEADOW_CHORD_WIDTH_SCALE`) and by `widen`
+            // to keep the area of the blades the far band's thinning
+            // drops. The distance fade thins casters and no widening
             // replaces them.
             var template_vert = vi;
             if (!near) {
@@ -635,7 +669,7 @@ fn rt_write_slot(slot: u32, key: vec2<u32>, near: bool) {
             }
             var local = meadow_template_vertex(template_vert, false, blade);
             if (!near) {
-                local.x = local.x * MEADOW_CHORD_WIDTH_SCALE;
+                local.x = local.x * MEADOW_CHORD_WIDTH_SCALE * widen;
             }
             // Suppressed owners retain finite, collapsed vertices. History
             // cannot accidentally sample NaN positions during a fade.

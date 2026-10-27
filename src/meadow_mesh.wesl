@@ -58,7 +58,7 @@ import bevy_meadow::meadow_shared::{
     meadow_tile_root, meadow_cover_survives, meadow_sample_cover, meadow_blade_palette,
     meadow_grid_bound, meadow_grid_footprint,
     meadow_blade_rank, MEADOW_MAX_HEIGHT_VARIANCE, MEADOW_MAX_DRYNESS_HEIGHT, MEADOW_NEUTRAL_DRYNESS,
-    GatedBlade, PaletteParams, meadow_disc_effect, MEADOW_BLADE_GROUND_LIFT,
+    GatedBlade, PaletteParams, meadow_disc_effect, meadow_lod_widen, MEADOW_BLADE_GROUND_LIFT,
 };
 import bevy_meadow::meadow_mesh_bindings::{
     variant_params, patches, trunk_slots, heightfield, view_cull, task_slices, mesh_view, palettes,
@@ -233,17 +233,23 @@ fn gate_blade(
     // The discs' clearing gates the blade, their height caps once its height
     // is known.
     var collapse = 1.0;
-    if (meadow_patch_is_tile(flags)) {
+    let tile = meadow_patch_is_tile(flags);
+    if (tile) {
         let eye = variant_params.viewer_world_xz.xzy;
         dist = distance(eye, vec3<f32>(blade.world_xz.x, out.ground_y, blade.world_xz.y));
-        // The rank needs no discs: reject on it first.
-        if (lod) {
-            let rank = meadow_blade_rank(b, u32(p.blade_count_noise_canopy_flags.x));
-            if (rank >= meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max)) {
-                out.collapse_t = 0.0;
-                return out;
-            }
+    }
+    // A disc patch's prefix gate keeps its share; a tile ranks each blade at
+    // its own distance, before the discs, which the rank does not need.
+    out.width_scale = 1.0;
+    if (lod) {
+        let keep = meadow_band_threshold(variant_params, band, is_shadow, dist, lod_max);
+        if (tile && meadow_blade_rank(b, u32(p.blade_count_noise_canopy_flags.x)) >= keep) {
+            out.collapse_t = 0.0;
+            return out;
         }
+        out.width_scale = meadow_lod_widen(keep, band, variant_params.lod.w);
+    }
+    if (tile) {
         let cover = meadow_sample_cover(cover_field, variant_params.cover_extents, blade.world_xz);
         let ceiling = p.blade_count_noise_canopy_flags.y;
         let stand = blade_visibility(blade.world_xz, patch_idx, out.ground_y, 0.0).x;
@@ -478,7 +484,7 @@ fn meadow_task(
             out.world_xz = blade.world_xz;
             out.yaw = blade.yaw;
             out.height = gated.height;
-            out.width = blade.width;
+            out.width = blade.width * gated.width_scale;
             out.albedo = 0u;
             if (!is_shadow) {
                 out.albedo = meadow_pack_albedo(
