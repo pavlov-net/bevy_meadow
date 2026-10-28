@@ -46,6 +46,8 @@ pub mod placement;
 pub mod plugin;
 pub mod render;
 mod rt_selection;
+#[cfg(test)]
+mod shader_tests;
 #[cfg(all(feature = "solari", not(target_family = "wasm")))]
 pub mod solari;
 
@@ -79,5 +81,6 @@ pub use plugin::{
     TUFT_BLADE_AREA_RATIO, TUFT_REFERENCE_BLADES_PER_M2, WindDirection, WindParams, palette_table,
     upload_clearing_profiles, upload_placements, upload_trunk_rows, upload_trunk_slots,
 };
+pub use rt_selection::MeadowRtMargins;
 
 pub use plugin::{MeadowSolariGeometryNormals, MeadowWindFreeze};

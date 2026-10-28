@@ -693,13 +693,27 @@ mod tests {
         }
     }
 
+    /// `meadow_blade_taper`: the blade's width at `t` along it over its
+    /// root's.
+    fn blade_taper(t: f32) -> f32 {
+        (1.0 - t) * (1.0 + 0.6 * t)
+    }
+
+    /// `meadow_blade_lean`: the root lean and the bend along the blade, in
+    /// radians, for lean hashes `u_root` and `u_bend`.
+    fn blade_lean(u_root: f32, u_bend: f32) -> (f32, f32) {
+        (
+            0.08 + 0.32 * u_root,
+            0.3 + 0.6 * u_bend + 0.9 * u_bend.powi(4),
+        )
+    }
+
     /// The blade template's normals (lean, bend, rounding, random yaw) with
     /// their blade width's weight.
     fn template_normals() -> Vec<(Vec3, f32)> {
-        let taper = |t: f32| (1.0 - t) * (1.0 + 0.6 * t);
         let mut normals = Vec::new();
         for i in 0..40_000u32 {
-            let h = |k: u32| crate::field::hash01_u32(i.wrapping_mul(7).wrapping_add(k));
+            let h = |k: u32| crate::field::tests::hash01_u32(i.wrapping_mul(7).wrapping_add(k));
             let (u_bend, u_root, t, s, yaw) = (
                 h(0),
                 h(1),
@@ -707,12 +721,13 @@ mod tests {
                 2.0 * h(3) - 1.0,
                 h(4) * std::f32::consts::TAU,
             );
-            let a = 0.08 + 0.32 * u_root + (0.3 + 0.6 * u_bend + 0.9 * u_bend.powi(4)) * t;
+            let (root, bend) = blade_lean(u_root, u_bend);
+            let a = root + bend * t;
             let n = Vec3::new(0.6 * s, -a.sin(), a.cos()).normalize();
             let (c, si) = (yaw.cos(), yaw.sin());
             normals.push((
                 Vec3::new(c * n.x + si * n.z, n.y, -si * n.x + c * n.z),
-                taper(t),
+                blade_taper(t),
             ));
         }
         normals
@@ -793,6 +808,48 @@ mod tests {
         }
     }
 
+    /// `meadow_blade_face_normal` faces the counter-clockwise side of every
+    /// template triangle at each of its vertices: the raytracing casters are
+    /// double-sided, and Solari flips a back-face hit's normals by the
+    /// winding. Local frame, any lean.
+    #[test]
+    fn caster_normals_face_the_counter_clockwise_side() {
+        let fraction = |v: u32| if v == 10 { 1.0 } else { (v >> 1) as f32 * 0.2 };
+        let side = |v: u32| {
+            if v == 10 {
+                0.0
+            } else {
+                (v & 1) as f32 * 2.0 - 1.0
+            }
+        };
+        for i in 0..64 {
+            let u = (i as f32 + 0.5) / 64.0;
+            let (root, bend) = blade_lean(u, u);
+            let position = |v: u32| {
+                let a = root + bend * fraction(v);
+                Vec3::new(
+                    side(v) * 0.5 * blade_taper(fraction(v)) * 0.01,
+                    BLADE_LENGTH_PER_HEIGHT * (a.sin() - root.sin()) / bend,
+                    BLADE_LENGTH_PER_HEIGHT * (root.cos() - a.cos()) / bend,
+                )
+            };
+            let normal = |v: u32| {
+                let a = root + bend * fraction(v);
+                Vec3::new(0.0, -a.sin(), a.cos())
+            };
+            for tri in BLADE_INDICES.chunks(3) {
+                let face = (position(tri[1]) - position(tri[0]))
+                    .cross(position(tri[2]) - position(tri[0]));
+                for &v in tri {
+                    assert!(
+                        face.dot(normal(v)) > 0.0,
+                        "lean {u}: triangle {tri:?} vertex {v}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A blade holds `BLADE_AREA_PER_WIDTH_HEIGHT` and a tuft
     /// `TUFT_BLADE_AREA_RATIO` blades' area: the ribbon of
     /// `local_blade_position` (five layers, each segment a chord of the
@@ -800,19 +857,22 @@ mod tests {
     /// arm triangles of `tuft_local_position`.
     #[test]
     fn tuft_area_ratio_matches_the_templates() {
-        let taper = |t: f32| (1.0 - t) * (1.0 + 0.6 * t);
         let layers = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
         let leans = 1000;
         let mut blade = 0.0;
         for i in 0..leans {
             let u = (i as f32 + 0.5) / leans as f32;
-            let bend = 0.3 + 0.6 * u + 0.9 * u.powi(4);
+            let (_, bend) = blade_lean(u, u);
             for k in 0..5 {
                 let dt = layers[k + 1] - layers[k];
                 let chord = BLADE_LENGTH_PER_HEIGHT * 2.0 * (0.5 * bend * dt).sin() / bend;
                 // Half widths at the segment's ends; the tip has none.
-                let top = if k < 4 { taper(layers[k + 1]) } else { 0.0 };
-                blade += 0.5 * (taper(layers[k]) + top) * chord / leans as f32;
+                let top = if k < 4 {
+                    blade_taper(layers[k + 1])
+                } else {
+                    0.0
+                };
+                blade += 0.5 * (blade_taper(layers[k]) + top) * chord / leans as f32;
             }
         }
         assert!(

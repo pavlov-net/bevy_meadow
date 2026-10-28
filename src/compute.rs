@@ -63,19 +63,17 @@ use crate::plugin::{
     MeadowVariantRegistry, MeadowViewer, palette_table,
 };
 use crate::render::{MeadowRenderDriver, RenderMeadowMeshIds};
-use crate::rt_selection::{
-    INACTIVE as RT_VACANT_SLOT, LivePlacements, RT_NEAR_DISTANCE, RtInputs, RtSelection,
-    same_placements,
-};
+use crate::rt_selection::{LivePlacements, RT_NEAR_DISTANCE, RtInputs, RtPose};
 
 const MEADOW_COMPUTE_SHADER: &str = "embedded://bevy_meadow/meadow_compute.wesl";
 
-/// Fixed per-variant capacity for nearest-first, persistent RT slots.
-/// The near band shares the exact visible ribbon, with no width inflation.
-/// 32,768 nine-triangle blades are a 294,912-triangle budget.
+/// Fixed per-variant capacity for persistent RT slots, least view-weighted
+/// distance first. The near band shares the exact visible ribbon, with no
+/// width inflation. 32,768 nine-triangle blades are a 294,912-triangle
+/// budget.
 pub const RT_NEAR_MAX_BLADES: u32 = 32_768;
 /// Far persistent slots, selected with gradually reduced density out to 50 m.
-pub const RT_FAR_MAX_BLADES: u32 = 131_072;
+pub const RT_FAR_MAX_BLADES: u32 = 262_144;
 /// Share the visible ribbon topology so raster and RT cannot drift.
 const RT_NEAR_VERTS_PER_BLADE: u32 = crate::mesh::BLADE_VERTS_PER_BLADE;
 const RT_NEAR_INDICES_PER_BLADE: u32 = crate::mesh::BLADE_INDICES_PER_BLADE;
@@ -279,137 +277,6 @@ pub struct MeadowGpuBuffers {
     pub by_variant: HashMap<MeadowVariantId, VariantGpuBuffers>,
 }
 
-// Selection runs off-thread: dense patches must not stall rendering while
-// the camera moves. Publish only complete mappings for the current patches.
-#[derive(Default)]
-struct RtSelectionJob {
-    state: Option<RtSelection>,
-    task: Option<bevy::tasks::Task<RtSelection>>,
-    /// Inputs the in-flight task selects from or, while idle, the ones
-    /// `state` matches. While they are the live inputs, only viewer motion
-    /// can make the selection stale.
-    inputs: RtInputs,
-    /// Placements the published slots were selected from, less any patch
-    /// purged since.
-    snapshot_inputs: LivePlacements,
-    near: Arc<Vec<[u32; 2]>>,
-    far: Arc<Vec<[u32; 2]>>,
-    near_generation: u64,
-    far_generation: u64,
-    transition: [f32; 2],
-    far_budget: f32,
-    center: Vec3,
-    /// Radius of the exact-only reference mode, `None` while it is off.
-    exact_radius: Option<f32>,
-    candidate_count: usize,
-    coverage_radius: f32,
-    near_selected: usize,
-    far_selected: usize,
-}
-impl RtSelectionJob {
-    fn update(&mut self, inputs: &RtInputs, viewer: Vec3, diagnostics: MeadowRtDiagnostics) {
-        let live = &inputs.placements;
-        // The radius shapes the selection only in exact-only mode.
-        let exact_radius = diagnostics.exact_only.then_some(diagnostics.exact_radius_m);
-        if self.exact_radius != exact_radius {
-            // Drop obsolete work and clear its published geometry immediately.
-            *self = Self {
-                exact_radius,
-                ..Default::default()
-            };
-            self.near = Arc::new(vec![RT_VACANT_SLOT; RT_NEAR_MAX_BLADES as usize]);
-            self.far = Arc::new(vec![RT_VACANT_SLOT; RT_FAR_MAX_BLADES as usize]);
-            self.near_generation = next_rt_snapshot_generation();
-            self.far_generation = next_rt_snapshot_generation();
-        }
-        // A streamed-out or replaced patch must disappear immediately even
-        // while the worker is preparing the next mapping.
-        if !self.snapshot_inputs.is_empty() && !same_placements(live, &self.snapshot_inputs) {
-            let current: HashMap<_, _> = live.iter().copied().collect();
-            let invalid: bevy::platform::collections::HashSet<_> = self
-                .snapshot_inputs
-                .iter()
-                .filter(|(i, p)| current.get(i) != Some(p))
-                .map(|(i, _)| *i)
-                .collect();
-            if !invalid.is_empty() {
-                for (slots, generation) in [
-                    (&mut self.near, &mut self.near_generation),
-                    (&mut self.far, &mut self.far_generation),
-                ] {
-                    let slots = Arc::make_mut(slots);
-                    let mut changed = false;
-                    for slot in slots {
-                        if invalid.contains(&slot[0]) {
-                            *slot = RT_VACANT_SLOT;
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        *generation = next_rt_snapshot_generation();
-                    }
-                }
-                self.near_selected = occupied_rt_slots(&self.near);
-                self.far_selected = occupied_rt_slots(&self.far);
-                Arc::make_mut(&mut self.snapshot_inputs).retain(|(i, _)| !invalid.contains(i));
-            }
-        }
-        if let Some(task) = self.task.as_mut()
-            && let Some(state) = bevy::tasks::block_on(bevy::tasks::poll_once(task))
-        {
-            if self.inputs.same(inputs) {
-                // New snapshots get distinct generations even if the worker
-                // state was recreated after a world transition or RT toggle.
-                let inputs_changed = !same_placements(&self.snapshot_inputs, live);
-                if self.near.as_ref() != &state.near_slots || inputs_changed {
-                    self.near = Arc::new(state.near_slots.clone());
-                    self.near_generation = next_rt_snapshot_generation();
-                }
-                if self.far.as_ref() != &state.far_slots || inputs_changed {
-                    self.far = Arc::new(state.far_slots.clone());
-                    self.far_generation = next_rt_snapshot_generation();
-                }
-                self.transition = state.near_transition;
-                self.far_budget = state.far_budget;
-                self.center = state.selection_center;
-                self.near_selected = occupied_rt_slots(&state.near_slots);
-                self.far_selected = occupied_rt_slots(&state.far_slots);
-                self.candidate_count = state.candidate_count;
-                self.coverage_radius = state.coverage_radius;
-                self.snapshot_inputs = Arc::clone(live);
-            }
-            self.state = Some(state);
-            self.task = None;
-        }
-        if self.task.is_none() {
-            let state = self.state.get_or_insert_with(Default::default);
-            let (near_capacity, far_capacity) =
-                (RT_NEAR_MAX_BLADES as usize, RT_FAR_MAX_BLADES as usize);
-            let stale = if self.inputs.same(inputs) {
-                state.needs_viewer_update(viewer, near_capacity, far_capacity)
-            } else {
-                state.needs_update(inputs, viewer, near_capacity, far_capacity)
-            };
-            // An unchanged selection matches `inputs` too.
-            self.inputs = inputs.clone();
-            if stale {
-                let mut state = self.state.take().unwrap();
-                let inputs = inputs.clone();
-                self.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-                    state.update_mode(&inputs, viewer, near_capacity, far_capacity, exact_radius);
-                    state
-                }));
-            }
-        }
-    }
-}
-fn occupied_rt_slots(slots: &[[u32; 2]]) -> usize {
-    slots.iter().filter(|s| s[0] != u32::MAX).count()
-}
-fn next_rt_snapshot_generation() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
 /// Swap in `next` only when the contents differ, so consumers can treat an
 /// unchanged `Arc` pointer as unchanged contents.
 fn replace_if_changed<T: PartialEq>(list: &mut Arc<Vec<T>>, next: Vec<T>) {
@@ -452,7 +319,7 @@ const TASK_LIST_VIEWER_STEP: f32 = 2.0 * TASK_LIST_REBUILD_DISTANCE;
 
 /// CPU twin of `meadow_shared.wesl::meadow_gate_count`: the blades of a
 /// patch that pass a survival `threshold`, a prefix of its blade indices.
-fn gate_count(threshold: f32, blade_count: u32) -> u32 {
+pub(crate) fn gate_count(threshold: f32, blade_count: u32) -> u32 {
     ((threshold.clamp(0.0, 1.0) * blade_count as f32).ceil() as u32).min(blade_count)
 }
 
@@ -620,14 +487,8 @@ pub struct ExtractedVariant {
     /// within `SHADOW_MAX_DIST` of the viewer cast) — bounds each cascade
     /// region.
     pub est_shadow_records: u32,
-    pub rt_near_slots: Arc<Vec<[u32; 2]>>,
-    pub rt_far_slots: Arc<Vec<[u32; 2]>>,
-    pub rt_near_generation: u64,
-    pub rt_far_generation: u64,
-    pub rt_transition: [f32; 2],
-    /// The RT far band's budget term, negative when unbounded.
-    pub rt_far_budget: f32,
-    pub rt_selection_center: Vec3,
+    /// The raytracing casters' frame, while they are enabled.
+    pub(crate) rt: Option<RtExtract>,
 }
 
 impl ExtractedVariant {
@@ -648,6 +509,8 @@ impl ExtractedVariant {
 #[derive(Resource, Default)]
 pub struct MeadowExtractedVariants {
     pub by_variant: HashMap<MeadowVariantId, ExtractedVariant>,
+    /// Where the casters' selection publishes its telemetry.
+    pub(crate) telemetry: Arc<Mutex<Vec<MeadowRtVariantStats>>>,
 }
 
 /// Render-world map `driver main-entity -> variant`, so
@@ -873,7 +736,10 @@ fn extract_meadow_variants(
         Extract<Option<Res<MeadowCoverField>>>,
         Extract<Option<Res<MeadowHeightfield>>>,
     ),
-    rt_config: Extract<Option<Res<MeadowRaytracingConfig>>>,
+    (rt_config, time): (
+        Extract<Option<Res<MeadowRaytracingConfig>>>,
+        Extract<Res<Time>>,
+    ),
     diagnostics: Extract<Res<MeadowRtDiagnostics>>,
     telemetry: Extract<Res<MeadowRtTelemetry>>,
     #[cfg(feature = "mesh-shaders")] force_compute: Extract<
@@ -882,14 +748,13 @@ fn extract_meadow_variants(
     #[cfg(feature = "mesh-shaders")] mesh_path: Res<MeadowMeshPathActive>,
     meadow_palettes: Extract<Res<MeadowPalettes>>,
     mut out: ResMut<MeadowExtractedVariants>,
-    mut selections: Local<HashMap<MeadowVariantId, RtSelectionJob>>,
     mut lists: Local<MeadowPatchLists>,
     mut palette_tables: Local<HashMap<MeadowVariantId, PaletteTable>>,
 ) {
     let patches_removed = !removed_patches.is_empty();
     removed_patches.clear();
     out.by_variant.clear();
-    let mut stats = Vec::new();
+    out.telemetry = Arc::clone(&telemetry.0);
     let diagnostics = MeadowRtDiagnostics {
         exact_only: diagnostics.exact_only,
         exact_radius_m: if diagnostics.exact_radius_m.is_finite() {
@@ -904,10 +769,20 @@ fn extract_meadow_variants(
     };
     let eye = viewer.as_deref().map_or(Vec3::ZERO, |v| v.eye);
     let viewer_xz = eye.xz();
+    let rt_pose = viewer.as_deref().map_or_else(RtPose::default, |v| RtPose {
+        eye: v.eye,
+        forward: v.depth_plane.xyz().normalize_or_zero(),
+        cone: v.view_cone.max(0.0),
+    });
+    let margins = viewer
+        .as_deref()
+        .map_or_else(Default::default, |v| v.caster_margins);
     let cover_field = cover_field.as_deref().cloned().unwrap_or_default();
     let (cover_extents, cover_params) = cover_field.params();
     let heights = heightfield.as_deref().and_then(|h| h.grid.clone());
     let rt_enabled = rt_config.as_deref().is_some_and(|c| c.enabled);
+    let exact_radius = diagnostics.exact_only.then_some(diagnostics.exact_radius_m);
+    let ease = 1.0 - (-time.delta_secs() / RT_DRAWN_EASE_SECONDS).exp();
     // The task work list exists solely for the mesh path — build it only
     // while that path can consume it (device support, not force-compute).
     // Extract runs before the prepare systems, so the list is rebuilt and
@@ -988,13 +863,6 @@ fn extract_meadow_variants(
         );
     }
 
-    selections.retain(|id, _| {
-        rt_enabled
-            && lists
-                .by_variant
-                .get(id)
-                .is_some_and(|l| !l.active_patches.is_empty())
-    });
     // A table write replaces only the tables whose contents changed, so the
     // render side re-uploads only those.
     let palettes_changed = meadow_palettes.is_changed() || registry_changed;
@@ -1014,35 +882,21 @@ fn extract_meadow_variants(
         let Some(variant_lists) = lists.by_variant.get(id) else {
             continue;
         };
-        let selection = selections.entry(*id).or_default();
-        if rt_enabled && !variant_lists.active_patches.is_empty() {
-            let inputs = RtInputs {
+        let rt = (rt_enabled && !variant_lists.active_patches.is_empty()).then(|| RtExtract {
+            inputs: RtInputs {
                 placements: Arc::clone(&variant_lists.rt_live),
                 trunks: Arc::clone(&entry.trunk_slots),
                 profiles: Arc::clone(&entry.clearing_profiles),
                 cover: cover_field.grid.clone(),
                 survival: cover_field.survival,
                 heights: heights.clone(),
-            };
-            selection.update(&inputs, eye, diagnostics);
-            stats.push(MeadowRtVariantStats {
-                variant: *id,
-                exact_only: diagnostics.exact_only,
-                requested_radius_m: if diagnostics.exact_only {
-                    diagnostics.exact_radius_m
-                } else {
-                    RT_NEAR_DISTANCE
-                },
-                coverage_radius_m: selection.coverage_radius,
-                near_selected: selection.near_selected,
-                near_capacity: RT_NEAR_MAX_BLADES as usize,
-                far_selected: selection.far_selected,
-                far_capacity: RT_FAR_MAX_BLADES as usize,
-                candidate_count: selection.candidate_count,
-                pending: selection.task.is_some(),
-                selection_center: selection.center,
-            });
-        }
+            },
+            viewer: rt_pose,
+            margins,
+            exact_radius,
+            sunward_widen: entry.variant.raytraced_sunward_widen,
+            ease,
+        });
         let mut variant_params = material.extension.variant_params;
         variant_params.cover_extents = cover_extents;
         variant_params.cover = cover_params;
@@ -1061,26 +915,9 @@ fn extract_meadow_variants(
                 est_main_near: est.main_near.ceil() as u32,
                 est_main_far: est.main_far.ceil() as u32,
                 est_shadow_records: est.shadow.ceil() as u32,
-                rt_near_slots: if rt_enabled {
-                    Arc::clone(&selection.near)
-                } else {
-                    Default::default()
-                },
-                rt_far_slots: if rt_enabled {
-                    Arc::clone(&selection.far)
-                } else {
-                    Default::default()
-                },
-                rt_near_generation: selection.near_generation,
-                rt_far_generation: selection.far_generation,
-                rt_transition: selection.transition,
-                rt_far_budget: selection.far_budget,
-                rt_selection_center: selection.center,
+                rt,
             },
         );
-    }
-    if let Ok(mut published) = telemetry.0.lock() {
-        *published = stats;
     }
 }
 
@@ -1798,17 +1635,25 @@ fn meadow_compute_node(
 // `MeadowRaytracingConfig::enabled` (set by the consumer) so it costs nothing
 // when no raytracer is present.
 //
-// CPU selection reserves the near budget for the closest roots, retains
-// blade-to-slot identities, and hands distant blades to cheaper chords.
-// GPU expansion updates wind in place; previous vertices preserve motion.
-// Topology generations tell consumers when temporal anchors must be dropped.
+// The GPU selection (`rt_select_*`) fills persistent blade slots the frame
+// the CPU finds one due (`rt_selection.rs`), nearest blades as exact
+// ribbons, distant ones as cheaper chords, and a blade keeps its slot while
+// selected or drawn. The expansion updates wind in place every frame and
+// keeps each slot's previous vertices. Identity generations tell consumers
+// when temporal anchors must be dropped.
 
+use bevy::render::diagnostic::{DiagnosticsRecorder, RecordDiagnostics};
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{
-    BufferInitDescriptor, CommandEncoder, CommandEncoderDescriptor,
+    BindGroupEntry, BindGroupLayout, BufferInitDescriptor, CommandEncoder,
+    CommandEncoderDescriptor, ComputePipeline, IntoBinding, MapMode, PollType, TextureView,
 };
 #[cfg(all(feature = "solari", not(target_family = "wasm")))]
 use bevy_solari::scene::RaytracingProducerEncoder;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::rt_selection::{MeadowRtMargins, RtSelect, RtSelectState, RtSelector};
 
 /// Consumer-set switch enabling the per-variant RT blade expansion. Off by
 /// default (no cost; the pipelines aren't even compiled until first enabled);
@@ -1835,26 +1680,441 @@ impl Default for MeadowRtDiagnostics {
     }
 }
 
-/// CPU selection telemetry. Counts include GPU-collapsed rim/trunk blades;
-/// coverage is a root-selection radius, not a visibility or GPU timing metric.
+/// Caster selection telemetry, read back from the GPU a few frames late.
+/// Counts are of live blades; coverage is the near band's reach,
+/// view-weighted outside the exact-only mode, not a visibility or GPU
+/// timing metric.
 #[derive(Clone, Debug)]
 pub struct MeadowRtVariantStats {
     pub variant: MeadowVariantId,
     pub exact_only: bool,
     pub requested_radius_m: f32,
     pub coverage_radius_m: f32,
+    /// The near reach the expansion draws with, easing toward the coverage.
+    pub drawn_radius_m: f32,
     pub near_selected: usize,
     pub near_capacity: usize,
     pub far_selected: usize,
     pub far_capacity: usize,
     pub candidate_count: usize,
+    /// Slots kept for blades drawn past the selection's limits.
+    pub pinned: usize,
+    /// Selected blades no slot was free for.
+    pub dropped: usize,
+    /// How many times a slot could pass from a drawn blade to another one,
+    /// which drops the consumer's temporal anchors on the casters.
+    pub topology_changes: u64,
+    /// Whether the latest selection's outcome is still on its way back.
     pub pending: bool,
     pub selection_center: Vec3,
 }
 
-/// Shared snapshot published by extraction, readable from main-world UI.
+/// Shared snapshot published by the render world, readable from main-world
+/// UI.
 #[derive(Resource, Clone, Default)]
-pub struct MeadowRtTelemetry(pub Arc<std::sync::Mutex<Vec<MeadowRtVariantStats>>>);
+pub struct MeadowRtTelemetry(pub Arc<Mutex<Vec<MeadowRtVariantStats>>>);
+
+/// MUST equal `RT_SELECT_BINS` in `meadow_compute.wesl`: bins per
+/// selection key histogram.
+pub(crate) const RT_SELECT_BINS: u32 = 16_384;
+/// MUST equal `RT_SCAN_ROW` in `meadow_compute.wesl`: workgroups per
+/// dispatch row of a scan.
+pub(crate) const RT_SCAN_ROW: u32 = 65_535;
+/// Slots of both bands, near band first.
+const RT_SLOTS: u32 = RT_NEAR_MAX_BLADES + RT_FAR_MAX_BLADES;
+/// Seconds the drawn reach and budget term take to cover all but 1/e of
+/// the way to a selection's.
+const RT_DRAWN_EASE_SECONDS: f32 = 0.15;
+
+/// A variant's casters for one frame, from the extract.
+pub(crate) struct RtExtract {
+    pub(crate) inputs: RtInputs,
+    pub(crate) viewer: RtPose,
+    /// The narrowest margins the selection holds its casters for
+    /// ([`MeadowViewer::caster_margins`]).
+    pub(crate) margins: MeadowRtMargins,
+    /// The exact-only reference's radius.
+    pub(crate) exact_radius: Option<f32>,
+    /// [`MeadowVariant::raytraced_sunward_widen`].
+    pub(crate) sunward_widen: f32,
+    /// Share of the way the drawn limits ease toward the selection's this
+    /// frame.
+    pub(crate) ease: f32,
+}
+
+/// `RtParams` in `meadow_compute.wesl`.
+#[repr(C)]
+#[derive(ShaderType, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct RtParams {
+    /// The drawn limits, which only `rt_ease_drawn` writes.
+    drawn: Vec4,
+    eye: Vec4,
+    forward: Vec4,
+    ease: Vec4,
+}
+
+/// Where the CPU's share of [`RtParams`] starts.
+const RT_PARAMS_CPU: usize = std::mem::offset_of!(RtParams, eye);
+
+impl RtExtract {
+    /// The expansion's parameters but the drawn limits: the pose it draws
+    /// from (the exact-only reference's ranks by eye distance alone) and
+    /// the ease.
+    pub(crate) fn params(&self) -> RtParams {
+        let pose = match self.exact_radius {
+            Some(_) => self.viewer.by_distance(),
+            None => self.viewer,
+        };
+        RtParams {
+            drawn: Vec4::ZERO,
+            eye: pose.eye.extend(pose.cone_cos()),
+            forward: pose.ranked_forward().extend(self.sunward_widen),
+            ease: Vec4::new(self.ease, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
+/// `RtSelectParams` in `meadow_compute.wesl`.
+#[derive(ShaderType, Clone, Copy, Default)]
+pub(crate) struct RtSelectParams {
+    eye: Vec4,
+    forward: Vec4,
+    margin: Vec4,
+    counts: UVec4,
+    run: UVec4,
+}
+
+impl RtSelectParams {
+    fn new(select: &RtSelect) -> Self {
+        let (sin_m, cos_m) = select.margins.angle.sin_cos();
+        Self {
+            eye: select.pose.eye.extend(select.near_radius()),
+            forward: select.pose.ranked_forward().extend(select.pose.cone_cos()),
+            margin: Vec4::new(select.margins.distance, sin_m, cos_m, 0.0),
+            counts: UVec4::new(
+                select.scan.near_chunks,
+                select.scan.coverage.len() as u32,
+                select.purge.len() as u32,
+                u32::from(select.exact_radius.is_none()) | u32::from(select.clear) << 1,
+            ),
+            run: UVec4::new(select.scan.chunks.len() as u32, select.serial, 0, 0),
+        }
+    }
+}
+
+/// `RtSelectState` in `meadow_compute.wesl`; pairs run near band first.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct RtSelectStateGpu {
+    pub(crate) serial: u32,
+    pub(crate) flags: u32,
+    pub(crate) limit: [u32; 2],
+    pub(crate) boundary: [u32; 2],
+    pub(crate) selected: [u32; 2],
+    pub(crate) drawn_other: [u32; 2],
+    pub(crate) free: [u32; 2],
+    pub(crate) claimed: [u32; 2],
+    pub(crate) near_candidates: u32,
+    pub(crate) pinned: u32,
+    pub(crate) dropped: u32,
+    pub(crate) drawn: [u32; 2],
+    pub(crate) drawn_valid: u32,
+    pub(crate) bound: [u32; 2],
+}
+
+impl RtSelectStateGpu {
+    pub(crate) fn decode(&self) -> RtSelectState {
+        RtSelectState {
+            serial: self.serial,
+            near_reach: f32::from_bits(self.limit[0]),
+            far_budget: f32::from_bits(self.limit[1]),
+            near_candidates: self.near_candidates,
+            near_selected: self.selected[0],
+            far_selected: self.selected[1],
+            pinned: self.pinned,
+            dropped: self.dropped,
+            drawn_near_reach: f32::from_bits(self.drawn[0]),
+            drawn_far_budget: f32::from_bits(self.drawn[1]),
+        }
+    }
+}
+
+/// Byte layout of the selection's scratch buffer (`RtSelectScratch`): the
+/// state, then the four key histograms, the free slots and the owner
+/// tables.
+pub(crate) const RT_STATE_SIZE: u64 = size_of::<RtSelectStateGpu>() as u64;
+/// The state each selection resets: all but what persists from `drawn` on.
+const RT_STATE_RESET: u64 = std::mem::offset_of!(RtSelectStateGpu, drawn) as u64;
+const RT_HISTS_SIZE: u64 = 4 * 4 * RT_SELECT_BINS as u64;
+const RT_TABLES_OFFSET: u64 = RT_STATE_SIZE + RT_HISTS_SIZE + 4 * RT_SLOTS as u64;
+const RT_TABLES_SIZE: u64 = 4 * 2 * RT_SLOTS as u64;
+const RT_SCRATCH_SIZE: u64 = RT_TABLES_OFFSET + RT_TABLES_SIZE;
+/// Bytes of a slot (`RtSlot`).
+const RT_SLOT_SIZE: u64 = 16;
+
+/// Where a readback stands: free, copied into this frame, being mapped, or
+/// mapped and ready to read.
+const READBACK_IDLE: u8 = 0;
+const READBACK_COPIED: u8 = 1;
+const READBACK_MAPPING: u8 = 2;
+const READBACK_MAPPED: u8 = 3;
+
+/// A selection state copy for the CPU to read without stalling.
+struct RtReadback {
+    buffer: Buffer,
+    stage: Arc<AtomicU8>,
+}
+
+fn rt_buffer(render_device: &RenderDevice, label: &str, size: u64, usage: BufferUsages) -> Buffer {
+    render_device.create_buffer(&BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    })
+}
+
+/// A variant's GPU selection: its slots, near band first, the selection's
+/// parameters and scan, and its scratch.
+pub(crate) struct RtSelectBuffers {
+    params: UniformBuffer<RtSelectParams>,
+    /// The purged patch indices, the coverage and the scan chunks
+    /// (`rt_scan`).
+    scan: Buffer,
+    pub(crate) slots: Buffer,
+    pub(crate) scratch: Buffer,
+    readbacks: [RtReadback; 2],
+}
+
+impl RtSelectBuffers {
+    fn new(render_device: &RenderDevice, render_queue: &RenderQueue) -> Self {
+        let storage = BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+        let mut params = UniformBuffer::<RtSelectParams>::default();
+        params.set_label(Some("meadow_rt_select_params"));
+        params.write_buffer(render_device, render_queue);
+        Self {
+            params,
+            scan: rt_buffer(render_device, "meadow_rt_select_scan", 16, storage),
+            slots: rt_buffer(
+                render_device,
+                "meadow_rt_slots",
+                RT_SLOT_SIZE * u64::from(RT_SLOTS),
+                storage,
+            ),
+            scratch: rt_buffer(
+                render_device,
+                "meadow_rt_select_scratch",
+                RT_SCRATCH_SIZE,
+                storage,
+            ),
+            readbacks: std::array::from_fn(|_| RtReadback {
+                buffer: rt_buffer(
+                    render_device,
+                    "meadow_rt_select_readback",
+                    RT_STATE_SIZE,
+                    BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                ),
+                stage: Arc::default(),
+            }),
+        }
+    }
+
+    /// Upload `select`'s parameters and scan, growing the scan buffer to
+    /// fit it.
+    fn upload(
+        &mut self,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        select: &RtSelect,
+    ) {
+        self.params.set(RtSelectParams::new(select));
+        self.params.write_buffer(render_device, render_queue);
+        let mut words = select.purge.clone();
+        words.extend(select.scan.coverage.iter().flatten());
+        words.extend(select.scan.chunks.iter().flatten());
+        let bytes = 4 * words.len() as u64;
+        if bytes > self.scan.size() {
+            self.scan = rt_buffer(
+                render_device,
+                "meadow_rt_select_scan",
+                bytes.next_power_of_two(),
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            );
+        }
+        if !words.is_empty() {
+            render_queue.write_buffer(&self.scan, 0, bytemuck::cast_slice(&words));
+        }
+    }
+
+    fn mapping(&self) -> bool {
+        self.readbacks
+            .iter()
+            .any(|r| r.stage.load(Ordering::Acquire) == READBACK_MAPPING)
+    }
+
+    /// The state a mapped readback holds; and start mapping the readbacks
+    /// copied into the last frame.
+    fn poll_readbacks(&self) -> Option<RtSelectState> {
+        let mut read = None;
+        for readback in &self.readbacks {
+            match readback.stage.load(Ordering::Acquire) {
+                READBACK_MAPPED => {
+                    read = readback
+                        .buffer
+                        .slice(..)
+                        .get_mapped_range()
+                        .ok()
+                        .map(|view| {
+                            bytemuck::pod_read_unaligned::<RtSelectStateGpu>(&view[..]).decode()
+                        });
+                    readback.buffer.unmap();
+                    readback.stage.store(READBACK_IDLE, Ordering::Release);
+                }
+                READBACK_COPIED => {
+                    readback.stage.store(READBACK_MAPPING, Ordering::Release);
+                    let stage = Arc::clone(&readback.stage);
+                    readback
+                        .buffer
+                        .slice(..)
+                        .map_async(MapMode::Read, move |result| {
+                            let next = if result.is_ok() {
+                                READBACK_MAPPED
+                            } else {
+                                READBACK_IDLE
+                            };
+                            stage.store(next, Ordering::Release);
+                        });
+                }
+                _ => {}
+            }
+        }
+        read
+    }
+
+    /// Copy the selection state into a free readback, if one is.
+    fn copy_readback(&self, encoder: &mut CommandEncoder) {
+        if let Some(readback) = self
+            .readbacks
+            .iter()
+            .find(|r| r.stage.load(Ordering::Acquire) == READBACK_IDLE)
+        {
+            encoder.copy_buffer_to_buffer(&self.scratch, 0, &readback.buffer, 0, RT_STATE_SIZE);
+            readback.stage.store(READBACK_COPIED, Ordering::Release);
+        }
+    }
+}
+
+/// The RT kernels' entry points, in [`RtPass`] order.
+pub(crate) const RT_ENTRIES: [&str; 12] = [
+    "rt_select_purge",
+    "rt_select_index",
+    "rt_select_count_near",
+    "rt_select_fit_near",
+    "rt_select_drawn_far",
+    "rt_select_count_far",
+    "rt_select_fit_far",
+    "rt_select_evict",
+    "rt_select_place",
+    "rt_ease_drawn",
+    "expand_rt_blades",
+    "rt_pad_unused",
+];
+
+/// The RT kernels, by their place in [`RT_ENTRIES`].
+#[derive(Clone, Copy)]
+pub(crate) enum RtPass {
+    Purge,
+    Index,
+    CountNear,
+    FitNear,
+    DrawnFar,
+    CountFar,
+    FitFar,
+    Evict,
+    Place,
+    Ease,
+    Expand,
+    Pad,
+}
+
+/// The RT kernels' compute pipelines, in [`RT_ENTRIES`] order.
+pub(crate) struct RtPasses<'a>(pub(crate) [&'a ComputePipeline; 12]);
+
+impl RtPasses<'_> {
+    /// Record `kernel` over `workgroups`, in rows of `RT_SCAN_ROW`.
+    fn dispatch(
+        &self,
+        pass: &mut bevy::render::render_resource::ComputePass,
+        kernel: RtPass,
+        workgroups: u32,
+    ) {
+        if workgroups > 0 {
+            pass.set_pipeline(self.0[kernel as usize]);
+            pass.dispatch_workgroups(
+                workgroups.min(RT_SCAN_ROW),
+                workgroups.div_ceil(RT_SCAN_ROW),
+                1,
+            );
+        }
+    }
+
+    /// Record `kernels` with `bind_group`.
+    fn record(
+        &self,
+        encoder: &mut CommandEncoder,
+        label: &str,
+        bind_group: &BindGroup,
+        kernels: &[(RtPass, u32)],
+    ) {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, bind_group, &[]);
+        for &(kernel, workgroups) in kernels {
+            self.dispatch(&mut pass, kernel, workgroups);
+        }
+    }
+
+    /// Record `select`, uploaded with [`RtSelectBuffers::upload`], with
+    /// `bind_group` binding `buffers`.
+    fn record_select(
+        &self,
+        encoder: &mut CommandEncoder,
+        bind_group: &BindGroup,
+        buffers: &RtSelectBuffers,
+        select: &RtSelect,
+    ) {
+        let reset = if select.clear {
+            RT_STATE_SIZE
+        } else {
+            RT_STATE_RESET
+        };
+        encoder.clear_buffer(&buffers.scratch, 0, Some(reset));
+        encoder.clear_buffer(&buffers.scratch, RT_STATE_SIZE, Some(RT_HISTS_SIZE));
+        encoder.clear_buffer(&buffers.scratch, RT_TABLES_OFFSET, Some(RT_TABLES_SIZE));
+        let slots = RT_SLOTS.div_ceil(256);
+        let chunks = select.scan.chunks.len() as u32;
+        let far = u32::from(select.exact_radius.is_none());
+        let purge = u32::from(select.clear || !select.purge.is_empty());
+        self.record(
+            encoder,
+            "meadow_rt_select",
+            bind_group,
+            &[
+                (RtPass::Purge, purge * slots),
+                (RtPass::Index, slots),
+                (RtPass::CountNear, select.scan.near_chunks),
+                (RtPass::FitNear, 1),
+                (RtPass::DrawnFar, far * RT_FAR_MAX_BLADES.div_ceil(256)),
+                (RtPass::CountFar, far * chunks),
+                (RtPass::FitFar, 1),
+                (RtPass::Evict, slots),
+                (RtPass::Place, chunks),
+            ],
+        );
+    }
+}
 
 /// One band's RT geometry (solari's 48-byte vertex layout + u32 indices),
 /// sized to its fixed blade capacity. Stable handles (never realloc): the
@@ -1862,8 +2122,8 @@ pub struct MeadowRtTelemetry(pub Arc<std::sync::Mutex<Vec<MeadowRtVariantStats>>
 /// consumer registers them once and rebuilds its BLAS per frame.
 pub struct RtBandBuffers {
     /// `array<PackedVertex>`. `STORAGE | BLAS_INPUT | COPY_SRC`:
-    /// compute-written, BLAS-read, and copied into `previous_vertices`.
-    /// Prefilled with NaN (inactive primitives) at creation.
+    /// compute-written and BLAS-read. Prefilled with NaN (inactive
+    /// primitives) at creation.
     pub vertices: Buffer,
     /// `array<u32>` static per-slot index pattern. `STORAGE | BLAS_INPUT`.
     /// Shared between variants (contents are a pure function of the band's
@@ -1873,60 +2133,405 @@ pub struct RtBandBuffers {
     pub vertex_count: u32,
     /// Full index capacity of `indices` (cap × indices-per-blade).
     pub index_count: u32,
-    /// Previous-frame positions in the same persistent blade slots.
+    /// Previous-frame positions in the same persistent blade slots, which
+    /// the expansion writes beside `vertices`.
     pub previous_vertices: Buffer,
-    /// Changes only when slots are reassigned, not when blades sway.
+    /// Changes only when a slot may pass from a drawn blade to another one,
+    /// not when blades sway or come and go.
     pub topology_generation: u64,
-    slots: Buffer,
-    uploaded_generation: Option<u64>,
 }
 
-impl RtBandBuffers {
-    /// Record a copy of the whole `vertices` buffer into `previous_vertices`.
-    fn copy_to_previous(&self, encoder: &mut CommandEncoder) {
-        encoder.copy_buffer_to_buffer(
-            &self.vertices,
-            0,
-            &self.previous_vertices,
-            0,
-            u64::from(self.vertex_count) * RT_VERTEX_SIZE,
-        );
+/// The resources the kernels read a variant's blades from.
+pub(crate) struct RtBlades<'a> {
+    pub(crate) params: &'a Buffer,
+    pub(crate) patches: &'a Buffer,
+    pub(crate) trunks: &'a Buffer,
+    pub(crate) palettes: &'a Buffer,
+    /// Heightfield, cover field and clearing profiles.
+    pub(crate) textures: [&'a TextureView; 3],
+}
+
+/// Identity of every resource [`RtBlades`] binds; a bind group references
+/// resources, not their contents.
+type RtBladesKey = ([BufferId; 4], [TextureViewId; 3]);
+
+impl<'a> RtBlades<'a> {
+    fn key(&self) -> RtBladesKey {
+        (
+            [self.params, self.patches, self.trunks, self.palettes].map(Buffer::id),
+            self.textures.map(TextureView::id),
+        )
+    }
+
+    /// The bindings the selection and the expansion share, with the slots.
+    fn entries(&self, slots: &'a Buffer) -> Vec<BindGroupEntry<'a>> {
+        let [heightfield, cover, profiles] = self.textures;
+        vec![
+            BindGroupEntry {
+                binding: 0,
+                resource: self.params.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: self.patches.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: self.trunks.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: heightfield.into_binding(),
+            },
+            BindGroupEntry {
+                binding: 10,
+                resource: slots.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 14,
+                resource: self.palettes.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 15,
+                resource: cover.into_binding(),
+            },
+            BindGroupEntry {
+                binding: 16,
+                resource: profiles.into_binding(),
+            },
+        ]
     }
 }
 
-/// Per-variant RT geometry, persistent slot mappings, and transition uniform.
+/// What a variant's casters do this frame.
+enum RtFrameInputs<'a> {
+    /// Select and expand from its blades.
+    Draw(RtBlades<'a>, &'a RtExtract),
+    /// Stand still: it has no live patches for a while.
+    Hold,
+    /// Clear: its blades' inputs are missing.
+    Pad,
+}
+
+impl ExtractedVariant {
+    /// The resources the RT kernels read this variant's blades from, once
+    /// all are resident.
+    fn blades<'a>(
+        &'a self,
+        id: &MeadowVariantId,
+        buffers: &MeadowGpuBuffers,
+        params: &'a MeadowVariantParamsBuffers,
+        shader_buffers: &'a RenderAssets<GpuShaderBuffer>,
+        gpu_images: &'a RenderAssets<GpuImage>,
+        fallback: &'a bevy::render::texture::FallbackImage,
+    ) -> Option<RtBlades<'a>> {
+        if buffers.by_variant.get(id)?.num_active == 0 {
+            return None;
+        }
+        let gpu = params.by_variant.get(id)?;
+        Some(RtBlades {
+            params: gpu.params.buffer()?,
+            patches: &shader_buffers.get(self.patches)?.buffer,
+            trunks: &shader_buffers.get(self.trunk_slots)?.buffer,
+            palettes: &gpu.palettes,
+            textures: self
+                .textures(gpu_images, fallback)
+                .map(|image| &image.texture_view),
+        })
+    }
+}
+
+/// The RT kernels' bind group layouts.
+pub(crate) struct RtLayouts {
+    pub(crate) select: BindGroupLayout,
+    pub(crate) expand: BindGroupLayout,
+    pub(crate) pad: BindGroupLayout,
+}
+
+/// Per-variant RT geometry, its slots and their selection, and the
+/// expansion's parameters.
 pub struct RtVariantBuffers {
     /// Near band: [`RT_NEAR_MAX_BLADES`] × 11-vert / 9-tri ribbons.
     pub near: RtBandBuffers,
     /// Far band: [`RT_FAR_MAX_BLADES`] × 3-vert / 1-tri proxies.
     pub far: RtBandBuffers,
-    /// `array<vec4<f32>, 2>((transition_start, transition_end, far_budget, _),
-    /// (centre.xyz, _))`: the near/far transition distances, measured from the
-    /// eye of the selection snapshot the slot arrays come from, and the far
-    /// band's budget term (negative when unbounded).
-    rt_params: Buffer,
-    /// Cached expand bind group, keyed on the input identities (the asset
-    /// buffers and heightfield view can be swapped by the asset system; the
-    /// variant's own buffers are stable).
-    expand_bind_group: Option<(RtExpandKey, BindGroup)>,
-    /// The pad pass binds only the variant's own (stable) buffers.
-    pad_bind_group: Option<BindGroup>,
-    /// Whether the buffers are already fully NaN-padded from a frame whose
-    /// expansion inputs were missing — skips re-padding the vertex buffers every frame
-    /// while a variant idles (streaming gaps, world transitions).
+    /// `rt_params` in `meadow_compute.wesl`.
+    params: Buffer,
+    pub(crate) select: RtSelectBuffers,
+    pub(crate) selector: RtSelector,
+    select_group: Option<((RtBladesKey, BufferId), BindGroup)>,
+    expand_group: Option<(RtBladesKey, BindGroup)>,
+    pad_group: Option<BindGroup>,
+    /// Whether the buffers are fully NaN-padded from a frame whose inputs
+    /// were missing — skips re-padding them every frame while a variant
+    /// idles.
     empty_padded: bool,
+    /// The slot identity the bands' topology generations stand for.
+    identity: Option<u64>,
+    /// Frames in a row the variant had no live patches, or was missing from
+    /// the extract.
+    inactive_frames: u32,
 }
 
-/// Identity of every externally-owned resource the expand bind group binds:
-/// (params uniform, patches, trunk_slots, palettes; heightfield, cover field
-/// and clearing-profile views).
-type RtExpandKey = ([BufferId; 4], [TextureViewId; 3]);
+impl RtVariantBuffers {
+    pub(crate) fn new(
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        (near_indices, far_indices): (Buffer, Buffer),
+    ) -> Self {
+        Self {
+            near: make_rt_band(
+                render_device,
+                "meadow_rt_near",
+                RT_NEAR_MAX_BLADES,
+                RT_NEAR_VERTS_PER_BLADE,
+                RT_NEAR_INDICES_PER_BLADE,
+                near_indices,
+            ),
+            far: make_rt_band(
+                render_device,
+                "meadow_rt_far",
+                RT_FAR_MAX_BLADES,
+                RT_FAR_VERTS_PER_BLADE,
+                RT_FAR_INDICES_PER_BLADE,
+                far_indices,
+            ),
+            params: rt_buffer(
+                render_device,
+                "meadow_rt_params",
+                size_of::<RtParams>() as u64,
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            ),
+            select: RtSelectBuffers::new(render_device, render_queue),
+            selector: RtSelector::default(),
+            select_group: None,
+            expand_group: None,
+            pad_group: None,
+            empty_padded: false,
+            identity: None,
+            inactive_frames: 0,
+        }
+    }
+
+    /// Read back the selection's state, once a copy is mapped.
+    pub(crate) fn poll_readbacks(&mut self) {
+        if let Some(state) = self.select.poll_readbacks() {
+            self.selector.state = Some(state);
+        }
+    }
+
+    /// Select if a selection is due, timed as `meadow_rt_select`, ease the
+    /// drawn limits toward the selection's, and copy the state for the CPU
+    /// while it changes. Returns the selection made.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select(
+        &mut self,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        encoder: &mut CommandEncoder,
+        passes: &RtPasses,
+        layout: &BindGroupLayout,
+        blades: &RtBlades,
+        rt: &RtExtract,
+        diagnostics: Option<&DiagnosticsRecorder>,
+    ) -> Option<RtSelect> {
+        render_queue.write_buffer(
+            &self.params,
+            RT_PARAMS_CPU as u64,
+            &bytemuck::bytes_of(&rt.params())[RT_PARAMS_CPU..],
+        );
+        let select = self
+            .selector
+            .update(&rt.inputs, rt.viewer, rt.exact_radius, &rt.margins);
+        if let Some(select) = &select {
+            self.select.upload(render_device, render_queue, select);
+        }
+        let key = (blades.key(), self.select.scan.id());
+        if self
+            .select_group
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != key)
+        {
+            let mut entries = blades.entries(&self.select.slots);
+            entries.extend([
+                BindGroupEntry {
+                    binding: 17,
+                    resource: self.select.params.binding().unwrap(),
+                },
+                BindGroupEntry {
+                    binding: 18,
+                    resource: self.select.scan.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 19,
+                    resource: self.select.scratch.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 22,
+                    resource: self.params.as_entire_binding(),
+                },
+            ]);
+            let group =
+                render_device.create_bind_group("meadow_rt_select_bind_group", layout, &entries);
+            self.select_group = Some((key, group));
+        }
+        let group = &self.select_group.as_ref().unwrap().1;
+        if let Some(select) = &select {
+            let span = diagnostics.time_span(encoder, "meadow_rt_select");
+            passes.record_select(encoder, group, &self.select, select);
+            span.end(encoder);
+        }
+        passes.record(encoder, "meadow_rt_ease", group, &[(RtPass::Ease, 1)]);
+        let easing = !self
+            .selector
+            .state
+            .is_some_and(|state| self.selector.current() && state.settled());
+        if select.is_some() || easing {
+            self.select.copy_readback(encoder);
+        }
+        select
+    }
+
+    /// Expand the slots' blades from this frame's pose.
+    pub(crate) fn expand(
+        &mut self,
+        render_device: &RenderDevice,
+        encoder: &mut CommandEncoder,
+        passes: &RtPasses,
+        layout: &BindGroupLayout,
+        blades: &RtBlades,
+    ) {
+        if self.identity != Some(self.selector.identity) {
+            self.identity = Some(self.selector.identity);
+            for band in [&mut self.near, &mut self.far] {
+                band.topology_generation = band.topology_generation.wrapping_add(1);
+            }
+        }
+        self.empty_padded = false;
+        let key = blades.key();
+        if self
+            .expand_group
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != key)
+        {
+            let mut entries = blades.entries(&self.select.slots);
+            entries.extend([
+                BindGroupEntry {
+                    binding: 9,
+                    resource: self.params.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 11,
+                    resource: self.near.vertices.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 12,
+                    resource: self.near.previous_vertices.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 13,
+                    resource: self.far.vertices.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 23,
+                    resource: self.far.previous_vertices.as_entire_binding(),
+                },
+            ]);
+            let group =
+                render_device.create_bind_group("meadow_rt_expand_bind_group", layout, &entries);
+            self.expand_group = Some((key, group));
+        }
+        let workgroups = RT_NEAR_MAX_BLADES.max(RT_FAR_MAX_BLADES).div_ceil(256);
+        passes.record(
+            encoder,
+            "meadow_rt_expand",
+            &self.expand_group.as_ref().unwrap().1,
+            &[(RtPass::Expand, workgroups)],
+        );
+    }
+
+    /// Clear both bands for a frame whose inputs are missing, so streaming
+    /// cannot leave stale casters, and start the selection over.
+    fn pad(
+        &mut self,
+        render_device: &RenderDevice,
+        encoder: &mut CommandEncoder,
+        passes: &RtPasses,
+        layout: &BindGroupLayout,
+    ) {
+        if self.empty_padded {
+            return;
+        }
+        self.empty_padded = true;
+        self.selector = RtSelector::default();
+        let group = self.pad_group.get_or_insert_with(|| {
+            render_device.create_bind_group(
+                "meadow_rt_pad_bind_group",
+                layout,
+                &BindGroupEntries::with_indices((
+                    (11, self.near.vertices.as_entire_binding()),
+                    (12, self.near.previous_vertices.as_entire_binding()),
+                    (13, self.far.vertices.as_entire_binding()),
+                    (23, self.far.previous_vertices.as_entire_binding()),
+                )),
+            )
+        });
+        let workgroups = RT_NEAR_MAX_BLADES.max(RT_FAR_MAX_BLADES).div_ceil(256);
+        passes.record(
+            encoder,
+            "meadow_rt_clear",
+            group,
+            &[(RtPass::Pad, workgroups)],
+        );
+        for band in [&mut self.near, &mut self.far] {
+            band.topology_generation = band.topology_generation.wrapping_add(1);
+        }
+    }
+
+    /// Keep last frame's casters standing still while the variant has no
+    /// live patches: the expansion would read no patch.
+    fn hold(&self, encoder: &mut CommandEncoder) {
+        if self.empty_padded {
+            return;
+        }
+        for band in [&self.near, &self.far] {
+            encoder.copy_buffer_to_buffer(
+                &band.vertices,
+                0,
+                &band.previous_vertices,
+                0,
+                u64::from(band.vertex_count) * RT_VERTEX_SIZE,
+            );
+        }
+    }
+
+    fn stats(&self, variant: MeadowVariantId, rt: &RtExtract) -> MeadowRtVariantStats {
+        let state = self.selector.state.unwrap_or_default();
+        MeadowRtVariantStats {
+            variant,
+            exact_only: rt.exact_radius.is_some(),
+            requested_radius_m: rt.exact_radius.unwrap_or(RT_NEAR_DISTANCE),
+            coverage_radius_m: state.near_reach,
+            drawn_radius_m: state.drawn_near_reach,
+            near_selected: state.near_selected as usize,
+            near_capacity: RT_NEAR_MAX_BLADES as usize,
+            far_selected: state.far_selected as usize,
+            far_capacity: RT_FAR_MAX_BLADES as usize,
+            candidate_count: state.near_candidates as usize,
+            pinned: state.pinned as usize,
+            dropped: state.dropped as usize,
+            topology_changes: self.selector.identity_changes,
+            pending: !self.selector.current(),
+            selection_center: self.selector.pose().map_or(Vec3::ZERO, |pose| pose.eye),
+        }
+    }
+}
 
 /// Frames a variant may stay inactive — no live patches, or missing from
-/// the extract entirely — before its RT buffers are freed (and
-/// its per-frame pad dispatch + the consumer's BLAS rebuild stop). Generous
-/// enough to ride out streaming gaps; a variant left behind by a world
-/// transition stops costing anything.
+/// the extract entirely — before its RT buffers and selection are freed (and
+/// the consumer's BLAS rebuild stops). Generous enough to ride out streaming
+/// gaps; a variant left behind by a world transition stops costing
+/// anything.
 const RT_INACTIVE_FREE_FRAMES: u32 = 300;
 
 /// Public per-variant RT geometry, for a raytracing consumer.
@@ -1937,16 +2542,52 @@ pub struct MeadowRtBuffers {
     shared_indices: Option<(Buffer, Buffer)>,
 }
 
+impl MeadowRtBuffers {
+    /// Free the buffers and selection of every variant inactive for
+    /// [`RT_INACTIVE_FREE_FRAMES`]. A variant missing from `extracted` (no
+    /// registry, material churn, a world transition) counts the same as one
+    /// with no live patches: only live patches reset its streak.
+    pub(crate) fn free_inactive(&mut self, extracted: &MeadowExtractedVariants) {
+        self.by_variant.retain(|id, rtv| {
+            let active = extracted
+                .by_variant
+                .get(id)
+                .is_some_and(|ev| !ev.active_patches.is_empty());
+            rtv.inactive_frames = if active { 0 } else { rtv.inactive_frames + 1 };
+            rtv.inactive_frames < RT_INACTIVE_FREE_FRAMES
+        });
+    }
+}
+
 /// Consumers bind geometry after slot generations and wind positions update.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MeadowRtExpanded;
 
+/// The RT kernels' layouts and pipelines, in [`RT_ENTRIES`] order.
 #[derive(Resource)]
-pub struct MeadowRtExpandPipeline {
+pub struct MeadowRtPipelines {
+    select_layout: BindGroupLayoutDescriptor,
     expand_layout: BindGroupLayoutDescriptor,
     pad_layout: BindGroupLayoutDescriptor,
-    expand: CachedComputePipelineId,
-    pad: CachedComputePipelineId,
+    ids: [CachedComputePipelineId; 12],
+}
+
+impl MeadowRtPipelines {
+    /// The pipelines, once all are compiled, and their layouts.
+    fn ready<'a>(&self, pipeline_cache: &'a PipelineCache) -> Option<(RtPasses<'a>, RtLayouts)> {
+        let mut pipelines = [None; 12];
+        for (pipeline, id) in pipelines.iter_mut().zip(self.ids) {
+            *pipeline = Some(pipeline_cache.get_compute_pipeline(id)?);
+        }
+        Some((
+            RtPasses(pipelines.map(Option::unwrap)),
+            RtLayouts {
+                select: pipeline_cache.get_bind_group_layout(&self.select_layout),
+                expand: pipeline_cache.get_bind_group_layout(&self.expand_layout),
+                pad: pipeline_cache.get_bind_group_layout(&self.pad_layout),
+            },
+        ))
+    }
 }
 
 /// Register the RT expansion resources + systems. Called from
@@ -1959,85 +2600,121 @@ pub fn build_meadow_raytracing(render_app: &mut SubApp) {
             prepare_meadow_rt_buffers
                 .in_set(RenderSystems::PrepareResources)
                 .after(prepare_meadow_gpu_buffers),
-            dispatch_meadow_rt_expand
+            dispatch_meadow_rt
                 .in_set(RenderSystems::PrepareResources)
                 .in_set(MeadowRtExpanded)
                 .after(prepare_meadow_rt_buffers)
-                // The expansion samples this frame's viewer position + wind
-                // time from the `VariantParams` uniform — without this edge
-                // the RT sway could lag the raster grass by a frame.
+                // The kernels read this frame's `VariantParams` uniform.
                 .after(prepare_meadow_variant_params),
         ),
     );
 }
 
-fn init_meadow_rt_pipeline(
-    asset_server: &AssetServer,
-    pipeline_cache: &PipelineCache,
-) -> MeadowRtExpandPipeline {
-    // Explicit binding indices — a SUBSET of meadow_compute.wesl's group 0
-    // (the read-only inputs, the palette table, the cover field and the
-    // clearing profiles) plus RT bindings at 9..=13. Raster-only bindings 4..=8 are omitted.
-    let expand_layout = BindGroupLayoutDescriptor::new(
+/// The bindings every RT kernel reads blades through: the read-only inputs,
+/// the palette table, the cover field and the clearing profiles of
+/// `meadow_compute.wesl`'s group 0, and the slots.
+fn rt_blade_layout_entries() -> [(
+    u32,
+    bevy::render::render_resource::BindGroupLayoutEntryBuilder,
+); 8] {
+    let texture = || texture_2d(TextureSampleType::Float { filterable: false });
+    [
+        (0, uniform_buffer::<VariantParams>(false)),
+        (1, storage_buffer_read_only_sized(false, None)), // patches
+        (2, storage_buffer_read_only_sized(false, None)), // trunk_slots
+        (3, texture()),                                   // heightfield
+        (10, storage_buffer_sized(false, None)),          // rt_slots
+        (14, storage_buffer_read_only_sized(false, None)), // palettes
+        (15, texture()),                                  // cover_field
+        (16, texture()),                                  // clearing_profiles
+    ]
+}
+
+fn rt_layout(
+    label: &'static str,
+    extra: &[(
+        u32,
+        bevy::render::render_resource::BindGroupLayoutEntryBuilder,
+    )],
+) -> BindGroupLayoutDescriptor {
+    let entries = rt_blade_layout_entries()
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(|(binding, entry)| entry.build(binding, ShaderStages::COMPUTE))
+        .collect::<Vec<_>>();
+    BindGroupLayoutDescriptor::new(label, &entries)
+}
+
+/// The expansion's group 0: the blade bindings and the bands' geometry.
+pub(crate) fn rt_expand_layout() -> BindGroupLayoutDescriptor {
+    rt_layout(
         "meadow_rt_expand_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (0, uniform_buffer::<VariantParams>(false)),
-                (1, storage_buffer_read_only_sized(false, None)), // patches
-                (2, storage_buffer_read_only_sized(false, None)), // trunk_slots
-                (
-                    3,
-                    texture_2d(TextureSampleType::Float { filterable: false }),
-                ), // heightfield
-                (9, uniform_buffer::<[Vec4; 2]>(false)),          // rt_params
-                (10, storage_buffer_read_only_sized(false, None)), // stable near slots
-                (11, storage_buffer_sized(false, None)),          // rt_verts_near
-                (12, storage_buffer_read_only_sized(false, None)), // stable far slots
-                (13, storage_buffer_sized(false, None)),          // rt_verts_far
-                (14, storage_buffer_read_only_sized(false, None)), // palettes
-                (
-                    15,
-                    texture_2d(TextureSampleType::Float { filterable: false }),
-                ), // cover_field
-                (
-                    16,
-                    texture_2d(TextureSampleType::Float { filterable: false }),
-                ), // clearing_profiles
-            ),
-        ),
-    );
-    // An input miss clears both bands instead of retaining stale casters.
-    let pad_layout = BindGroupLayoutDescriptor::new(
+        &[
+            (9, uniform_buffer::<RtParams>(false)),  // rt_params
+            (11, storage_buffer_sized(false, None)), // rt_verts_near
+            (12, storage_buffer_sized(false, None)), // rt_previous_near
+            (13, storage_buffer_sized(false, None)), // rt_verts_far
+            (23, storage_buffer_sized(false, None)), // rt_previous_far
+        ],
+    )
+}
+
+/// The selection's group 0: the blade bindings and the selection's.
+pub(crate) fn rt_select_layout() -> BindGroupLayoutDescriptor {
+    rt_layout(
+        "meadow_rt_select_layout",
+        &[
+            (17, uniform_buffer::<RtSelectParams>(false)), // rt_select
+            (18, storage_buffer_read_only_sized(false, None)), // rt_scan
+            (19, storage_buffer_sized(false, None)),       // rt_scratch
+            (22, storage_buffer_sized(false, None)),       // rt_drawn_params
+        ],
+    )
+}
+
+/// The pad pass's group 0: the bands' geometry.
+pub(crate) fn rt_pad_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
         "meadow_rt_pad_layout",
         &BindGroupLayoutEntries::with_indices(
             ShaderStages::COMPUTE,
             (
                 (11, storage_buffer_sized(false, None)),
+                (12, storage_buffer_sized(false, None)),
                 (13, storage_buffer_sized(false, None)),
+                (23, storage_buffer_sized(false, None)),
             ),
         ),
-    );
+    )
+}
+
+fn init_meadow_rt_pipelines(
+    asset_server: &AssetServer,
+    pipeline_cache: &PipelineCache,
+) -> MeadowRtPipelines {
+    let select_layout = rt_select_layout();
+    let expand_layout = rt_expand_layout();
+    let pad_layout = rt_pad_layout();
     let shader = asset_server.load(MEADOW_COMPUTE_SHADER);
-    let expand = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("meadow_expand_rt_blades".into()),
-        layout: vec![expand_layout.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("expand_rt_blades")),
-        ..default()
+    let ids = std::array::from_fn(|i| {
+        let layout = match i {
+            i if i == RtPass::Expand as usize => &expand_layout,
+            i if i == RtPass::Pad as usize => &pad_layout,
+            _ => &select_layout,
+        };
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some(format!("meadow_{}", RT_ENTRIES[i]).into()),
+            layout: vec![layout.clone()],
+            shader: shader.clone(),
+            entry_point: Some(Cow::from(RT_ENTRIES[i])),
+            ..default()
+        })
     });
-    let pad = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("meadow_rt_pad_unused".into()),
-        layout: vec![pad_layout.clone()],
-        shader,
-        entry_point: Some(Cow::from("rt_pad_unused")),
-        ..default()
-    });
-    MeadowRtExpandPipeline {
+    MeadowRtPipelines {
+        select_layout,
         expand_layout,
         pad_layout,
-        expand,
-        pad,
+        ids,
     }
 }
 
@@ -2047,7 +2724,7 @@ static NAN_CHUNK: [u32; 16384] = [0x7FC0_0000; 16384];
 /// Build one band's static index buffer: slot `s` -> verts
 /// `s * verts_per_blade` + the band's triangle pattern. Contents are a pure
 /// function of the capacity, so one buffer serves every variant.
-fn make_rt_indices(
+pub(crate) fn make_rt_indices(
     render_device: &RenderDevice,
     label: &str,
     blades: u32,
@@ -2064,6 +2741,26 @@ fn make_rt_indices(
         contents: bytemuck::cast_slice(&indices),
         usage: BufferUsages::STORAGE | BufferUsages::BLAS_INPUT,
     })
+}
+
+/// The static (near, far) index buffers.
+pub(crate) fn make_rt_band_indices(render_device: &RenderDevice) -> (Buffer, Buffer) {
+    (
+        make_rt_indices(
+            render_device,
+            "meadow_rt_near_indices",
+            RT_NEAR_MAX_BLADES,
+            RT_NEAR_VERTS_PER_BLADE,
+            &RT_NEAR_BLADE_INDICES,
+        ),
+        make_rt_indices(
+            render_device,
+            "meadow_rt_far_indices",
+            RT_FAR_MAX_BLADES,
+            RT_FAR_VERTS_PER_BLADE,
+            &RT_FAR_BLADE_INDICES,
+        ),
+    )
 }
 
 fn make_rt_band(
@@ -2099,35 +2796,25 @@ fn make_rt_band(
         }
     }
     vertices.unmap();
-
-    let previous_vertices = render_device.create_buffer(&BufferDescriptor {
-        label: Some(&format!("{label}_previous_vertices")),
-        size: u64::from(vertex_count) * RT_VERTEX_SIZE,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let slots = render_device.create_buffer(&BufferDescriptor {
-        label: Some(&format!("{label}_slots")),
-        size: u64::from(blades) * 8,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     RtBandBuffers {
         vertices,
-        previous_vertices,
-        slots,
+        previous_vertices: rt_buffer(
+            render_device,
+            &format!("{label}_previous_vertices"),
+            u64::from(vertex_count) * RT_VERTEX_SIZE,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        ),
         indices,
         vertex_count,
         index_count: blades * indices_per_blade,
         topology_generation: 0,
-        uploaded_generation: None,
     }
 }
 
 /// Allocate the fixed-cap RT buffers for every variant with live patches
 /// (once), free them for variants that stay inactive past
-/// [`RT_INACTIVE_FREE_FRAMES`], and lazily compile the expansion pipelines
-/// the first frame RT is enabled. No-op when RT is off.
+/// [`RT_INACTIVE_FREE_FRAMES`], and lazily compile the RT pipelines the
+/// first frame RT is enabled. No-op when RT is off.
 #[allow(clippy::too_many_arguments)]
 fn prepare_meadow_rt_buffers(
     mut commands: Commands,
@@ -2135,124 +2822,56 @@ fn prepare_meadow_rt_buffers(
     extracted: Res<MeadowExtractedVariants>,
     slots: Res<MeadowViewSlots>,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
-    pipeline: Option<Res<MeadowRtExpandPipeline>>,
+    pipelines: Option<Res<MeadowRtPipelines>>,
     mut rt: ResMut<MeadowRtBuffers>,
-    mut inactive_frames: Local<HashMap<MeadowVariantId, u32>>,
 ) {
     if !config.enabled {
         rt.by_variant.clear();
         rt.shared_indices = None;
-        inactive_frames.clear();
         return;
     }
-    if pipeline.is_none() {
-        commands.insert_resource(init_meadow_rt_pipeline(&asset_server, &pipeline_cache));
+    if pipelines.is_none() {
+        commands.insert_resource(init_meadow_rt_pipelines(&asset_server, &pipeline_cache));
     }
     // No meadow views this frame (a menu with only a 2D camera): nothing
-    // expands, so allocate nothing and let the inactivity streaks freeze —
+    // expands, so allocate nothing and let the inactivity streaks freeze:
     // buffers ride out the menu and resume the frame a 3D camera reappears.
     if slots.count == 0 {
         return;
     }
 
-    // Inactivity is counted per variant that still owns RT buffers; a
-    // variant absent from `extracted` entirely (registry/material churn, a
-    // world transition) counts the same as one present with no live patches
-    // — only real patches reset the streak. Freeing waits out the full
-    // grace window either way, so a brief streaming gap never re-triggers
-    // the vertex buffers' NaN prefill + the consumer's BLAS realloc.
-    for id in rt.by_variant.keys() {
-        let has_patches = extracted
-            .by_variant
-            .get(id)
-            .is_some_and(|ev| !ev.active_patches.is_empty());
-        let streak = inactive_frames.entry(*id).or_insert(0);
-        *streak = if has_patches {
-            0
-        } else {
-            streak.saturating_add(1)
-        };
-    }
-    rt.by_variant.retain(|id, _| {
-        inactive_frames
-            .get(id)
-            .is_none_or(|streak| *streak < RT_INACTIVE_FREE_FRAMES)
-    });
-    // Counters live exactly as long as the buffers they guard.
-    inactive_frames.retain(|id, _| rt.by_variant.contains_key(id));
-
+    rt.free_inactive(&extracted);
     for (id, ev) in extracted.by_variant.iter() {
         if rt.by_variant.contains_key(id) || ev.active_patches.is_empty() {
             continue;
         }
-        let (near_indices, far_indices) = rt
+        let indices = rt
             .shared_indices
-            .get_or_insert_with(|| {
-                (
-                    make_rt_indices(
-                        &render_device,
-                        "meadow_rt_near_indices",
-                        RT_NEAR_MAX_BLADES,
-                        RT_NEAR_VERTS_PER_BLADE,
-                        &RT_NEAR_BLADE_INDICES,
-                    ),
-                    make_rt_indices(
-                        &render_device,
-                        "meadow_rt_far_indices",
-                        RT_FAR_MAX_BLADES,
-                        RT_FAR_VERTS_PER_BLADE,
-                        &RT_FAR_BLADE_INDICES,
-                    ),
-                )
-            })
+            .get_or_insert_with(|| make_rt_band_indices(&render_device))
             .clone();
         rt.by_variant.insert(
             *id,
-            RtVariantBuffers {
-                near: make_rt_band(
-                    &render_device,
-                    "meadow_rt_near",
-                    RT_NEAR_MAX_BLADES,
-                    RT_NEAR_VERTS_PER_BLADE,
-                    RT_NEAR_INDICES_PER_BLADE,
-                    near_indices,
-                ),
-                far: make_rt_band(
-                    &render_device,
-                    "meadow_rt_far",
-                    RT_FAR_MAX_BLADES,
-                    RT_FAR_VERTS_PER_BLADE,
-                    RT_FAR_INDICES_PER_BLADE,
-                    far_indices,
-                ),
-                rt_params: render_device.create_buffer(&BufferDescriptor {
-                    label: Some("meadow_rt_params"),
-                    size: 32,
-                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                expand_bind_group: None,
-                pad_bind_group: None,
-                empty_padded: false,
-            },
+            RtVariantBuffers::new(&render_device, &render_queue, indices),
         );
     }
 }
 
-/// Per variant: upload changed slots, run `expand_rt_blades` (when this frame's
-/// inputs are all present), or clear both bands if inputs are missing.
+/// Per variant: read back the selection's state, select when due, ease the
+/// drawn limits, and expand the slots' blades — or hold them while the
+/// variant has no live patches, or clear them while its inputs are missing.
 /// Records into solari's shared `RaytracingProducerEncoder` when its scene
 /// plugin is present — one submit covers every raytracing geometry producer,
-/// ahead of the BLAS builds — and otherwise falls back to a private encoder +
-/// submit so the pass works without a raytracer. Either way, queue
+/// ahead of the BLAS builds — and otherwise into a private encoder it
+/// submits, so the passes work without a raytracer. Either way, queue
 /// submission order guarantees a consumer's BLAS build (a later render set)
 /// sees the finished buffers.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_meadow_rt_expand(
+fn dispatch_meadow_rt(
     config: Res<MeadowRaytracingConfig>,
-    pipeline: Option<Res<MeadowRtExpandPipeline>>,
+    pipelines: Option<Res<MeadowRtPipelines>>,
     pipeline_cache: Res<PipelineCache>,
     extracted: Res<MeadowExtractedVariants>,
     slots: Res<MeadowViewSlots>,
@@ -2267,199 +2886,105 @@ fn dispatch_meadow_rt_expand(
     #[cfg(all(feature = "solari", not(target_family = "wasm")))] mut producer_encoder: Option<
         ResMut<RaytracingProducerEncoder>,
     >,
-    mut logged: Local<bool>,
+    diagnostics: Option<Res<DiagnosticsRecorder>>,
 ) {
-    if !config.enabled || rt.by_variant.is_empty() {
-        return;
-    }
     // No meadow views this frame (a menu with only a 2D camera): the
     // sibling prepares idle too, leaving the params uniform frozen and the
-    // GPU active-patch list stale — its indices can dangle into recycled
-    // PatchData slots as streaming continues, so expanding would bake
-    // garbage casters and drive per-variant BLAS rebuilds. Idle instead;
-    // the consumer tolerates frames with no dispatch.
-    if slots.count == 0 {
+    // GPU active-patch list stale. Idle instead; the consumer tolerates
+    // frames with no dispatch.
+    if !config.enabled || rt.by_variant.is_empty() || slots.count == 0 {
         return;
     }
-    let Some(pipeline) = pipeline else {
+    let Some(pipelines) = pipelines else {
         return;
     };
-    let (Some(expand), Some(pad)) = (
-        pipeline_cache.get_compute_pipeline(pipeline.expand),
-        pipeline_cache.get_compute_pipeline(pipeline.pad),
-    ) else {
+    let Some((passes, layouts)) = pipelines.ready(&pipeline_cache) else {
         return; // pipelines still compiling; buffers stay NaN (empty geometry)
     };
-
-    // Fully-idle frames (every variant already NaN-padded with no inputs)
-    // encode nothing — bail before acquiring an encoder, so the shared
-    // producer encoder isn't created for nothing.
-    if !rt.by_variant.iter().any(|(id, rtv)| {
-        !rtv.empty_padded
-            || gather_expand_inputs(id, &extracted, &buffers, &shader_buffers, &params).is_some()
+    if rt.by_variant.values().any(|rtv| rtv.select.mapping()) {
+        let _ = render_device.poll(PollType::Poll);
+    }
+    for rtv in rt.by_variant.values_mut() {
+        rtv.poll_readbacks();
+    }
+    let frames: Vec<(MeadowVariantId, RtFrameInputs)> = rt
+        .by_variant
+        .keys()
+        .map(|id| {
+            let frame = match extracted.by_variant.get(id) {
+                Some(ev) if ev.active_patches.is_empty() => RtFrameInputs::Hold,
+                Some(ev) => ev
+                    .rt
+                    .as_ref()
+                    .zip(ev.blades(
+                        id,
+                        &buffers,
+                        &params,
+                        &shader_buffers,
+                        &gpu_images,
+                        &fallback_image,
+                    ))
+                    .map_or(RtFrameInputs::Pad, |(extract, blades)| {
+                        RtFrameInputs::Draw(blades, extract)
+                    }),
+                None => RtFrameInputs::Pad,
+            };
+            (*id, frame)
+        })
+        .collect();
+    // Fully idle frames encode nothing.
+    if frames.iter().all(|(id, frame)| {
+        !matches!(frame, RtFrameInputs::Draw(..)) && rt.by_variant[id].empty_padded
     }) {
         return;
     }
 
     let mut own_encoder: Option<CommandEncoder> = None;
-    let new_own_encoder = || {
+    let new_encoder = || {
         render_device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("meadow_rt_expand_encoder"),
+            label: Some("meadow_rt_encoder"),
         })
     };
     #[cfg(all(feature = "solari", not(target_family = "wasm")))]
     let encoder = match producer_encoder.as_mut() {
         Some(shared) => shared.encoder(&render_device),
-        None => own_encoder.insert(new_own_encoder()),
+        None => own_encoder.insert(new_encoder()),
     };
     #[cfg(not(all(feature = "solari", not(target_family = "wasm"))))]
-    let encoder = own_encoder.insert(new_own_encoder());
+    let encoder = own_encoder.insert(new_encoder());
 
-    let workgroups = RT_NEAR_MAX_BLADES.max(RT_FAR_MAX_BLADES).div_ceil(256);
-    for (id, rtv) in rt.by_variant.iter_mut() {
-        let inputs = gather_expand_inputs(id, &extracted, &buffers, &shader_buffers, &params);
-        if inputs.is_none() && rtv.empty_padded {
-            continue;
-        }
-        let was_empty = rtv.empty_padded;
-        rtv.empty_padded = inputs.is_none();
-        let mut reset_near = was_empty;
-        let mut reset_far = was_empty;
-        // Preserve matching vertices before the compute overwrites them.
-        for band in [&rtv.near, &rtv.far] {
-            band.copy_to_previous(encoder);
-        }
-        if let Some(ExpandInputs {
-            ev,
-            patches,
-            trunk_slots,
-            params_buf,
-            palettes,
-        }) = inputs
-        {
-            for (band, slots, generation, reset) in [
-                (
-                    &mut rtv.near,
-                    &ev.rt_near_slots,
-                    ev.rt_near_generation,
-                    &mut reset_near,
-                ),
-                (
-                    &mut rtv.far,
-                    &ev.rt_far_slots,
-                    ev.rt_far_generation,
-                    &mut reset_far,
-                ),
-            ] {
-                if band.uploaded_generation != Some(generation) || was_empty {
-                    render_queue.write_buffer(
-                        &band.slots,
-                        0,
-                        bytemuck::cast_slice(slots.as_slice()),
-                    );
-                    band.uploaded_generation = Some(generation);
-                    band.topology_generation = band.topology_generation.wrapping_add(1);
-                    *reset = true;
-                }
-            }
-            render_queue.write_buffer(
-                &rtv.rt_params,
-                0,
-                bytemuck::cast_slice(&[
-                    ev.rt_transition[0],
-                    ev.rt_transition[1],
-                    ev.rt_far_budget,
-                    0.0,
-                    ev.rt_selection_center.x,
-                    ev.rt_selection_center.y,
-                    ev.rt_selection_center.z,
-                    0.0,
-                ]),
+    let diagnostics = diagnostics.as_deref();
+    for (id, frame) in &frames {
+        if let RtFrameInputs::Draw(blades, rt_frame) = frame {
+            let rtv = rt.by_variant.get_mut(id).unwrap();
+            rtv.select(
+                &render_device,
+                &render_queue,
+                encoder,
+                &passes,
+                &layouts.select,
+                blades,
+                rt_frame,
+                diagnostics,
             );
-            let textures = ev.textures(&gpu_images, &fallback_image);
-            let [heightfield, cover, profiles] = textures;
-            let key = (
-                [
-                    params_buf.id(),
-                    patches.buffer.id(),
-                    trunk_slots.buffer.id(),
-                    palettes.id(),
-                ],
-                textures.map(|image| image.texture_view.id()),
-            );
-            if rtv
-                .expand_bind_group
-                .as_ref()
-                .is_none_or(|(cached, _)| *cached != key)
-            {
-                let bind_group = render_device.create_bind_group(
-                    Some("meadow_rt_expand_bind_group"),
-                    &pipeline_cache.get_bind_group_layout(&pipeline.expand_layout),
-                    &BindGroupEntries::with_indices((
-                        (0, params_buf.as_entire_binding()),
-                        (1, patches.buffer.as_entire_binding()),
-                        (2, trunk_slots.buffer.as_entire_binding()),
-                        (3, &heightfield.texture_view),
-                        (9, rtv.rt_params.as_entire_binding()),
-                        (10, rtv.near.slots.as_entire_binding()),
-                        (11, rtv.near.vertices.as_entire_binding()),
-                        (12, rtv.far.slots.as_entire_binding()),
-                        (13, rtv.far.vertices.as_entire_binding()),
-                        (14, palettes.as_entire_binding()),
-                        (15, &cover.texture_view),
-                        (16, &profiles.texture_view),
-                    )),
-                );
-                rtv.expand_bind_group = Some((key, bind_group));
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("meadow_rt_expand"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(expand);
-                pass.set_bind_group(0, &rtv.expand_bind_group.as_ref().unwrap().1, &[]);
-                pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-            if !*logged {
-                info!(
-                    "meadow RT stable slots: near transition {:.1}..{:.1}m, near cap {}, far cap {}",
-                    ev.rt_transition[0], ev.rt_transition[1], RT_NEAR_MAX_BLADES, RT_FAR_MAX_BLADES
-                );
-                *logged = true;
-            }
-        } else {
-            for band in [&mut rtv.near, &mut rtv.far] {
-                band.topology_generation = band.topology_generation.wrapping_add(1);
-                band.uploaded_generation = None;
-            }
-            reset_near = true;
-            reset_far = true;
-            if rtv.pad_bind_group.is_none() {
-                rtv.pad_bind_group = Some(render_device.create_bind_group(
-                    Some("meadow_rt_pad_bind_group"),
-                    &pipeline_cache.get_bind_group_layout(&pipeline.pad_layout),
-                    &BindGroupEntries::with_indices((
-                        (11, rtv.near.vertices.as_entire_binding()),
-                        (13, rtv.far.vertices.as_entire_binding()),
-                    )),
-                ));
-            }
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("meadow_rt_clear"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pad);
-            pass.set_bind_group(0, rtv.pad_bind_group.as_ref().unwrap(), &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
         }
-        // A reassigned slot has no valid motion history. Initialize previous
-        // positions to the NEW owner and separately invalidate GI anchors.
-        for (band, reset) in [(&rtv.near, reset_near), (&rtv.far, reset_far)] {
-            if reset {
-                band.copy_to_previous(encoder);
+    }
+    let span = diagnostics.time_span(encoder, "meadow_rt_expand");
+    let mut stats = Vec::new();
+    for (id, frame) in &frames {
+        let rtv = rt.by_variant.get_mut(id).unwrap();
+        match frame {
+            RtFrameInputs::Draw(blades, rt_frame) => {
+                rtv.expand(&render_device, encoder, &passes, &layouts.expand, blades);
+                stats.push(rtv.stats(*id, rt_frame));
             }
+            RtFrameInputs::Hold => rtv.hold(encoder),
+            RtFrameInputs::Pad => rtv.pad(&render_device, encoder, &passes, &layouts.pad),
         }
+    }
+    span.end(encoder);
+    if let Ok(mut published) = extracted.telemetry.lock() {
+        *published = stats;
     }
 
     // Standalone fallback only — the shared producer encoder is submitted
@@ -2469,132 +2994,12 @@ fn dispatch_meadow_rt_expand(
     }
 }
 
-/// Everything one variant's expansion dispatch needs this frame.
-struct ExpandInputs<'a> {
-    ev: &'a ExtractedVariant,
-    patches: &'a GpuShaderBuffer,
-    trunk_slots: &'a GpuShaderBuffer,
-    params_buf: &'a Buffer,
-    palettes: &'a Buffer,
-}
-
-fn gather_expand_inputs<'a>(
-    id: &MeadowVariantId,
-    extracted: &'a MeadowExtractedVariants,
-    buffers: &'a MeadowGpuBuffers,
-    shader_buffers: &'a RenderAssets<GpuShaderBuffer>,
-    params: &'a MeadowVariantParamsBuffers,
-) -> Option<ExpandInputs<'a>> {
-    let ev = extracted.by_variant.get(id)?;
-    let vb = buffers.by_variant.get(id)?;
-    if ev.active_patches.is_empty()
-        || vb.num_active == 0
-        || ev.rt_near_slots.len() != RT_NEAR_MAX_BLADES as usize
-        || ev.rt_far_slots.len() != RT_FAR_MAX_BLADES as usize
-    {
-        return None;
-    }
-    let gpu = params.by_variant.get(id)?;
-    Some(ExpandInputs {
-        patches: shader_buffers.get(ev.patches)?,
-        trunk_slots: shader_buffers.get(ev.trunk_slots)?,
-        params_buf: gpu.params.buffer()?,
-        palettes: &gpu.palettes,
-        ev,
-    })
-}
+#[cfg(test)]
+mod rt_gpu_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Run `job` until its worker has published and no further task is due.
-    fn settle(
-        job: &mut RtSelectionJob,
-        live: &RtInputs,
-        viewer: Vec3,
-        diagnostics: MeadowRtDiagnostics,
-    ) {
-        for _ in 0..10_000 {
-            job.update(live, viewer, diagnostics);
-            if job.task.is_none() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        panic!("RT selection task never completed");
-    }
-
-    /// The exact-only radius shapes the selection only while that mode is on;
-    /// moving it otherwise must keep the published slots.
-    #[test]
-    fn exact_radius_resets_published_slots_only_in_exact_mode() {
-        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        let diagnostics = |exact_only, exact_radius_m| MeadowRtDiagnostics {
-            exact_only,
-            exact_radius_m,
-        };
-        let live = RtInputs::default();
-        let mut job = RtSelectionJob::default();
-        settle(&mut job, &live, Vec3::ZERO, diagnostics(false, 4.0));
-
-        let published = (job.near_generation, job.far_generation);
-        job.update(&live, Vec3::ZERO, diagnostics(false, 6.0));
-        assert_eq!((job.near_generation, job.far_generation), published);
-
-        job.update(&live, Vec3::ZERO, diagnostics(true, 6.0));
-        assert_ne!(job.near_generation, published.0);
-        assert_ne!(job.far_generation, published.1);
-        settle(&mut job, &live, Vec3::ZERO, diagnostics(true, 6.0));
-
-        let published = (job.near_generation, job.far_generation);
-        job.update(&live, Vec3::ZERO, diagnostics(true, 7.0));
-        assert_ne!(job.near_generation, published.0);
-        assert_ne!(job.far_generation, published.1);
-    }
-
-    /// An unchanged live list reselects only on viewer motion, and a patch
-    /// dropped from it leaves the published slots the same frame.
-    #[test]
-    fn unchanged_live_list_reselects_on_motion_and_purges_removed_patches() {
-        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        let diagnostics = MeadowRtDiagnostics {
-            exact_only: false,
-            exact_radius_m: 4.0,
-        };
-        let placement = |x, seed| crate::placement::PatchPlacement {
-            centre: Vec2::new(x, 0.0),
-            radius: 2.0,
-            blade_count: 100,
-            seed,
-            edge_noise_amp: 0.2,
-            canopy_density_at_centre: 0.0,
-            palette: 0,
-            shape: crate::placement::PatchShape::Disc,
-        };
-        let rt = |list: Vec<(u32, crate::placement::PatchPlacement)>| RtInputs {
-            placements: Arc::new(list),
-            ..Default::default()
-        };
-        let both = rt(vec![(0, placement(2.0, 12)), (1, placement(6.0, 13))]);
-        let mut job = RtSelectionJob::default();
-        settle(&mut job, &both, Vec3::ZERO, diagnostics);
-        assert!(job.near.iter().any(|slot| slot[0] == 1));
-
-        job.update(&both, Vec3::new(0.4, 0.0, 0.0), diagnostics);
-        assert!(job.task.is_none());
-        job.update(&both, Vec3::new(1.0, 0.0, 0.0), diagnostics);
-        assert!(job.task.is_some());
-        settle(&mut job, &both, Vec3::new(1.0, 0.0, 0.0), diagnostics);
-        assert_eq!(job.center, Vec3::new(1.0, 0.0, 0.0));
-
-        let one = rt(vec![(0, placement(2.0, 12))]);
-        let generation = job.near_generation;
-        job.update(&one, Vec3::new(1.0, 0.0, 0.0), diagnostics);
-        assert!(job.near.iter().all(|slot| slot[0] != 1));
-        assert!(job.far.iter().all(|slot| slot[0] != 1));
-        assert_ne!(job.near_generation, generation);
-    }
 
     #[test]
     fn replace_if_changed_keeps_pointer_for_equal_contents() {

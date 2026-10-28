@@ -7,8 +7,8 @@
 //! matches the shaders' `pixel = uv * (dims - 1)` lookup exactly. The
 //! resources that carry one ([`MeadowCoverField`],
 //! [`MeadowHeightfield`](crate::MeadowHeightfield)) keep the grid on the CPU
-//! beside its GPU atlas, so raytracing caster selection tests blades against
-//! the data the kernels read.
+//! beside its GPU atlas; the raytracing caster selection bounds patches'
+//! distances on the heightfield's.
 //!
 //! The cover field drives tile patches ([`PatchShape::Tile`](crate::PatchShape)):
 //! every blade samples its density, height scale and palette index, and
@@ -58,10 +58,15 @@ impl<T: Copy> MeadowGrid<T> {
 
     /// The four texels around `world_xz` (`[x0y0, x1y0, x0y1, x1y1]`) and
     /// the position between them, edge-clamped like the shaders.
-    fn footprint(&self, world_xz: Vec2) -> ([T; 4], Vec2) {
+    /// `world_xz` in texel coordinates, edge-clamped like the shaders.
+    pub fn pixel(&self, world_xz: Vec2) -> Vec2 {
         let size = (self.world_max - self.world_min).max(Vec2::splat(1e-3));
         let uv = ((world_xz - self.world_min) / size).clamp(Vec2::ZERO, Vec2::ONE);
-        let pixel = uv * (self.dims - UVec2::ONE).as_vec2();
+        uv * (self.dims - UVec2::ONE).as_vec2()
+    }
+
+    fn footprint(&self, world_xz: Vec2) -> ([T; 4], Vec2) {
+        let pixel = self.pixel(world_xz);
         let p0 = pixel.floor().as_uvec2();
         let p1 = (p0 + UVec2::ONE).min(self.dims - UVec2::ONE);
         (
@@ -283,19 +288,6 @@ pub(crate) fn hash_u32(mut x: u32) -> u32 {
     x ^ (x >> 16)
 }
 
-pub(crate) fn hash01_u32(v: u32) -> f32 {
-    (hash_u32(v) & 0x00ff_ffff) as f32 / 16_777_216.0
-}
-
-/// `meadow_tile_root`.
-pub(crate) fn tile_root(half: f32, blade_seed: u32) -> Vec2 {
-    let u = Vec2::new(
-        hash01_u32(blade_seed),
-        hash01_u32(blade_seed.wrapping_add(1)),
-    );
-    (2.0 * u - Vec2::ONE) * half
-}
-
 /// `MEADOW_NOISE_ROTATION`.
 const NOISE_ROTATION: Vec2 = Vec2::new(0.8, 0.6);
 
@@ -392,48 +384,69 @@ pub(crate) fn patch_noise(p: Vec2) -> f32 {
             .tanh()
 }
 
-/// `meadow_cover_threshold`: the blade's uniform `blade_u` mixed with the
-/// uniform `noise_u` by `clumpiness`, mapped back to a uniform threshold
-/// through the CDF of the weighted sum.
-pub(crate) fn cover_threshold(blade_u: f32, noise_u: f32, clumpiness: f32) -> f32 {
-    let b = clumpiness.clamp(0.0, 1.0);
-    let a = 1.0 - b;
-    let lo = a.min(b);
-    let hi = a.max(b);
-    if lo < 1e-4 {
-        return if a > b { blade_u } else { noise_u };
-    }
-    let z = a * blade_u + b * noise_u;
-    if z < lo {
-        z * z / (2.0 * a * b)
-    } else if z > hi {
-        let w = 1.0 - z;
-        1.0 - w * w / (2.0 * a * b)
-    } else {
-        (z - 0.5 * lo) / hi
-    }
-}
-
-/// `meadow_cover_survives`.
-pub(crate) fn cover_survives(
-    survival: &CoverSurvival,
-    root: Vec2,
-    seed: u32,
-    density: f32,
-    ceiling: f32,
-) -> bool {
-    let noise_u = uniform_noise(root / survival.noise_scale_m.max(1e-3));
-    let threshold = cover_threshold(
-        hash01_u32(seed.wrapping_add(37)),
-        noise_u,
-        survival.clumpiness,
-    );
-    density > threshold * ceiling.max(1e-4)
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // ---------- CPU twins of the shaders' blade derivation and survival,
+    // for the crate's tests ----------
+
+    pub(crate) fn hash01_u32(v: u32) -> f32 {
+        (hash_u32(v) & 0x00ff_ffff) as f32 / 16_777_216.0
+    }
+
+    /// Blade `blade`'s seed in a patch seeded `seed` (`derive_blade`).
+    pub(crate) fn blade_seed(seed: u32, blade: u32) -> u32 {
+        hash_u32(seed ^ blade.wrapping_mul(0x27d4_eb2d))
+    }
+
+    /// `meadow_tile_root`.
+    pub(crate) fn tile_root(half: f32, blade_seed: u32) -> Vec2 {
+        let u = Vec2::new(
+            hash01_u32(blade_seed),
+            hash01_u32(blade_seed.wrapping_add(1)),
+        );
+        (2.0 * u - Vec2::ONE) * half
+    }
+
+    /// `meadow_cover_threshold`: the blade's uniform `blade_u` mixed with the
+    /// uniform `noise_u` by `clumpiness`, mapped back to a uniform threshold
+    /// through the CDF of the weighted sum.
+    pub(crate) fn cover_threshold(blade_u: f32, noise_u: f32, clumpiness: f32) -> f32 {
+        let b = clumpiness.clamp(0.0, 1.0);
+        let a = 1.0 - b;
+        let lo = a.min(b);
+        let hi = a.max(b);
+        if lo < 1e-4 {
+            return if a > b { blade_u } else { noise_u };
+        }
+        let z = a * blade_u + b * noise_u;
+        if z < lo {
+            z * z / (2.0 * a * b)
+        } else if z > hi {
+            let w = 1.0 - z;
+            1.0 - w * w / (2.0 * a * b)
+        } else {
+            (z - 0.5 * lo) / hi
+        }
+    }
+
+    /// `meadow_cover_survives`.
+    pub(crate) fn cover_survives(
+        survival: &CoverSurvival,
+        root: Vec2,
+        seed: u32,
+        density: f32,
+        ceiling: f32,
+    ) -> bool {
+        let noise_u = uniform_noise(root / survival.noise_scale_m.max(1e-3));
+        let threshold = cover_threshold(
+            hash01_u32(seed.wrapping_add(37)),
+            noise_u,
+            survival.clumpiness,
+        );
+        density > threshold * ceiling.max(1e-4)
+    }
 
     /// The threshold maps two uniforms to a uniform at every clumpiness, so
     /// the expected cover is the density.

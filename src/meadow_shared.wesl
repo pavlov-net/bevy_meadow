@@ -163,13 +163,12 @@ fn local_blade_position(vert_idx: u32, blade: BladeAttrs) -> vec3<f32> {
     return vec3<f32>(blade_side(vert_idx) * half_w, up, forward);
 }
 
-// World-space normal of the blade's front face (the template triangles'
-// counter-clockwise side) at a vertex, tilted toward its edge by
-// `MEADOW_BLADE_ROUNDING`. `cy`/`sy` are the yaw's cosine and sine, as in
-// the vertex expansion; `wind_full` is the tip's wind displacement, a
-// shear along the length that leans the surface with it. Unnormalized, so
-// interpolation rounds it between the edges.
-fn meadow_blade_world_normal(
+// Unit world-space normal of the blade's front face (the template
+// triangles' counter-clockwise side) at the height of a vertex.
+// `cy`/`sy` are the yaw's cosine and sine, as in the vertex expansion;
+// `wind_full` is the tip's wind displacement, a shear along the length
+// that leans the surface with it.
+fn meadow_blade_face_normal(
     vert_idx: u32,
     blade: BladeAttrs,
     cy: f32,
@@ -185,8 +184,23 @@ fn meadow_blade_world_normal(
         length * cos(a),
         cy * length * sin(a) + wind_full.y,
     );
-    let face = normalize(cross(across, along));
-    return face + across * (blade_side(vert_idx) * MEADOW_BLADE_ROUNDING);
+    return normalize(cross(across, along));
+}
+
+// The blade's shading normal at a vertex: its face normal
+// (`meadow_blade_face_normal`) tilted toward the vertex's edge by
+// `MEADOW_BLADE_ROUNDING`. Unnormalized, so interpolation rounds it
+// between the edges.
+fn meadow_blade_world_normal(
+    vert_idx: u32,
+    blade: BladeAttrs,
+    cy: f32,
+    sy: f32,
+    wind_full: vec2<f32>,
+) -> vec3<f32> {
+    let across = vec3<f32>(cy, 0.0, -sy);
+    return meadow_blade_face_normal(vert_idx, blade, cy, sy, wind_full)
+        + across * (blade_side(vert_idx) * MEADOW_BLADE_ROUNDING);
 }
 
 // Weight of the blade's own normal in its shading normal at view depth

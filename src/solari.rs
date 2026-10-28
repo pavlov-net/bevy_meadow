@@ -152,11 +152,12 @@ struct MeadowRtProxy {
 
 /// Keep one proxy entity per (live variant, band) while the casters are
 /// enabled. Proxies carry [`RaytracingGeometry`] and a per-variant
-/// `StandardMaterial` whose base colour texture holds one texel per palette
-/// entry: the entry's coverage-weighted mean colour times the mean blade
-/// shade. Each caster vertex's `uv.x` is its patch's texel centre
-/// (`meadow_compute.wesl::rt_write_slot`), so Solari bounces light off
-/// every blade at its own patch's mean colour.
+/// double-sided `StandardMaterial` whose base colour texture holds one texel
+/// per palette entry: the entry's coverage-weighted mean colour times the
+/// mean blade shade. Each caster vertex's `uv.x` is its patch's texel centre
+/// and its normal the blade's face normal
+/// (`meadow_compute.wesl::rt_write_slot`), so Solari bounces light off every
+/// blade at its own patch's mean colour, from the face a ray hits.
 fn manage_meadow_rt_proxies(
     mut commands: Commands,
     config: Option<Res<MeadowRaytracingConfig>>,
@@ -239,6 +240,11 @@ fn manage_meadow_rt_proxies(
                     perceptual_roughness: 1.0,
                     metallic: 0.0,
                     emissive: LinearRgba::BLACK,
+                    // Blades are seen and lit from both faces: Solari turns
+                    // the normals of a back-face hit to face the ray only
+                    // on a double-sided material.
+                    double_sided: true,
+                    cull_mode: None,
                     ..default()
                 })
             })

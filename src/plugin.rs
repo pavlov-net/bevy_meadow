@@ -28,6 +28,7 @@ use crate::material::{
 };
 use crate::mesh::{MeadowMeshes, build_blade_template_mesh, build_tuft_template_mesh};
 use crate::placement::{PatchOverride, PatchShape};
+use crate::rt_selection::MeadowRtMargins;
 
 /// Per-variant scalar tuning. Defaults target a dense temperate-forest
 /// meadow; other biomes override what they care about.
@@ -52,6 +53,14 @@ pub struct MeadowVariant {
     /// [`MeadowPalettes`].
     pub palettes: Vec<MeadowPalette>,
     pub lod: MeadowLodCurve,
+    /// Largest factor a raytraced far-band caster widens by when its blade
+    /// lies toward the sun from the eye, whatever the view direction. A
+    /// caster widens to keep the area of the blades the far band thins out,
+    /// up to `lod.max_widen`; its blade's direction from the eye, dotted
+    /// with the sun's (clamped to 0), blends that cap toward this one, so
+    /// only blades sunward of the eye widen past it. Values up to
+    /// `lod.max_widen` change nothing.
+    pub raytraced_sunward_widen: f32,
     pub overrides: Vec<PatchOverride>,
     pub seed: u64,
     pub audio_tag: Option<&'static str>,
@@ -74,6 +83,7 @@ impl Default for MeadowVariant {
             wind: WindParams::default(),
             palettes: vec![MeadowPalette::default()],
             lod: MeadowLodCurve::default(),
+            raytraced_sunward_widen: 1.0,
             overrides: Vec::new(),
             seed: 0x6D45_5F4D_4541_4400,
             audio_tag: None,
@@ -516,7 +526,7 @@ impl MeadowVariantRegistry {
     }
 }
 
-fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
+pub(crate) fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
     // `wind_direction` / `wind_state` come from `VariantParams::default()`
     // so the freshly-registered variant has sane values before the
     // broadcast systems run for the first time.
@@ -569,9 +579,8 @@ fn variant_params_from(variant: &MeadowVariant) -> VariantParams {
 /// keeps the variant's bind group well-formed in the meantime.
 ///
 /// [`Self::set_grid`] builds the atlas from a [`MeadowGrid`] and keeps the
-/// grid for raytracing caster selection, which then measures blade
-/// distances in 3D; without a grid it measures them in the plane of the
-/// eye.
+/// grid for the raytracing caster selection, which then bounds patches'
+/// distances in 3D; without a grid it bounds them in the plane of the eye.
 #[derive(Resource, Debug, Clone, Default)]
 pub struct MeadowHeightfield {
     pub atlas: Handle<Image>,
@@ -601,11 +610,43 @@ impl MeadowHeightfield {
 /// raytracing casters by its 3D distance. `depth_plane` is the camera
 /// view-depth plane `(forward.xyz, -dot(forward, eye))`, used for shadow
 /// cascade assignment so casters land in the same cascade the receiver
-/// samples.
+/// samples. `view_cone` is the half-angle, in radians, of the cone around
+/// that forward that holds the view frustum; raytracing casters spend their
+/// slots inside it first. 0 ranks them by eye distance alone.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
 pub struct MeadowViewer {
     pub eye: Vec3,
     pub depth_plane: Vec4,
+    pub view_cone: f32,
+    /// The narrowest margins the raytracing casters' selection holds for
+    /// this viewer's motion; it widens them while the viewer moves faster.
+    pub caster_margins: MeadowRtMargins,
+}
+
+impl MeadowViewer {
+    /// The viewer of a camera at `transform` with `projection`, with the
+    /// default caster margins.
+    pub fn from_camera(transform: &GlobalTransform, projection: &Projection) -> Self {
+        let eye = transform.translation();
+        let forward = transform.forward().as_vec3();
+        Self {
+            eye,
+            depth_plane: forward.extend(-forward.dot(eye)),
+            view_cone: view_cone(projection),
+            caster_margins: MeadowRtMargins::default(),
+        }
+    }
+}
+
+/// Half-angle of the cone around the view direction through the view
+/// frustum's corners; 0 for a projection without one.
+fn view_cone(projection: &Projection) -> f32 {
+    let Projection::Perspective(perspective) = projection else {
+        return 0.0;
+    };
+    let half_height = (perspective.fov * 0.5).tan();
+    let half_width = half_height * perspective.aspect_ratio;
+    half_height.hypot(half_width).atan()
 }
 
 /// World-level sun: past their blade normals, blades shade as a canopy lit
@@ -954,7 +995,7 @@ fn palette_flags(palette: u32) -> u32 {
 
 /// A placement's `PatchData` row: a tile carries its cover ceiling in the
 /// edge-noise lane and the tile flag.
-fn patch_row(p: &crate::placement::PatchPlacement) -> PatchData {
+pub(crate) fn patch_row(p: &crate::placement::PatchPlacement) -> PatchData {
     // Pack seed (u32) into f32-bits so the shader can `bitcast<u32>` it
     // back: `PatchData` carries four floats per row.
     let seed_f = f32::from_bits(p.seed);
@@ -1274,7 +1315,7 @@ mod tests {
 
     /// `meadow_blade_height_scale`.
     fn height_scale(params: &PaletteParams, root: Vec2, dryness: f32, seed: u32) -> f32 {
-        let blade_term = 2.0 * crate::field::hash01_u32(seed.wrapping_add(19)) - 1.0;
+        let blade_term = 2.0 * crate::field::tests::hash01_u32(seed.wrapping_add(19)) - 1.0;
         let share = patch_share(params, dryness);
         let chance = patch_dead(params, patch_noise(params, root, dryness), share);
         let patch_term = (share - chance) / share.max(1.0 - share);
@@ -1284,7 +1325,7 @@ mod tests {
     /// Whether `meadow_blade_albedo` kills the blade with seed `seed` at
     /// `root`.
     fn blade_is_dead(params: &PaletteParams, root: Vec2, dryness: f32, seed: u32) -> bool {
-        use crate::field::hash01_u32;
+        use crate::field::tests::hash01_u32;
         let chance = patch_dead(
             params,
             patch_noise(params, root, dryness),
@@ -1296,7 +1337,8 @@ mod tests {
 
     /// `n` blades' seeds and roots, spread over 20 km.
     fn blades(n: u32) -> impl Iterator<Item = (u32, Vec2)> {
-        use crate::field::{hash_u32, hash01_u32};
+        use crate::field::hash_u32;
+        use crate::field::tests::hash01_u32;
         (0..n).map(|i| {
             let seed = hash_u32(i ^ 0x2545_f491);
             let unit = Vec2::new(hash01_u32(seed), hash01_u32(seed.wrapping_add(1)));
@@ -1445,7 +1487,7 @@ mod tests {
         }
         // Without a patch share only the blade term varies the height.
         for (seed, root) in blades(1000) {
-            let blade_term = 2.0 * crate::field::hash01_u32(seed.wrapping_add(19)) - 1.0;
+            let blade_term = 2.0 * crate::field::tests::hash01_u32(seed.wrapping_add(19)) - 1.0;
             let expected = 1.1 * (1.0 + 0.15 * blade_term);
             assert!((height_scale(&params, root, 0.0, seed) - expected).abs() < 1e-5);
         }
@@ -1645,12 +1687,69 @@ mod tests {
                 "`{line}` missing from meadow_shared.wesl"
             );
         }
+        let compute = include_str!("meadow_compute.wesl");
+        let [near_thinning, far_thinning] = crate::rt_selection::FAR_THINNING;
+        for line in [
+            format!(
+                "const RT_NEAR_MAX_BLADES: u32 = {}u;",
+                crate::compute::RT_NEAR_MAX_BLADES
+            ),
+            format!(
+                "const RT_FAR_MAX_BLADES: u32 = {}u;",
+                crate::compute::RT_FAR_MAX_BLADES
+            ),
+            format!(
+                "const RT_COVERAGE_NEAR: u32 = 0x{:08X}u;",
+                crate::rt_selection::COVERAGE_NEAR
+            ),
+            format!(
+                "const RT_FAR_THINNING: vec2<f32> = vec2<f32>({near_thinning:?}, {far_thinning:?});"
+            ),
+            format!(
+                "const RT_OUTSIDE_VIEW_WEIGHT: f32 = {:?};",
+                crate::rt_selection::OUTSIDE_VIEW_WEIGHT
+            ),
+            format!(
+                "const RT_UNBOUNDED_BUDGET: f32 = {:.1e};",
+                crate::rt_selection::UNBOUNDED_BUDGET
+            ),
+            format!(
+                "const RT_SELECT_BINS: u32 = {}u;",
+                crate::compute::RT_SELECT_BINS
+            ),
+            format!("const RT_SCAN_ROW: u32 = {}u;", crate::compute::RT_SCAN_ROW),
+        ] {
+            assert!(
+                compute.contains(&line),
+                "`{line}` missing from meadow_compute.wesl"
+            );
+        }
         assert_eq!(size_of::<TrunkDisc>(), 48);
         assert_eq!(TrunkDisc::min_size().get(), 48);
         assert_eq!(
             size_of::<PatchTrunkSlot>(),
             16 + 48 * crate::MAX_TRUNK_DISCS_PER_PATCH
         );
+    }
+
+    /// The cone reaches the frustum's corners, and an orthographic view has
+    /// none.
+    #[test]
+    fn view_cone_reaches_the_frustum_corners() {
+        let perspective = |aspect_ratio| {
+            Projection::Perspective(PerspectiveProjection {
+                fov: std::f32::consts::FRAC_PI_2,
+                aspect_ratio,
+                ..default()
+            })
+        };
+        assert!((view_cone(&perspective(1.0)) - 2f32.sqrt().atan()).abs() < 1e-5);
+        assert!((view_cone(&perspective(2.0)) - 5f32.sqrt().atan()).abs() < 1e-5);
+        let orthographic = Projection::Orthographic(OrthographicProjection::default_3d());
+        assert_eq!(view_cone(&orthographic), 0.0);
+        let viewer =
+            MeadowViewer::from_camera(&GlobalTransform::from_xyz(1.0, 2.0, 3.0), &perspective(1.0));
+        assert_eq!(viewer.depth_plane, Vec4::new(0.0, 0.0, -1.0, 3.0));
     }
 
     /// The palette index sits in bits 8..15, clear of the audio bit, and is

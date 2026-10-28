@@ -161,8 +161,8 @@ The other driver resources:
   wavenumber) -- world wind, shared so meadow and tree foliage gust together.
 - **`MeadowHeightfield`** (`atlas`, `world_min`, `world_max`, `grid`) -- an
   `R32Float` world-XZ -> ground-Y atlas. Set it from a `MeadowGrid<f32>` with
-  `set_grid`, which keeps the grid for raytracing caster selection (3D blade
-  distances). Until you set one, blades sit at Y=0.
+  `set_grid`, which keeps the grid for the raytracing caster selection (3D
+  patch distances). Until you set one, blades sit at Y=0.
 - **`MeadowCoverField`** (`atlas`, `grid`, `survival`) -- the cover map tile
   patches grow from; see [Tile patches and the cover field](#tile-patches-and-the-cover-field).
 
@@ -205,6 +205,9 @@ inverse of the area share its band keeps, up to `max_widen`, so near blades
 thin to `1 / max_widen` and a tuft counts as `TUFT_BLADE_AREA_RATIO` blades.
 `MeadowVariant::drawn_area_share` gives the share of the blade area the main
 view draws at a distance, for the ground to carry the rest.
+`MeadowVariant::raytraced_sunward_widen` lets raytraced far casters whose
+blades lie toward the sun from the eye, whatever the view direction, widen
+past `max_widen`; it defaults to no extra widening.
 
 ### Placement
 
@@ -323,13 +326,28 @@ slice, so a blade casts into roughly one cascade rather than all of them, and
 `SHADOW_MAX_DIST` bounds the union. A second shadow-casting directional light
 gets no grass shadows.
 
-Under a raytracer (`solari` feature), a CPU pass selects the caster blades:
+Under a raytracer (`solari` feature), a GPU pass selects the caster blades:
 the nearest blades as exact ribbons, then a thinning band of one-triangle
-proxies out to `SHADOW_MAX_DIST`, by 3D distance when the heightfield carries
-its grid. It mirrors the kernels' roots and survival (rims, clearing cores,
-tile cover), so dead blades take no slot, and walks only as many blades as the
-budget can keep. Casters keep their slots while their patch index lives, so
-keep a patch's index stable while it is resident.
+proxies out to `SHADOW_MAX_DIST`, by 3D distance. Distances are
+view-weighted: a blade outside the view cone (`MeadowViewer::view_cone`)
+ranks as if farther, up to three times straight behind, so both bands spend
+their slots on what the camera sees. Dead blades (rims, clearing cores, tile
+cover) take no slot, and each band's limits are fitted to its capacity.
+Each selection holds every caster the expansion can draw from any pose
+within its margins, and the next one runs the frame the camera is halfway
+there. The margins follow the camera: at least
+`MeadowViewer::caster_margins` (by default half a metre and eight degrees of
+view turn and cone change together), widened at once, up to sixteen times, to
+hold its recent motion per frame, and narrowed once it slows. A cut leaves
+them as they are.
+`MeadowViewer::from_camera` fills the viewer from a camera's transform and
+projection.
+The expansion decides each frame, from the current pose, which resident
+blades cast. A caster keeps its slot while selected or drawn, so casters
+come and go one at a time as the camera moves and a slot only passes
+between undrawn blades. Casters keep their slots while their patch index
+lives, so keep a patch's index stable while it is resident; a patch leaving
+or changing in reach gives its slots up.
 
 ### Runtime assumptions
 
