@@ -755,8 +755,10 @@ fn rt_write_slot(slot: u32, near: bool) {
     // (template verts 0/1/10), widened to the ribbon's silhouette area
     // (`MEADOW_CHORD_WIDTH_SCALE`) and by `widen` to keep the area of the
     // blades the far band's thinning drops. The distance fade thins casters
-    // and no widening replaces them. Suppressed owners keep finite,
-    // collapsed vertices, so history never samples NaN positions in a fade.
+    // and no widening replaces them. An undrawn owner's vertices all sit
+    // exactly at its root: finite, so history never samples NaN positions
+    // in a fade, and zero-area, so Solari drops history anchored on the
+    // slot before it passes to another blade.
     var local: array<vec4<f32>, 11>;
     var world: array<vec3<f32>, 11>;
     for (var vi = 0u; vi < count; vi += 1u) {
@@ -765,18 +767,16 @@ fn rt_write_slot(slot: u32, near: bool) {
         if (!near) {
             local[vi].x *= MEADOW_CHORD_WIDTH_SCALE * widen;
         }
-        world[vi] = meadow_place_vertex(local[vi], blade.world_xz, x.gated.ground_y, cy, sy, wind_tip, collapse);
+        world[vi] = x.root;
+        if (drawn) {
+            world[vi] = meadow_place_vertex(local[vi], blade.world_xz, x.gated.ground_y, cy, sy, wind_tip, collapse);
+        }
     }
-    // A collapsed blade faces down, away from every receiver above its
-    // root. Solari moves a GI sample anchored on it to the collapsed
-    // triangle, where its reconnection fails and the sample drops, so a slot
-    // passes to another blade free of samples gathered on this one.
-    var chord_normal = vec3<f32>(0.0, -1.0, 0.0);
-    if (drawn && !near) {
+    var chord_normal = vec3<f32>(0.0, 1.0, 0.0);
+    if (!near) {
         let e1 = world[1] - world[0];
         let e2 = world[2] - world[0];
         let n = cross(e1, e2);
-        chord_normal = vec3<f32>(0.0, 1.0, 0.0);
         if (dot(n, n) > 1e-12 * dot(e1, e1) * dot(e2, e2)) {
             chord_normal = normalize(n);
         }

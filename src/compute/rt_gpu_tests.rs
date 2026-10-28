@@ -481,6 +481,27 @@ impl Harness {
             .filter(|(_, drawn)| *drawn)
             .count()
     }
+
+    /// Each slot's vertices as `(position, normal)`, near band first.
+    fn slot_vertices(&self) -> Vec<Vec<(Vec3, Vec3)>> {
+        let band = |buffers: &RtBandBuffers, per_slot: u32| {
+            let bytes = self.read(
+                &buffers.vertices,
+                u64::from(buffers.vertex_count) * RT_VERTEX_SIZE,
+            );
+            bytemuck::cast_slice::<u8, [f32; (RT_VERTEX_SIZE / 4) as usize]>(&bytes)
+                .chunks(per_slot as usize)
+                .map(|slot| {
+                    slot.iter()
+                        .map(|v| (Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5])))
+                        .collect()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut slots = band(&self.rtv.near, RT_NEAR_VERTS_PER_BLADE);
+        slots.extend(band(&self.rtv.far, RT_FAR_VERTS_PER_BLADE));
+        slots
+    }
 }
 
 impl RtLayouts {
@@ -919,7 +940,10 @@ fn fits_leave_slack_and_count_drawn_slots() {
 /// Drawn blades that die (a clearing disc grows over them, or the cover
 /// thins under them) keep their slots for the frame and count against the
 /// capacity without a key; the next frame they leave, with no blade waiting
-/// for a slot and the slots' identity kept.
+/// for a slot and the slots' identity kept. While they hold their slots
+/// undrawn, their vertices all sit at one finite point facing up, so
+/// Solari drops history anchored on them; a vacant slot's are NaN, or
+/// collapsed from its last owner.
 #[test]
 fn dying_drawn_blades_hold_their_slots_without_a_key() {
     let scene = scene();
@@ -956,6 +980,36 @@ fn dying_drawn_blades_hold_their_slots_without_a_key() {
     assert!(state.pinned >= raw.drawn_other[0], "{state:?}");
     assert_eq!(state.dropped, 0);
     assert_eq!(gpu.rtv.selector.identity, identity);
+    let collapsed = |vertices: &[(Vec3, Vec3)]| {
+        vertices[0].0.is_finite() && vertices.iter().all(|(p, _)| *p == vertices[0].0)
+    };
+    let (mut undrawn, mut vacant) = (0, 0);
+    for (slot, ((owner, drawn), vertices)) in
+        gpu.slots().into_iter().zip(gpu.slot_vertices()).enumerate()
+    {
+        match (owner, drawn) {
+            (Some(_), true) => {
+                assert!(vertices.iter().all(|(p, _)| p.is_finite()), "slot {slot}");
+                assert!(!collapsed(&vertices), "slot {slot}");
+            }
+            (Some(_), false) => {
+                undrawn += 1;
+                assert!(
+                    collapsed(&vertices) && vertices.iter().all(|(_, n)| *n == Vec3::Y),
+                    "slot {slot}: {vertices:?}"
+                );
+            }
+            (None, _) => {
+                vacant += 1;
+                assert!(
+                    vertices.iter().all(|(p, _)| p.is_nan()) || collapsed(&vertices),
+                    "slot {slot}: {vertices:?}"
+                );
+            }
+        }
+    }
+    assert!(undrawn > 100, "{undrawn}");
+    assert!(vacant > 50, "{vacant}");
     // The cover thins to nothing over half the field.
     let dims = UVec2::splat(17);
     let texels = (0..dims.x * dims.y)

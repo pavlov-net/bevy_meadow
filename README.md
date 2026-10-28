@@ -345,9 +345,11 @@ projection.
 The expansion decides each frame, from the current pose, which resident
 blades cast. A caster keeps its slot while selected or drawn, so casters
 come and go one at a time as the camera moves and a slot only passes
-between undrawn blades. Casters keep their slots while their patch index
-lives, so keep a patch's index stable while it is resident; a patch leaving
-or changing in reach gives its slots up.
+between undrawn blades. An undrawn caster collapses to its root, and Solari
+drops temporal history anchored on a zero-area triangle, so lighting gathered
+on one blade never follows its slot to the next. Casters keep their slots
+while their patch index lives, so keep a patch's index stable while it is
+resident; a patch leaving or changing in reach gives its slots up.
 
 ### Runtime assumptions
 
